@@ -938,10 +938,12 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   if (!device_properties.vertexPipelineStoresAndAtomics) {
-    REXGPU_ERROR(
-        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
-        "D3D12 parity, but unsupported by the selected device");
-    return false;
+    // EXPERIMENTO Mali-G52: no abortar. Los draws cuyo vertex shader hace memexport se
+    // omiten mas abajo en IssueDraw; el resto del render continua. Ver
+    // docs/diagnostico-crash-mali-g52.md.
+    REXGPU_WARN(
+        "Vulkan vertexPipelineStoresAndAtomics no soportado; se omitiran los draws de "
+        "memexport en vertex y se continua (parche Mali-G52)");
   }
   if (!device_properties.geometryShader) {
     if (REXCVAR_GET(vulkan_require_geometry_shader)) {
@@ -956,16 +958,11 @@ bool VulkanCommandProcessor::SetupContext() {
         "fallback conversion/expansion paths will be used");
   }
   if (!device_properties.fillModeNonSolid) {
-    if (REXCVAR_GET(vulkan_require_fill_mode_non_solid)) {
-      REXGPU_ERROR(
-          "Vulkan fillModeNonSolid is required for GPU emulation "
-          "(vulkan_require_fill_mode_non_solid=true), but unsupported by the "
-          "selected device");
-      return false;
-    }
+    // EXPERIMENTO Mali-G52: no abortar aunque vulkan_require_fill_mode_non_solid siga true;
+    // los modos de poligono line/point caen a relleno solido.
     REXGPU_WARN(
         "Vulkan fillModeNonSolid is not supported by the device; line/point "
-        "polygon modes will fall back to solid fill");
+        "polygon modes will fall back to solid fill (parche Mali-G52)");
   }
 
   // Requires the transient descriptor set layouts.
@@ -3672,10 +3669,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
-      REXGPU_ERROR(
-          "Vertex shader memexport draw encountered without "
-          "vertexPipelineStoresAndAtomics support");
-      return false;
+      // EXPERIMENTO Mali-G52: el SPIR-V de este vertex shader escribe memoria desde el
+      // vertex stage, que la Mali no soporta. En vez de abortar el frame, omitimos este
+      // draw (se pierde su efecto) y seguimos, para obtener imagen. Ver
+      // docs/diagnostico-crash-mali-g52.md.
+      return true;
     }
     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
   }
