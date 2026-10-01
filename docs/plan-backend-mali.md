@@ -119,3 +119,53 @@ Mali** que active los sustitutos de arriba, sin afectar a GPUs potentes:
 - Xenia / xenia-canary: memexport→compute (`spirv_translator_memexport.cpp` equivalente en este árbol).
 - Dolphin: backend Vulkan con descriptores clásicos en Mali/Adreno.
 - MoltenVK (en `sdk/thirdparty/moltenvk`): patrones de emulación de features ausentes.
+
+---
+
+## 7. Vita3K: lógica concreta a reutilizar (open source)
+
+Fuente estudiada: `vita3k/renderer/src/vulkan/pipeline_cache.cpp` (~44 KB) y la estructura de
+`vita3k/renderer/src/vulkan/` (renderer.cpp, creation.cpp, texture.cpp, surface_cache.cpp) y
+`vita3k/shader/src/` (spirv_recompiler.cpp).
+
+> **Frontera de reutilización:** el recompilador de shaders de Vita3K (`spirv_recompiler.cpp`,
+> USSE/GXM→SPIR-V) **no** se reutiliza — es otro ISA; seguimos con XenosRecomp. Lo que se basa en Vita3K es
+> la **infraestructura**: caché en disco, pipeline cache, compilación asíncrona y el modelo de descriptores.
+
+### 7.1 Caché de pipelines en disco (basar nuestro `nfsmw_nativo_pipelines.bin`)
+- Vita3K: archivo `pipeline-cache-vk{version}.dat` = magic `0xBEEF4321` + nº de hashes (size_t) +
+  array de hashes (uint64) + blob de `VkPipelineCache`. `read_pipeline_cache()` lo carga; se pasa a
+  `vkCreateGraphicsPipelines` para que el driver reuse lo compilado entre arranques.
+- **Mejora sobre Vita3K:** Vita3K NO valida que el blob sea del mismo GPU/driver. Nosotros debemos guardar y
+  comparar `VkPhysicalDeviceProperties::pipelineCacheUUID` (o vendorID/deviceID/driverVersion) en la cabecera,
+  e invalidar la caché si no coincide. Evita cuelgues/corrupción al cambiar de driver.
+
+### 7.2 Caché de SPIR-V en disco
+- Vita3K: `vk{version}-{sha256}.spv` (SPIR-V crudo) indexado por SHA-256; lista `shaders_cache_hashs`
+  (pares vertex/fragment) para saber qué precargar; `precompile_shader()` carga del disco y crea el
+  `vk::ShaderModule`. Nuestro `.nfsp` ya cumple este rol (XenosRecomp→DXC→packer); mantener.
+
+### 7.3 Compilación asíncrona (RELEVANTE para el muro del xenos)
+- Vita3K: pipelines en un **pool de hilos** (1–6 según CPU, cola lock-free moodycamel); shaders con centinela
+  `shader_compiling = ~0ULL` + `std::this_thread::yield()`; `set_async_compilation()` lo activa.
+- Por qué importa: en el experimento xenos el hilo de render se **congeló** compilando la 1ª pipeline. Con
+  compilación async, la compilación lenta del driver Mali **no congela** el render/audio; se presenta cuando
+  está lista (o un placeholder). No arregla un *deadlock* del driver, pero sí la *lentitud*. En el backend
+  nativo revisar `async_shader_compilation` (cvar, ya existe) y asegurar que la 1ª pipeline no bloquea.
+
+### 7.4 Descriptores clásicos (el modelo para la incompatibilidad B)
+Layout de Vita3K (copiar la forma, adaptar contenido a Xenos):
+- set 0: uniforms — UBO dinámico vertex + fragment (+ storage buffers si aplica).
+- set 1: attachments — input attachment / storage image (para EDRAM/efectos).
+- **sets 2–3: texturas — 0..16 `CombinedImageSampler` con bindings FIJOS** (no heap ilimitado), y una
+  matriz de pipeline layouts `[vert_tex_count][frag_tex_count]` (Vita3K usa 17×17).
+- Esto sustituye nuestro `g_Texture2DDescriptorHeap[]` (shader_common.h:136). En NFSMW, en vez de un índice a
+  heap ilimitado, cada draw vincula sus N texturas en slots fijos del set. La Mali soporta indexado dinámico
+  de arrays ACOTADOS (`shaderSampledImageArrayDynamicIndexing`), así que si se prefiere, se puede usar un
+  array acotado indexado en vez de slots 1-a-1.
+
+### 7.5 Fallbacks de features (Vita3K `creation.cpp`/`pipeline_cache.cpp`)
+- Query por formato (`getFormatProperties`); formatos RGB de 3 componentes → padding a RGBA; atributos
+  "scaled" no soportados → convertir en el shader; `wideLines` ausente → quitar el dynamic state.
+- Mismo patrón para nuestros fallbacks Mali (fillModeNonSolid→solid, formatos de textura ya con fallback en
+  el VulkanTextureCache del xenos, etc.).
