@@ -141,6 +141,11 @@ python3 tools/recompilar_mali.py --install   # además, adb install -r al termin
   gradle al armar el APK; codegen/rexglue solo hacen falta si cambia el `.xex`/manifest.
 - Desde WSL, el paso del APK invoca `powershell.exe build_android.ps1`; desde Windows, delega los pasos
   de Linux a `wsl.exe`. Reusa los mismos flags/arreglos de §2.2–2.3.
+- **Antes del APK genera/completa `android/local.properties`** (gitignored → no viaja por git, por eso el
+  build caía a los defaults heredados: `[CXX1300] CMake 3.30.5 was not found`). Detecta tu `sdk.dir` y la
+  **mayor** versión instalada de CMake/NDK/plataforma y las escribe como `nfsmw.cmakeVersion` /
+  `nfsmw.ndkVersion` / `nfsmw.compileSdk`. Es **additivo**: respeta las claves que ya tengas. Overrides:
+  `--sdk-dir`, `--cmake-version`, `--ndk-version`, `--forzar-local-properties`, `--sin-local-properties`.
 
 ---
 
