@@ -169,7 +169,7 @@ def main(argv=None) -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Sin accion = build + install + run (tras preparar toml y local.properties).")
     ap.add_argument("accion", nargs="?", default="loop",
-                    choices=["loop", "all", "build", "install", "run", "stop", "log", "codegen"],
+                    choices=["loop", "all", "build", "install", "run", "stop", "log", "codegen", "bootstrap"],
                     help="que hacer (def: loop = build+install+run)")
     ap.add_argument("--mali", choices=["auto", "on", "off"], default="auto",
                     help="valor de nfsmw_nativo_mali en el toml (def: auto = -1)")
@@ -182,6 +182,8 @@ def main(argv=None) -> None:
     # Pass-through a mw.py:
     ap.add_argument("--debug", action="store_true", help="variante debug")
     ap.add_argument("--clean", action="store_true", help="gradle clean antes de compilar")
+    ap.add_argument("--no-bootstrap", action="store_true",
+                    help="no auto-resolver prerrequisitos (thirdparty/codegen); solo avisar")
     ap.add_argument("--no-install", action="store_true", help="no instalar")
     ap.add_argument("--no-run", action="store_true", help="no lanzar")
     ap.add_argument("--log", action="store_true", help="capturar logcat al final (filtro Mali)")
@@ -191,8 +193,9 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
 
     # Namespace que esperan las funciones de mw.py.
-    ns = argparse.Namespace(debug=args.debug, clean=args.clean, no_install=args.no_install,
-                            no_run=args.no_run, log=args.log, all=args.all, out=args.out, app=args.app)
+    ns = argparse.Namespace(debug=args.debug, clean=args.clean, no_bootstrap=args.no_bootstrap,
+                            no_install=args.no_install, no_run=args.no_run, log=args.log,
+                            all=args.all, out=args.out, app=args.app)
 
     va_a_compilar = args.accion in ("loop", "all", "build")
     if va_a_compilar:
@@ -209,7 +212,7 @@ def main(argv=None) -> None:
     despacho = {
         "build": mw.cmd_build, "install": mw.cmd_install, "run": mw.cmd_run,
         "stop": mw.cmd_stop, "log": mw.cmd_log, "codegen": mw.cmd_codegen,
-        "loop": mw.cmd_loop, "all": mw.cmd_loop,
+        "bootstrap": mw.cmd_bootstrap, "loop": mw.cmd_loop, "all": mw.cmd_loop,
     }
     despacho[args.accion](ns)
 
