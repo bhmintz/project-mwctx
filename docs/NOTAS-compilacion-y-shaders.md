@@ -8,6 +8,15 @@
 
 ## 0. ESTADO ACTUAL — problema abierto (empezar por aquí)
 
+> **ACTUALIZACIÓN 2025-10-01 (sesión 2): logcat capturado, causa encontrada.**
+> No era un crash: el proceso salía limpio (`exit 0`) porque el selector Vulkan **rechazaba** la
+> Mali-G52 por features faltantes. Tras parchear eso, la app arranca (suena audio + overlay de
+> controles) pero queda **en negro porque el renderizador nativo exige `shaderInt64` +
+> `bufferDeviceAddress` + bindless**, que la Mali-G52 (driver r26p0) no tiene. Detalle completo,
+> parches, commits y opciones en **`docs/diagnostico-crash-mali-g52.md`**. Lo de abajo queda como
+> referencia histórica del arranque de la investigación.
+
+
 - El APK **compila entero desde cero** con el SDK/NDK de esta máquina (ver §2). Eso funciona.
 - **PERO el juego crashea al pulsar "Jugar"**, y esto pasa **igual con la APK oficial (pensada para Adreno) y con la APK modeada al mínimo**. Probado en el Helio G80 tras instalar e importar los archivos del juego correctamente.
 - **Conclusión:** el crash **NO** lo causa el perfil Mali ni los cambios de este trabajo. Es un problema de **arranque del juego en este dispositivo**. El port solo se ha probado en **Adreno 830** y **Xclipse 530**; **nunca en una GPU Mali**. Lo más probable es una incompatibilidad del **driver Vulkan de Mali** (o de la edición/archivos), no un tema de rendimiento.
