@@ -1403,6 +1403,16 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
       REXSYS_ERROR("BaseHeap::AllocFixed failed to alloc range from host");
       return false;
     }
+    // See BaseHeap::AllocRange: a commit onto an already-mapped range must reset
+    // the host protection to the requested access (freed guard pages can leave it
+    // at NoAccess, and SyncHostPageAccess is a no-op for large guest pages).
+    if ((allocation_type & memory::kMemoryAllocationCommit) &&
+        !rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
+                              page_count << page_size_shift_,
+                              ToHostPageAccess(protect, heap_type_), nullptr)) {
+      REXSYS_ERROR("BaseHeap::AllocFixed failed to reset host protection after commit");
+      return false;
+    }
   }
 
   // Set page state.
@@ -1565,6 +1575,20 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
                                 ToHostPageAccess(protect, heap_type_));
     if (!result) {
       REXSYS_ERROR("BaseHeap::Alloc failed to alloc range from host");
+      return false;
+    }
+    // Committing an already-mapped range must reset the host protection to the
+    // requested access. The whole guest space is reserved up front and Release
+    // never unmaps, so the commit always lands on an existing mapping; the
+    // mmap(MAP_FIXED_NOREPLACE) path does not reliably reprotect pages a prior
+    // allocation left non-default (e.g. a freed guard page stuck at NoAccess),
+    // and SyncHostPageAccess is a no-op when the guest page >= the host page.
+    // Force it here so the host protection always matches the guest page table.
+    if ((allocation_type & memory::kMemoryAllocationCommit) &&
+        !rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
+                              page_count << page_size_shift_,
+                              ToHostPageAccess(protect, heap_type_), nullptr)) {
+      REXSYS_ERROR("BaseHeap::Alloc failed to reset host protection after commit");
       return false;
     }
   }
