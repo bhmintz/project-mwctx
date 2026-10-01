@@ -121,11 +121,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       return nullptr;
     }
     if (!supported_features.vertexPipelineStoresAndAtomics) {
+      // EXPERIMENTO Mali-G52: esta GPU no expone vertexPipelineStoresAndAtomics.
+      // En vez de rechazar el dispositivo, seguimos adelante para ver hasta donde
+      // llega el arranque y que falla despues. Revertir con git si rompe el render.
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
-          "is required for Vulkan GPU emulation parity",
+          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics "
+          "(normalmente requerido para paridad); continuando igual (parche Mali-G52)",
           properties.deviceName);
-      return nullptr;
     }
     if (REXCVAR_GET(vulkan_require_geometry_shader) && !supported_features.geometryShader) {
       REXLOG_WARN(
