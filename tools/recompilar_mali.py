@@ -161,6 +161,122 @@ def paso_codegen() -> None:
 
 
 # --------------------------------------------------------------------------------------
+# android/local.properties con TUS rutas y versiones (el archivo es gitignored, por eso
+# el build caia al default heredado: [CXX1300] CMake 3.30.5 was not found).
+# --------------------------------------------------------------------------------------
+LOCAL_PROPS = RAIZ / "android" / "local.properties"
+SDK_DIR_DEFECTO_WIN = "D:/android/sdk"  # la ruta de esta maquina (docs/NOTAS §2.3/2.4)
+
+
+def _ruta_fs_de_sdk(sdk_win: str) -> Path | None:
+    """Ruta de filesystem accesible AHORA para un sdk.dir (en formato Windows)."""
+    if es_wsl():
+        try:
+            u = subprocess.run(["wslpath", "-u", sdk_win], check=True,
+                               capture_output=True, text=True).stdout.strip()
+            return Path(u)
+        except subprocess.CalledProcessError:
+            return None
+    return Path(sdk_win)
+
+
+def _subdirs(d: Path) -> list[str]:
+    try:
+        return [p.name for p in d.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+
+
+def _mayor_version(nombres: list[str]) -> str | None:
+    """La mayor version entre nombres tipo '3.31.6', '29.0.14206865', '35'."""
+    def clave(n: str):
+        return [int(t) if t.isdigit() else 0 for t in n.replace("-", ".").split(".")]
+    validos = [n for n in nombres if any(c.isdigit() for c in n)]
+    return max(validos, key=clave) if validos else None
+
+
+def _leer_props(p: Path) -> dict:
+    props = {}
+    if p.exists():
+        for linea in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            s = linea.strip()
+            if s and not s.startswith("#") and "=" in s:
+                k, _, v = s.partition("=")
+                props[k.strip()] = v.strip()
+    return props
+
+
+def asegurar_local_properties(sdk_dir: str | None, cmake_ver: str | None,
+                              ndk_ver: str | None, forzar: bool) -> None:
+    """Crea/completa android/local.properties con el SDK y las versiones instaladas.
+
+    Additivo: respeta las claves que ya tengas (salvo --forzar-local-properties). Detecta
+    cmake/ndk/plataforma del propio SDK para no quedar atado a versiones viejas.
+    """
+    banner("local.properties: asegurando tus rutas y versiones (gitignored)")
+    existentes = _leer_props(LOCAL_PROPS)
+
+    sdk_win = (sdk_dir or existentes.get("sdk.dir") or os.environ.get("ANDROID_HOME")
+               or os.environ.get("ANDROID_SDK_ROOT") or SDK_DIR_DEFECTO_WIN).replace("\\", "/")
+    sdk_fs = _ruta_fs_de_sdk(sdk_win)
+    if sdk_fs is None or not sdk_fs.exists():
+        print(f"  aviso: no veo el SDK en {sdk_win}. Se escribe igual; usa --sdk-dir si la ruta es otra.")
+
+    cmake_final = cmake_ver or (_mayor_version(_subdirs(sdk_fs / "cmake")) if sdk_fs else None)
+    ndk_final = ndk_ver or (_mayor_version(_subdirs(sdk_fs / "ndk")) if sdk_fs else None)
+    plats = [n.replace("android-", "") for n in _subdirs(sdk_fs / "platforms")] if sdk_fs else []
+    plat_final = _mayor_version(plats)
+
+    deseados = {"sdk.dir": sdk_win}
+    if cmake_final:
+        deseados["nfsmw.cmakeVersion"] = cmake_final
+    if ndk_final:
+        deseados["nfsmw.ndkVersion"] = ndk_final
+    if plat_final:
+        deseados["nfsmw.compileSdk"] = plat_final
+        deseados["nfsmw.targetSdk"] = plat_final
+
+    # Escritura preservando lineas existentes: se actualizan las claves (solo si --forzar o faltan)
+    # y se anexan las que no estuvieran.
+    lineas = LOCAL_PROPS.read_text(encoding="utf-8", errors="ignore").splitlines() \
+        if LOCAL_PROPS.exists() else []
+    por_poner = {}
+    for k, v in deseados.items():
+        if k in existentes and not forzar:
+            continue  # respetar lo que ya pusiste
+        por_poner[k] = v
+
+    nuevas = []
+    vistas = set()
+    for linea in lineas:
+        s = linea.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.partition("=")[0].strip()
+            if k in por_poner:
+                nuevas.append(f"{k}={por_poner[k]}")
+                vistas.add(k)
+                continue
+        nuevas.append(linea)
+    anexar = {k: v for k, v in por_poner.items() if k not in vistas}
+    if anexar:
+        if nuevas and nuevas[-1].strip():
+            nuevas.append("")
+        nuevas.append("# Rutas/versiones de esta maquina (tools/recompilar_mali.py; gitignored)")
+        for k, v in anexar.items():
+            nuevas.append(f"{k}={v}")
+
+    LOCAL_PROPS.parent.mkdir(parents=True, exist_ok=True)
+    LOCAL_PROPS.write_text("\n".join(nuevas) + "\n", encoding="utf-8")
+
+    efectivos = _leer_props(LOCAL_PROPS)
+    resumen = ", ".join(f"{k}={efectivos.get(k)}" for k in deseados)
+    print(f"  {LOCAL_PROPS}")
+    print(f"  valores efectivos: {resumen}")
+    if not por_poner:
+        print("  (ya estaba todo; no se cambio nada)")
+
+
+# --------------------------------------------------------------------------------------
 # Paso del APK (Windows)
 # --------------------------------------------------------------------------------------
 def ruta_apk() -> Path:
@@ -238,6 +354,16 @@ def main() -> int:
     ap.add_argument("--install", action="store_true", help="adb install -r al terminar")
     ap.add_argument("--rexglue-build-dir", default=os.path.expanduser("~/rexglue-build"),
                     help="carpeta de build del host (def: ~/rexglue-build)")
+    ap.add_argument("--sdk-dir", default=None,
+                    help="ruta del Android SDK para local.properties (def: la ya puesta o D:/android/sdk)")
+    ap.add_argument("--cmake-version", default=None,
+                    help="forzar nfsmw.cmakeVersion (def: la mayor instalada en el SDK)")
+    ap.add_argument("--ndk-version", default=None,
+                    help="forzar nfsmw.ndkVersion (def: la mayor instalada en el SDK)")
+    ap.add_argument("--forzar-local-properties", action="store_true",
+                    help="sobrescribir las claves nfsmw.* / sdk.dir aunque ya existan")
+    ap.add_argument("--sin-local-properties", action="store_true",
+                    help="no tocar android/local.properties")
     ap.add_argument("--solo-linux", action="store_true",
                     help=argparse.SUPPRESS)  # uso interno: re-dispatch desde Windows
     args = ap.parse_args()
@@ -285,6 +411,9 @@ def main() -> int:
 
         # --- Paso del APK (Windows) ---
         if hacer_apk:
+            if not args.sin_local_properties:
+                asegurar_local_properties(args.sdk_dir, args.cmake_version,
+                                          args.ndk_version, args.forzar_local_properties)
             paso_apk()
 
         if hacer_install:
