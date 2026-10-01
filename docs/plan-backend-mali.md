@@ -107,8 +107,9 @@ Mali** que active los sustitutos de arriba, sin afectar a GPUs potentes:
 
 ## 3. Plan por fases (correctitud primero, luego velocidad)
 
-- **Fase 0 — preparación**: decidir mecanismo (sub-modo del nativo), añadir el gate y dejar que el
-  dispositivo se cree en Mali (los parches de `vulkan_device.cpp` ya lo permiten).
+- **Fase 0 — preparación** ✅ **HECHO** (ver §8): sub-modo del nativo vía cvar `nfsmw_nativo_mali`
+  (-1 auto / 0 off / 1 on), gate `requisitos[]` relajado (solo exige `shaderSampledImageArrayDynamicIndexing`),
+  BDA opcional y constantes UBO forzadas. El dispositivo ya pasa la inicialización en Mali.
 - **Fase 1 — constantes sin 64-bit (A)**: forzar UBO, sellar la vía puntero, validar SPIR-V sin Int64/BDA.
 - **Fase 2 — texturas acotadas (B)**: array fijo + indexado dinámico en shader; pool de descriptores
   acotado + rebinding por lote en C++; relajar `requisitos[]`.
@@ -190,3 +191,29 @@ Layout de Vita3K (copiar la forma, adaptar contenido a Xenos):
   "scaled" no soportados → convertir en el shader; `wideLines` ausente → quitar el dynamic state.
 - Mismo patrón para nuestros fallbacks Mali (fillModeNonSolid→solid, formatos de textura ya con fallback en
   el VulkanTextureCache del xenos, etc.).
+
+---
+
+## 8. Registro de progreso
+
+### Fase 0 — sub-modo Mali del nativo (hecho)
+Todo en `app/src/nfsmw_nativo_dibujos.cpp`. No toca el camino del nativo clásico (en una GPU potente
+`nfsmw_nativo_mali` auto da `false` y nada cambia).
+
+- **cvar `nfsmw_nativo_mali`** (INT32, default `-1`): -1 auto, 0 off, 1 forzado. Auto se activa cuando el
+  dispositivo no tiene `shaderInt64`+`bufferDeviceAddress`+`runtimeDescriptorArray` pero sí
+  `shaderSampledImageArrayDynamicIndexing` (perfil Mali-G52). Helper `DecidirModoMali()` + miembro `modo_mali_`.
+- **Gate `requisitos[]` relajado** en `Inicializar()`: se parte en `requisitos_siempre[]` (solo
+  `shaderSampledImageArrayDynamicIndexing`, único que el camino acotado necesita del hardware) y
+  `requisitos_bindless[]` (Int64/BDA/runtimeDescriptorArray/descriptorBinding*), que en modo Mali solo
+  emiten `WARN` en vez de abortar.
+- **BDA opcional**: no se exige `vkGetBufferDeviceAddress` en modo Mali; `CrearBuferSubida()` no pide
+  `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT` ni `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` ni calcula
+  `subida_direccion_` (queda 0; nadie la lee porque siempre se va por UBO).
+- **Constantes UBO forzadas** (incompatibilidad A sellada por C++): `usar_ubo_ = modo_mali_ || cvar`, y el
+  test A/B `alternar_ubo_s_` se desactiva en Mali (alternaba a modo puntero, inviable sin Int64/BDA).
+
+> **Pendiente para que esto dibuje** (no es un fallo de la Fase 0, es el orden del plan): la biblioteca de
+> shaders sigue declarando el push-constant `uint64_t` y el heap bindless, así que el SPIR-V aún pide
+> Int64/bindless. Hasta la Fase 1 (sellar el `uint64_t` en `shader_common.h`) y la Fase 2 (texturas
+> acotadas) + regenerar el `.nfsp`, el modo Mali inicializa pero las pipelines no compilarán en la Mali.

@@ -207,6 +207,24 @@ REXCVAR_DEFINE_INT32(nfsmw_nativo_constantes_ubo_alternar_s, 0, "NFSMW",
                      "UBO (tramos impares) cada N segundos y anota cada cambio, para comparar capturas de una escena "
                      "quieta en la misma ejecucion");
 /*
+ * Sub-modo Mali (GPUs sin bindless/Int64/bufferDeviceAddress, p.ej. Mali-G52/Helio G80).
+ *
+ * Reutiliza el renderizador nativo (precompila los shaders a .nfsp, lo que evita el cuelgue del driver
+ * Mali al compilar en runtime), pero sustituye las tres cosas que la Mali no soporta por equivalentes
+ * clasicos: constantes por UBO dinamico en vez de puntero de 64 bits (incompatibilidad A, ya forzada
+ * aqui), texturas por descriptores acotados en vez de heap bindless (incompatibilidad B), y sin
+ * bufferDeviceAddress. Ver docs/plan-backend-mali.md.
+ *
+ * -1 = auto: se activa cuando el dispositivo NO tiene shaderInt64 ni bufferDeviceAddress ni
+ *            runtimeDescriptorArray pero SI tiene shaderSampledImageArrayDynamicIndexing (perfil Mali-G52).
+ *  0 = forzar apagado (nativo clasico; en una Mali no dibujara: aborta en requisitos[]).
+ *  1 = forzar encendido en cualquier GPU (para probar el camino acotado en PC).
+ */
+REXCVAR_DEFINE_INT32(nfsmw_nativo_mali, -1, "NFSMW",
+                     "Renderizador nativo, sub-modo Mali (sin bindless/Int64/bufferDeviceAddress): constantes por "
+                     "UBO y texturas por descriptores acotados. -1 = auto (se activa en GPUs sin esas features), "
+                     "0 = apagado, 1 = forzado");
+/*
  * Descriptor set 4 by differences (the work is done in NVK, see mesa/parche_nvk_set4.py).
  *
  * vkCmdBindDescriptorSets for set 4 costs 1.3-1.4 us per call in a race and happens in 70-78 % of the
@@ -2152,26 +2170,57 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
   }
 
+  // Decide el sub-modo Mali (nfsmw_nativo_mali) a partir del cvar y de las features del dispositivo.
+  // Auto (-1): se activa en GPUs sin el stack bindless/64-bit pero con indexado dinamico de arrays de
+  // imagenes (el perfil de una Mali-G52). 0 = apagado, 1 = forzado. Las features solo estan rellenas si
+  // vulkan_native_shader_features esta activo, que el sistema grafico nativo ya fuerza.
+  static bool DecidirModoMali(const VulkanDevice::Properties& propiedades) {
+    const int32_t cvar = REXCVAR_GET(nfsmw_nativo_mali);
+    if (cvar == 0) return false;
+    if (cvar == 1) return true;
+    const bool tiene_bindless = propiedades.shaderInt64 && propiedades.bufferDeviceAddress &&
+                                propiedades.runtimeDescriptorArray;
+    return !tiene_bindless && propiedades.shaderSampledImageArrayDynamicIndexing;
+  }
+
   bool Inicializar() {
     const auto& propiedades = dispositivo_->properties();
-    const std::pair<bool, const char*> requisitos[] = {
+    modo_mali_ = DecidirModoMali(propiedades);
+    // El indexado dinamico de arrays de imagenes es la unica feature que el camino acotado (modo Mali) SI
+    // necesita del hardware; el resto (Int64, bufferDeviceAddress, runtimeDescriptorArray, el stack de
+    // descriptor-indexing/bindless) se sustituye por equivalentes clasicos y aqui solo se advierte.
+    const std::pair<bool, const char*> requisitos_siempre[] = {
+        {propiedades.shaderSampledImageArrayDynamicIndexing,
+         "shaderSampledImageArrayDynamicIndexing"},
+    };
+    const std::pair<bool, const char*> requisitos_bindless[] = {
         {propiedades.shaderInt64, "shaderInt64"},
         {propiedades.bufferDeviceAddress, "bufferDeviceAddress"},
         {propiedades.runtimeDescriptorArray, "runtimeDescriptorArray"},
-        {propiedades.shaderSampledImageArrayDynamicIndexing,
-         "shaderSampledImageArrayDynamicIndexing"},
         {propiedades.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound"},
         {propiedades.descriptorBindingSampledImageUpdateAfterBind,
          "descriptorBindingSampledImageUpdateAfterBind"},
         {propiedades.descriptorBindingUpdateUnusedWhilePending,
          "descriptorBindingUpdateUnusedWhilePending"},
     };
-    for (const auto& [presente, nombre] : requisitos) {
+    for (const auto& [presente, nombre] : requisitos_siempre) {
       if (!presente) {
         REXLOG_ERROR("[nativo] C6: el dispositivo Vulkan no tiene {}: no se dibuja", nombre);
         return false;
       }
     }
+    for (const auto& [presente, nombre] : requisitos_bindless) {
+      if (!presente) {
+        if (modo_mali_) {
+          REXLOG_WARN("[nativo] C6: el dispositivo Vulkan no tiene {}; se usa el camino clasico (modo Mali)",
+                      nombre);
+        } else {
+          REXLOG_ERROR("[nativo] C6: el dispositivo Vulkan no tiene {}: no se dibuja", nombre);
+          return false;
+        }
+      }
+    }
+    REXLOG_INFO("[nativo] C6: sub-modo Mali (nfsmw_nativo_mali) = {}", modo_mali_ ? "SI" : "no");
     direccion_bufer_ = reinterpret_cast<FnDireccionBufer>(
         dispositivo_->vulkan_instance()->functions().vkGetDeviceProcAddr(device_,
                                                                           "vkGetBufferDeviceAddress"));
@@ -2179,7 +2228,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         dispositivo_->vulkan_instance()->functions().vkGetDeviceProcAddr(device_, "vkCmdCopyImage"));
     CargarCachePipelines();
     CargarEstadoDinamico();  // dynamic state phases 1 and 2
-    if (!direccion_bufer_ || !CrearSubida() || !CrearDescriptores()) {
+    // En modo Mali las constantes van siempre por UBO (incompatibilidad A): no se usa el puntero de 64
+    // bits, asi que no se exige vkGetBufferDeviceAddress.
+    if ((!direccion_bufer_ && !modo_mali_) || !CrearSubida() || !CrearDescriptores()) {
       return false;
     }
     // The pool is created after CrearDescriptores (where texturas_mb_max_ is read) and before CrearVacias,
@@ -7839,9 +7890,14 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     info.size = kTamanoSubida;
     // UNIFORM_BUFFER because it is also bound as a dynamic UBO (constants through UBOs, set 4).
+    // En modo Mali no se pide SHADER_DEVICE_ADDRESS (la feature bufferDeviceAddress no esta habilitada y
+    // crear el buffer con ese flag seria un error de validacion): las constantes van siempre por UBO.
     info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    if (!modo_mali_) {
+      info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (dfn_.vkCreateBuffer(device_, &info, nullptr, &subida_) != VK_SUCCESS) {
       return false;
@@ -7873,7 +7929,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     banderas.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo reserva{};
     reserva.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    reserva.pNext = &banderas;
+    // En modo Mali no se reserva con DEVICE_ADDRESS (sin la feature bufferDeviceAddress el flag no es valido).
+    reserva.pNext = modo_mali_ ? nullptr : &banderas;
     reserva.allocationSize = requisitos.size;
     reserva.memoryTypeIndex = subida_tipo_;
     if (dfn_.vkAllocateMemory(device_, &reserva, nullptr, &subida_memoria_) != VK_SUCCESS) {
@@ -7888,6 +7945,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       return false;
     }
     subida_datos_ = static_cast<uint8_t*>(mapeado);
+    // En modo Mali las constantes van por UBO, no por puntero de 64 bits: no se calcula la direccion del
+    // buffer (vkGetBufferDeviceAddress podria ni existir). subida_direccion_ queda en 0 y nadie la lee.
+    if (modo_mali_) {
+      subida_direccion_ = 0;
+      return true;
+    }
     VkBufferDeviceAddressInfo direccion{};
     direccion.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
     direccion.buffer = subida_;
@@ -8006,7 +8069,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     // then bound with offsets 0). With an older library it is unnecessary and harmless. No
     // UPDATE_AFTER_BIND: dynamic descriptors do not support it. CrearSubida runs first, so the buffers
     // already exist.
-    usar_ubo_ = REXCVAR_GET(nfsmw_nativo_constantes_ubo);
+    // En modo Mali las constantes van siempre por UBO (incompatibilidad A): la via por puntero de 64 bits
+    // necesita Int64+bufferDeviceAddress, que la Mali no tiene. El cvar solo manda fuera del modo Mali.
+    usar_ubo_ = modo_mali_ || REXCVAR_GET(nfsmw_nativo_constantes_ubo);
     cache_entre_fotogramas_ = REXCVAR_GET(nfsmw_nativo_cache_texturas_entre_fotogramas);
     REXLOG_INFO("[nativo] C6: caches de texturas entre fotogramas (nfsmw_nativo_cache_texturas_entre_fotogramas) = {}",
                 cache_entre_fotogramas_ ? "SI" : "no");
@@ -8025,7 +8090,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       REXLOG_INFO("[nativo] C3: diagnostico de mips (nfsmw_nativo_diag_mips) = SI");
     }
     alineacion_ubo_ = std::max<VkDeviceSize>(16, dispositivo_->properties().minUniformBufferOffsetAlignment);
-    alternar_ubo_s_ = REXCVAR_GET(nfsmw_nativo_constantes_ubo_alternar_s);
+    // El test A/B alterna a modo puntero (necesita Int64+BDA): no tiene sentido ni es viable en Mali.
+    alternar_ubo_s_ = modo_mali_ ? 0 : REXCVAR_GET(nfsmw_nativo_constantes_ubo_alternar_s);
     REXLOG_INFO("[nativo] C6: constantes por UBO dinamico (nfsmw_nativo_constantes_ubo) = {}; alternar cada {} s; "
                 "alineacion {} bytes",
                 usar_ubo_ ? "SI" : "no", alternar_ubo_s_, alineacion_ubo_);
@@ -12097,6 +12163,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   ContextoDestinos* contexto_;
   FnDireccionBufer direccion_bufer_ = nullptr;
   FnCopiarImagen copiar_imagen_ = nullptr;  // resolved faces of the dynamic cubemaps
+  // Sub-modo Mali (nfsmw_nativo_mali): sin bindless/Int64/bufferDeviceAddress. Se decide una vez en
+  // Inicializar() a partir del cvar y de las features del dispositivo, y gobierna el gate de requisitos[],
+  // el forzado de las constantes por UBO y que no se use la direccion de buffer de 64 bits.
+  bool modo_mali_ = false;
 
   VkBuffer subida_ = VK_NULL_HANDLE;
   VkDeviceMemory subida_memoria_ = VK_NULL_HANDLE;
