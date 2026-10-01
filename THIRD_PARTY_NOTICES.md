@@ -49,6 +49,8 @@ This port modifies these files of the SDK's third-party tree; the modified copie
   for AArch64 Horizon and for a build limited to the WMV3 decoder
 - `ffmpeg-overlay/codec_list.c`: registers the WMV3 decoder
 - `CMakeLists.txt`: builds the libraries for the Switch
+- `FFmpeg/config_android_aarch64.h` and `CMakeLists.txt`: the VC-1/WMV3 decoder (with its mpegvideo, H.263 and DSP
+  dependencies, NEON included) for Android arm64
 
 The rest of FFmpeg and libmspack is the unmodified upstream source at the commits pinned by ReXGlue SDK v0.10.0.
 Everything needed to rebuild and relink the NRO with a modified version of either library is in this repository and
