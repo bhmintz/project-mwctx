@@ -665,6 +665,23 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
   }
 
+  // Core Vulkan 1.0 features (members of VkPhysicalDeviceFeatures) used by the native renderer. They must
+  // be read regardless of apiVersion: a 1.1 device (e.g. Mali-G52, driver r26p0) exposes them too. Keeping
+  // shaderSampledImageArrayDynamicIndexing / pipelineStatisticsQuery under the 1.2 guard below left them
+  // reading false on such devices, which blocked the native renderer's Mali sub-mode (nfsmw_nativo_mali).
+  if (REXCVAR_GET(vulkan_native_shader_features)) {
+    XE_UI_VULKAN_FEATURE(shaderInt64)
+    XE_UI_VULKAN_FEATURE(shaderSampledImageArrayDynamicIndexing)
+    // Fragments and vertices shaded per pass (pipeline statistics for the native
+    // renderer). Without the feature the query pool cannot be created.
+    XE_UI_VULKAN_FEATURE(pipelineStatisticsQuery)
+    if (!with_gpu_emulation) {
+      XE_UI_VULKAN_FEATURE(independentBlend)
+      XE_UI_VULKAN_FEATURE(samplerAnisotropy)
+      XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
+    }
+  }
+
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
     if (with_gpu_emulation || REXCVAR_GET(vulkan_native_shader_features)) {
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
@@ -672,11 +689,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
     }
     if (REXCVAR_GET(vulkan_native_shader_features)) {
-      XE_UI_VULKAN_FEATURE(shaderInt64)
-      XE_UI_VULKAN_FEATURE(shaderSampledImageArrayDynamicIndexing)
-      // Fragments and vertices shaded per pass (pipeline statistics for the native
-      // renderer). Without the feature the query pool cannot be created.
-      XE_UI_VULKAN_FEATURE(pipelineStatisticsQuery)
+      // Genuine Vulkan 1.2 features (VkPhysicalDeviceVulkan12Features): only on >= 1.2 devices. On a Mali
+      // 1.1 device these stay false and the Mali sub-mode substitutes them (UBO constants instead of BDA,
+      // bounded descriptors instead of bindless; see nfsmw_nativo_mali in nfsmw_nativo_dibujos.cpp).
       XE_UI_VULKAN_FEATURE_2(features_1_2, bufferDeviceAddress);
       XE_UI_VULKAN_FEATURE_2(features_1_2, runtimeDescriptorArray);
       // Native renderer: unbounded textures and samplers that are added while the
@@ -684,11 +699,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingPartiallyBound);
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingSampledImageUpdateAfterBind);
       XE_UI_VULKAN_FEATURE_2(features_1_2, descriptorBindingUpdateUnusedWhilePending);
-      if (!with_gpu_emulation) {
-        XE_UI_VULKAN_FEATURE(independentBlend)
-        XE_UI_VULKAN_FEATURE(samplerAnisotropy)
-        XE_UI_VULKAN_FEATURE(fullDrawIndexUint32)
-      }
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
