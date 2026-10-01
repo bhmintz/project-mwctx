@@ -208,6 +208,49 @@ config sino por silicio. Actualizar driver no lo salva (sigue sin Int64/bindless
 
 ---
 
+## 5ter. Resultado del experimento con el backend portable (xenos) — 2025-10-01
+
+Se probó forzar el backend portable de Xenia (`nfsmw_renderizador = "xenos"` en
+`android/app/src/main/assets/nfsmw.toml`) + 3 parches en `sdk/src/graphics/vulkan/command_processor.cpp`
+para que **degrade en vez de abortar** (commit `0698a6b`):
+- init: no abortar por `vertexPipelineStoresAndAtomics` (línea ~940) ni por `fillModeNonSolid` (~958).
+- IssueDraw: omitir (return true) los draws cuyo vertex shader hace memexport (~3674), en vez de abortar.
+
+**Resultado: llegó mucho más lejos que el nativo, pero se cuelga.** Secuencia (run4):
+- ✅ Swapchain creado (`VulkanPresenter: Created 2194x1017 / 2400x1080 swapchain`).
+- ✅ VulkanTextureCache con fallbacks de formato para Mali (k_16_16, DXT*, etc.).
+- ✅ Empieza la 1ª pipeline: `Creating graphics pipeline state with VS 6DD9DD04… , PS 2B4F1D2C…` (12:07:36).
+- ❌ **Se cuelga ahí.** El hilo de render no registra nada más en ~80 s; solo sigue el audio, que a los
+  ~80 s también se atasca ("[audio] … 250 ms sin avanzar; entra en rescate").
+- El proceso NO crashea: lo cierra el usuario → `ActivityManager: Killing … (adj 905): remove task`
+  (`remove task` = quitado de recientes; no es OOM, ni watchdog, ni SIGSEGV).
+
+**Diagnóstico:** el backend portable se bloquea **dentro del driver Mali compilando la primera
+pipeline/shader** (`vkCreateGraphicsPipelines` sobre el SPIR-V traducido por Xenia). El driver r26p0 no
+digiere esos shaders en tiempo razonable. Por eso no renderiza y, a diferencia del nativo, **tampoco
+suena** (el hilo de render bloqueado acaba congelando el proceso).
+
+**Conclusión (los dos caminos tapiados en Mali-G52):**
+- **Nativo**: la Mali no tiene `shaderInt64`/bindless/BDA → ni prepara los dibujos.
+- **Xenos portable**: el driver Mali se cuelga compilando los shaders traducidos en runtime.
+- Esto explica *por qué* existe el renderizador nativo: precompila shaders a `.nfsp` (XenosRecomp→DXC)
+  justo para evitar la compilación en runtime que mata al driver Mali. Catch-22.
+
+**Qué quedaría por intentar (todo mayor, sin garantía):**
+1. Confirmar si es *cuelgue* o solo *lentísimo*: relanzar y esperar varios minutos (gratis, sin recompilar)
+   a ver si la 1ª pipeline termina alguna vez y aparece un frame.
+2. `async_shader_compilation` (cvar, default true): ver por qué no evita el bloqueo del hilo de render en
+   la 1ª pipeline (¿el juego espera la pipeline antes de presentar?).
+3. Reducir/simplificar los shaders traducidos para que el compilador Mali no se atore (trabajo en el
+   traductor SPIR-V de Xenia) — difícil.
+4. Driver Mali más nuevo (25.x/Vulkan 1.2) expone más y podría compilar mejor; no disponible en A32 de stock.
+
+Estado del repo tras el experimento: commit `0698a6b` deja el modo xenos activo. Para volver al nativo:
+`git checkout 0698a6b~1 -- android/app/src/main/assets/nfsmw.toml` (o revertir el commit). Los parches de
+`command_processor.cpp` son inocuos si se vuelve a "nativo".
+
+---
+
 ## 6. Datos de referencia (para no recapturar)
 
 - GPU: `Mali-G52 MC2`, vendor `0x13B5`, device `0x74021000`.
