@@ -46,17 +46,38 @@ La buena noticia: una ya existe a medias en el código.
 - Esfuerzo: **bajo-medio** (la lógica ya está; es sellar la vía 64-bit).
 
 ### (B) Texturas bindless ilimitadas → array acotado con indexado dinámico  **[EL TRABAJO REAL]**
-- Dónde (shaders): `shader_common.h:136-139` y `XenosRecomp/shader_common.h` —
-  `Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);` (+ 3D, Cube, Sampler), indexado
-  por `resourceDescriptorIndex` (`tfetch2D`, líneas 148+). Array **ilimitado** → `runtimeDescriptorArray`
-  + update-after-bind + partially-bound (Mali ❌).
-- Dónde (C++): `app/src/nfsmw_nativo_dibujos.cpp` `CrearDescriptores()` y la gestión del heap bindless;
-  la lista de requisitos en `Inicializar()` (~línea 2157).
-- Sustituto Mali: **array ACOTADO** (p.ej. `Texture2D g_Textures[256]`) indexado dinámicamente — la Mali
-  **sí** soporta `shaderSampledImageArrayDynamicIndexing`. Gestionar los slots por frame (reusar/rotar),
-  sin update-after-bind. Es más trabajo de C++ (pool de descriptores acotado, rebinding por lote) que de
-  shader (cambiar la declaración del array a tamaño fijo).
-- Esfuerzo: **medio-alto**. Es el núcleo del backend.
+
+> **NO se reescribe el sistema de texturas del X360.** Solo cambia la "última milla": cómo una textura
+> YA resuelta se expone al shader (bindless → descriptores clásicos). Detalle abajo.
+
+**Lo que se REUTILIZA tal cual (es agnóstico de GPU y ya funciona en Mali):**
+- Destiling/untiling, formatos Xenos (k_8_8_8_8, k_DXT1, k_10_11_11, swizzle del fetch constant, orden de
+  bytes): `app/src/nfsmw_nativo_dibujos.cpp:1649+`.
+- Resolver **fetch constant del juego → `VkImageView`**, con caché por registro, caché entre fotogramas,
+  subida y `en_vuelo_`: `nfsmw_nativo_dibujos.cpp:2744` y alrededores (`VkImageView vista`, línea 2064).
+- Fallbacks de formato para Mali: ya vistos funcionando en el run del xenos
+  (`VulkanTextureCache: k_16_16 … via fallback format`).
+- La lista de "qué texturas usa este draw" ya se calcula al resolver por fetch constant → se reaprovecha.
+
+**Lo que CAMBIA (la capa de binding, 2 puntos de contacto):**
+1. Shader: `shader_common.h:136-139` y `XenosRecomp/shader_common.h` —
+   `Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);` (+ 3D, Cube, Sampler), indexado
+   por `resourceDescriptorIndex` (`tfetch2D`, líneas 148+). Array **ilimitado** → `runtimeDescriptorArray`
+   + update-after-bind + partially-bound (Mali ❌). Sustituir por slots fijos `g_Textures[slot]` o un array
+   **ACOTADO** `g_Textures[N]` indexado dinámicamente (la Mali **sí** tiene
+   `shaderSampledImageArrayDynamicIndexing`). Regenerar el `.nfsp`.
+2. C++: `app/src/nfsmw_nativo_dibujos.cpp` `CrearDescriptores()` + el write del heap bindless. En vez de
+   escribir el `VkImageView` en el array global y pasar índice, asignar un **descriptor set por draw/lote**
+   con las N texturas del draw en bindings fijos (sets 2-3, patrón Vita3K §7.4) y vincularlo. Relajar la
+   lista `requisitos[]` de `Inicializar()` (~línea 2157). Igual con los samplers
+   (`g_SamplerDescriptorHeap[]`).
+
+**Lo tedioso/arriesgado:** mapear `resourceDescriptorIndex` del juego → slot 0..N-1 por draw; gestionar el
+**churn de descriptor sets por frame** (con streaming hay muchas texturas → pool con reset/rotación por
+frame, patrón Vita3K); regenerar shaders y validar el muestreo.
+
+- Esfuerzo: **medio-alto**. Es el núcleo del backend, pero es UNA capa delimitada (binding), no reescribir
+  el decodificado/caché de texturas del X360.
 
 ### (C) memexport desde vertex shader → omitir o compute  **[ACOTADO]**
 - La Mali no tiene `vertexPipelineStoresAndAtomics`. Los draws cuyo VS escribe memoria (memexport) no
