@@ -251,6 +251,50 @@ Estado del repo tras el experimento: commit `0698a6b` deja el modo xenos activo.
 
 ---
 
+## 5quater. Hito: el nativo YA inicializa en Mali; el muro es compilar la 1ª pipeline (2026-10-01)
+
+Tras dos arreglos nuevos (ver rama `claude/relaxed-ride-zku3z6`, PR #1):
+- **Fix de memoria** (`85f74e2`, `sdk/src/system/xmemory.cpp`): el bucle de access-violation era un
+  desajuste host↔guest (una página-guarda NoAccess sobrevivía a un Release y la siguiente reasignación no
+  reponía la protección del host). Con esto el juego **avanza de verdad** (lógica + audio).
+- **Sub-modo Mali del nativo** (`ccd3c70` + Fase 0): el gate ya no aborta; constantes por UBO; sin BDA.
+- **Features core-1.0 fuera del guard de 1.2** (`ccd3c70`): el logcat mostró que el gate abortaba en
+  `shaderSampledImageArrayDynamicIndexing`, no en `shaderInt64`. Causa: tres features **core de Vulkan 1.0**
+  estaban dentro de `if (apiVersion >= 1.2)` en `vulkan_device.cpp`, y la Mali es **1.1.131**, así que no se
+  leían. Movidas fuera del guard.
+
+### Lo que dice el logcat ahora (modo Mali activo)
+- `[nativo] C6: sub-modo Mali (nfsmw_nativo_mali) = SI` ✅ — el nativo **inicializa completo** en Mali.
+- `* shaderSampledImageArrayDynamicIndexing` ✅ — la Mali **SÍ** tiene indexado dinámico de arrays de
+  imágenes (el plan lo asumía; confirmado). El muro era el guard de versión, no el silicio.
+- Int64 / bufferDeviceAddress / runtimeDescriptorArray / descriptorBinding* → ❌ (warnings "camino clásico").
+- **0 pipelines creadas** en toda la captura, **sin `causa 51/53`** (no hay rechazo) y **sin presentar**.
+- `[vigilante]`: los 17 hilos del juego se **congelan 5-11 s** y reviven (×4). `[espera_anillo]`: el ring
+  casi no avanza (≈4270/4870 esperas agotan el plazo). El audio genera tramas a ráfagas pero se queda sin
+  ellas → **deja de oírse** (efecto, no causa: ahora el juego SÍ intenta renderizar y se atasca).
+
+**Conclusión:** la Mali se **atasca dentro de `vkCreateGraphicsPipelines`** compilando la 1ª pipeline desde
+el SPIR-V del `.nfsp`, que todavía pide `Int64` (puntero de constantes) y `runtimeDescriptorArray` (heaps
+bindless `g_Texture*DescriptorHeap[]`). Es el mismo muro del experimento xenos, pero por SPIR-V inválido/pesado
+para el driver, no por compilar en runtime. Falta **Fase 1** (sellar el `uint64_t`) + **Fase 2** (texturas
+acotadas) + **regenerar el `.nfsp`**.
+
+### Restricciones reales para la Fase 2 (de este logcat)
+- `maxPerStageDescriptorSampledImages = 256`. El heap actual es `kCapacidadMonton = {4096,16,64,512}`
+  (2D/3D/cubo/sampler). **Un array acotado no puede ser 4096**: sin `UPDATE_AFTER_BIND` el límite por etapa
+  es 256. → Hay que usar un **descriptor set por draw/lote** con solo las texturas de ese draw (un puñado,
+  ≤16-32) y **remapear** `resourceDescriptorIndex` → slot 0..N-1 (patrón Vita3K §7.4). La Mali sí permite
+  indexar ese array acotado dinámicamente (`shaderSampledImageArrayDynamicIndexing`).
+- Sin `descriptorBinding*` (bindless/update-after-bind/partially-bound): el layout y el pool deben crearse
+  **sin** esos flags, y los descriptores escribirse **antes** de vincular (no durante la grabación como hoy).
+
+### Test gratis pendiente (slow vs. deadlock)
+Dejar la app 2-3 min quieta tras entrar: si alguna vez aparece `[nativo] C6: pipeline 1 (VS ...)` o un
+destello de imagen, es **lentitud** (sirve compilación asíncrona); si nunca, es cuelgue duro del driver con
+ese SPIR-V (hay que quitar Int64/bindless sí o sí). No requiere recompilar.
+
+---
+
 ## 6. Datos de referencia (para no recapturar)
 
 - GPU: `Mali-G52 MC2`, vendor `0x13B5`, device `0x74021000`.
