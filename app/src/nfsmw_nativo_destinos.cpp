@@ -4914,7 +4914,10 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       return;
     }
     const auto antes_espera = std::chrono::steady_clock::now();
-    dfn_.vkWaitForFences(device_, 1, &ranura.fence, VK_TRUE, UINT64_MAX);
+    {
+      MarcaSondaMali sonda("vkWaitForFences (ranura de trabajo)");
+      dfn_.vkWaitForFences(device_, 1, &ranura.fence, VK_TRUE, UINT64_MAX);
+    }
     ns_esperas_gpu_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     std::chrono::steady_clock::now() - antes_espera)
                                     .count());
@@ -5156,6 +5159,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
         const auto antes_candado = std::chrono::steady_clock::now();  // "C2: presentar" report
         const auto cola = dispositivo_->AcquireQueue(familia_, 0);
         const auto antes_envio = std::chrono::steady_clock::now();
+        MarcaSondaMali sonda_envio("vkQueueSubmit (trabajo)");
         if (dfn_.vkQueueSubmit(cola.queue(), 1, &envio, ranuras_[ranura_].fence) != VK_SUCCESS) {
           return false;
         }
@@ -5192,7 +5196,10 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   void EsperarSalidas() {
     for (uint32_t i = 0; i < kRanurasSalida; ++i) {
       if (salidas_pendientes_[i]) {
-        dfn_.vkWaitForFences(device_, 1, &fences_salida_[i], VK_TRUE, UINT64_MAX);
+        {
+          MarcaSondaMali sonda("vkWaitForFences (salida, todas)");
+          dfn_.vkWaitForFences(device_, 1, &fences_salida_[i], VK_TRUE, UINT64_MAX);
+        }
         dfn_.vkResetFences(device_, 1, &fences_salida_[i]);
         salidas_pendientes_[i] = false;
       }
@@ -5591,7 +5598,10 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     const uint32_t s = salida_sin_espera_ ? (salida_actual_ + 1) % kRanurasSalida : 0;
     if (salidas_pendientes_[s]) {
       const auto antes_espera = std::chrono::steady_clock::now();  // "C2: presentar" report
-      dfn_.vkWaitForFences(device_, 1, &fences_salida_[s], VK_TRUE, UINT64_MAX);
+      {
+        MarcaSondaMali sonda("vkWaitForFences (salida)");
+        dfn_.vkWaitForFences(device_, 1, &fences_salida_[s], VK_TRUE, UINT64_MAX);
+      }
       ns_espera_salida_ += Ns(antes_espera, std::chrono::steady_clock::now());
       ++esperas_salida_;
       dfn_.vkResetFences(device_, 1, &fences_salida_[s]);
@@ -5747,6 +5757,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       const auto antes_candado = std::chrono::steady_clock::now();  // "C2: presentar" report
       const auto cola = dispositivo_->AcquireQueue(familia_, 0);
       const auto antes_envio = std::chrono::steady_clock::now();
+      MarcaSondaMali sonda_envio("vkQueueSubmit (salida)");
       if (dfn_.vkQueueSubmit(cola.queue(), 1, &envio, fences_salida_[s]) != VK_SUCCESS) {
         return false;
       }

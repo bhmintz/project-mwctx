@@ -30,6 +30,57 @@ En la rama, confirmado por logcat del dispositivo:
 - ⚠️ **`maxPerStageDescriptorSampledImages = 256`** (límite duro sin update-after-bind).
 - API **Vulkan 1.1.131** (no 1.2): afecta `-fspv-target-env` y qué extensiones hay.
 
+## 0bis. CORRECCIÓN (sesión local 2026-10-01): el muro NO era la compilación de pipelines
+
+Con una sonda (`[mali-sonda]`, `nfsmw_nativo_dibujos.cpp`: vigilante que informa cada 5 s en qué llamada al
+driver está el anillo, y un log por paso de `Inicializar`) se vio que **nunca se llega a crear una pipeline**:
+la Mali se colgaba dentro de **`vkCreatePipelineLayout`** (más de 110 s, sin error ni log del driver). Ese
+layout era inválido en este dispositivo por dos razones:
+
+1. **`maxBoundDescriptorSets = 4`**, y el layout usa **5 sets** (0-3 montones + 4 UBO). ← muro real.
+2. Montones bindless de 4096+16+64 imágenes y 512 samplers con flags de *descriptor indexing*/UAB, cuando
+   los límites son `maxPerStageDescriptorSampledImages = 256` y `maxPerStageDescriptorSamplers = 128`, y la
+   extensión ni está habilitada.
+
+Hecho ya (solo en `modo_mali_`): montones acotados `kCapacidadMontonMali = {160,16,64,96}` sin flags ni UAB,
+con todos los slots rellenos con la textura/sampler vacíos (no hay PARTIALLY_BOUND); y un chequeo de
+`maxBoundDescriptorSets` que hace **fallar limpio** en vez de colgar → el juego ya no se congela y **el
+sonido vuelve** (pantalla negra: el nativo no inicializa).
+
+Otros datos medidos: Vulkan 1.1 con solo `VK_KHR_spirv_1_4` → acepta SPIR-V ≤ 1.4, pero el DXC WASM del
+instalador (`shaders/wasm/dxc_web.cpp:78`) fija `-fspv-target-env=vulkan1.2` (SPIR-V 1.5). La variante Mali
+debe usar `-fspv-target-env=vulkan1.1spirv1.4`. El `dxc.exe` del Windows SDK no trae SPIR-V; hace falta el
+del Vulkan SDK.
+
+**Siguiente paso:** variante Mali de los shaders con **4 sets**, p. ej. samplers en el set 0 binding 1
+(`[[vk::binding(1,0)]]`), 3D→set 1, cubo→set 2, UBO→set 3 (hoy `[[vk::binding(n,4)]]`, shader_common.h:92-94),
+arrays acotados (Fase 2 §4.1) y sin `uint64_t` (Fase 1); y el C++ del modo Mali con el layout equivalente.
+
+### 0ter. Estado al cierre de la sesión local (2026-10-01, noche)
+
+Hecho y probado en el dispositivo:
+- **Variante Mali de los shaders** (`NFSMW_MALI` en las 3 copias de `shader_common.h`): 4 sets (2D+samplers
+  set 0, 3D set 1, cubo set 2, UBO set 3), montones acotados, sin `uint64_t` (el `1ull` de los texcoords
+  incluido), `NFSMW_UBO` fijo. La biblioteca normal sale **byte a byte igual a la oficial** (comprobado).
+- **`tools/biblioteca_shaders_mali.mjs`**: arma el `.nfsp` Mali con el pipeline del instalador, DXC nativo
+  de WSL (`~/dxc`, release oficial v1.9.2609) con `vulkan1.1spirv1.4` y `spirv-val` del NDK; rechaza
+  Int64/RuntimeDescriptorArray/PhysicalStorageBuffer. Lee el juego por `adb:` de a un archivo y deja los
+  contenedores en `out/contenedores_cache` (después no hace falta ni el juego ni el celular).
+- C++ modo Mali con el layout de 4 sets (`SetsMontones()`/`SetUbo()`).
+- **BC (DXT) en CPU**: la Mali-G52 no muestrea BC; crear/copiar una imagen BC crasheaba dentro de
+  `vkCmdCopyBufferToImage` (visto con simpleperf: el hilo del anillo girando en el manejador de señales).
+  Ahora BC1-3→RGBA8, BC4→R8, BC5→RG8 en `SubirTextura`.
+- Resultado: **el nativo corre en la Mali** (1300+ Swaps, 22k dibujos, 33 pipelines, sin cuelgues, con
+  sonido), pero la pantalla sale **gris uniforme (#303030)**: siguiente cosa a investigar.
+
+Pendiente / a revisar:
+- Imagen gris: ¿qué llega a la salida? (comprobar que los dibujos escriben color, UBOs con datos, índices de
+  textura dentro del techo, escrituras de descriptores con el set enlazado: sin UAB es inválido, Fase 2 §4.3).
+- `android/app/build.gradle` tiene `debuggable true` TEMPORAL (para simpleperf): revertir antes de publicar.
+- El manejador de excepciones (`exception_handler_posix.cpp`) reintenta para siempre un SIGSEGV del host
+  dentro del driver en vez de abortar: convendría que crashee con tombstone.
+- Los SPIR-V embebidos (`kSpirvResplandor*`) son bindless/vulkan1.2: no valen en Mali si se activan.
+
 ## 1. El muro y la meta
 
 **Muro:** la Mali se **atasca dentro de `vkCreateGraphicsPipelines`** compilando la 1ª pipeline, porque el

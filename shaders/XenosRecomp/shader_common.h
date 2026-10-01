@@ -74,6 +74,22 @@
 
 #ifdef __spirv__
 
+#ifdef NFSMW_MALI
+// NFSMW (Mali-G52 variant, tools/biblioteca_shaders_mali.mjs): no shaderInt64 and no bufferDeviceAddress, so
+// there is no 64-bit pointer. The constants always come from the UBOs; the pointer branch the translator
+// emits still has to compile, so the builder rewrites vk::RawBufferLoad as NfsmwSinPuntero, which returns 0.
+struct PushConstants
+{
+    uint VertexShaderConstants;
+    uint PixelShaderConstants;
+    uint SharedConstants;
+};
+static const PushConstants g_PushConstants = (PushConstants)0;
+template<typename T> T NfsmwSinPuntero(uint direccion) { return (T)0; }
+template<typename T> T NfsmwSinPuntero(uint direccion, uint alineacion) { return (T)0; }
+// maxBoundDescriptorSets = 4: the samplers go in set 0 binding 1 and the UBO set is 3.
+#define NFSMW_SET_UBO 3
+#else
 struct PushConstants
 {
     uint64_t VertexShaderConstants;
@@ -82,6 +98,8 @@ struct PushConstants
 };
 
 [[vk::push_constant]] ConstantBuffer<PushConstants> g_PushConstants;
+#define NFSMW_SET_UBO 4
+#endif
 
 // NFSMW: the same blocks of the upload buffer, also as dynamic UBOs in set 4. With
 // -fvk-use-dx-layout each float4 takes 16 contiguous bytes, so any 4-byte word of the shared block is
@@ -89,10 +107,14 @@ struct PushConstants
 struct NfsmwBloqueVs { float4 v[256]; };
 struct NfsmwBloquePs { float4 v[224]; };
 struct NfsmwBloqueCompartidas { float4 v[23]; };
-[[vk::binding(0, 4)]] ConstantBuffer<NfsmwBloqueVs> g_UboVertex;
-[[vk::binding(1, 4)]] ConstantBuffer<NfsmwBloquePs> g_UboPixel;
-[[vk::binding(2, 4)]] ConstantBuffer<NfsmwBloqueCompartidas> g_UboCompartidas;
+[[vk::binding(0, NFSMW_SET_UBO)]] ConstantBuffer<NfsmwBloqueVs> g_UboVertex;
+[[vk::binding(1, NFSMW_SET_UBO)]] ConstantBuffer<NfsmwBloquePs> g_UboPixel;
+[[vk::binding(2, NFSMW_SET_UBO)]] ConstantBuffer<NfsmwBloqueCompartidas> g_UboCompartidas;
+#ifdef NFSMW_MALI
+#define NFSMW_UBO true
+#else
 #define NFSMW_UBO ((g_SpecConstants & SPEC_CONSTANT_CONSTANTES_UBO) != 0)
+#endif
 #define NFSMW_COMPARTIDA_UINT(B)  asuint(g_UboCompartidas.v[(B) / 16][((B) % 16) / 4])
 #define NFSMW_COMPARTIDA_FLOAT(B) g_UboCompartidas.v[(B) / 16][((B) % 16) / 4]
 
@@ -133,10 +155,19 @@ uint g_SpecConstants();
 
 #endif
 
+#ifdef NFSMW_MALI
+// Bounded heaps, no runtimeDescriptorArray (kCapacidadMontonMali in nfsmw_nativo_dibujos.cpp: 240 sampled
+// images and 96 samplers, under the 256 and 128 per stage of the Mali-G52).
+[[vk::binding(0, 0)]] Texture2D<float4> g_Texture2DDescriptorHeap[160];
+[[vk::binding(0, 1)]] Texture3D<float4> g_Texture3DDescriptorHeap[16];
+[[vk::binding(0, 2)]] TextureCube<float4> g_TextureCubeDescriptorHeap[64];
+[[vk::binding(1, 0)]] SamplerState g_SamplerDescriptorHeap[96];
+#else
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
 Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
 TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
 SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
+#endif
 
 uint2 getTexture2DDimensions(Texture2D<float4> texture)
 {
@@ -299,7 +330,11 @@ float4 tfetchR11G11B10(uint4 value)
 
 float4 tfetchTexcoord(uint swappedTexcoords, float4 value, uint semanticIndex)
 {
+#ifdef NFSMW_MALI
+    return (swappedTexcoords & (1u << semanticIndex)) != 0 ? value.yxwz : value;  // no Int64 (texcoords < 32)
+#else
     return (swappedTexcoords & (1ull << semanticIndex)) != 0 ? value.yxwz : value;
+#endif
 }
 
 // NFSMW: 3 bits per component: 0-3 = data component, 4 = 0, 5 = 1, 7 = unchanged.

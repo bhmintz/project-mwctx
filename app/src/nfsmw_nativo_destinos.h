@@ -139,4 +139,13 @@ class DestinosNativos {
   virtual void CostePresentar(uint64_t coste[12]) const = 0;
 };
 
+// Mali (diagnostic, nfsmw_nativo_dibujos.cpp): marks a driver call so the watcher can say where a thread
+// hangs. A no-op unless Mali mode started the watcher.
+void SondaMaliEntrar(const char* que);
+void SondaMaliSalir();
+struct MarcaSondaMali {
+  explicit MarcaSondaMali(const char* que) { SondaMaliEntrar(que); }
+  ~MarcaSondaMali() { SondaMaliSalir(); }
+};
+
 }  // namespace nfsmw::nativo

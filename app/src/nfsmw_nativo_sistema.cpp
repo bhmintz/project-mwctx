@@ -3606,7 +3606,10 @@ class SistemaGraficoNativo final : public rex::system::IGraphicsSystem {
 
     // A single command buffer: wait for the previous one before reusing it.
     if (fence_pendiente_) {
-      dfn.vkWaitForFences(device, 1, &fence_, VK_TRUE, UINT64_MAX);
+      {
+        MarcaSondaMali sonda("vkWaitForFences (sistema)");
+        dfn.vkWaitForFences(device, 1, &fence_, VK_TRUE, UINT64_MAX);
+      }
       dfn.vkResetFences(device, 1, &fence_);
       fence_pendiente_ = false;
     }
@@ -3675,6 +3678,7 @@ class SistemaGraficoNativo final : public rex::system::IGraphicsSystem {
     envio.pCommandBuffers = &comandos_;
     {
       const auto cola = dispositivo->AcquireQueue(dispositivo->queue_family_graphics_compute(), 0);
+      MarcaSondaMali sonda_envio("vkQueueSubmit (sistema)");
       if (dfn.vkQueueSubmit(cola.queue(), 1, &envio, fence_) != VK_SUCCESS) {
         return false;
       }

@@ -76,6 +76,7 @@ static const uint32_t kSpirvResplandorSuave[1] = {0};
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <new>
 #include <thread>
 #include <type_traits>
@@ -1122,6 +1123,78 @@ inline uint32_t CategoriaDeDestino(uint32_t pitch, const uint64_t* claves) {
   return kGpuMenores;
 }
 
+/*
+ * Mali (diagnostic): what the ring thread is doing inside the driver. On the Mali-G52 the ring stops
+ * inside the first pipeline creation and the release APK cannot be inspected with debuggerd, so the ring
+ * marks the driver call here and a watcher thread reports every few seconds how long it has been inside.
+ * That tells slowness (it eventually returns, with its time) from a hang (it never does). Mali mode only.
+ */
+struct SondaDriver {
+  std::atomic<const char*> que{nullptr};
+  std::atomic<int64_t> desde_ns{0};
+  std::atomic<int> vs{-1};
+  std::atomic<int> ps{-1};
+  std::atomic<const char*> ultimo{nullptr};  // last mark left, for hangs outside any mark
+  std::atomic<int64_t> ultimo_ns{0};
+};
+SondaDriver g_sonda_driver;
+
+int64_t AhoraNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+std::atomic<bool> g_sonda_activa{false};
+
+void LanzarVigilanteSonda() {
+  static std::once_flag una_vez;
+  std::call_once(una_vez, [] {
+    g_sonda_activa = true;
+    std::thread([] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        const char* que = g_sonda_driver.que.load();
+        if (!que) {
+          const char* ultimo = g_sonda_driver.ultimo.load();
+          const double s = double(AhoraNs() - g_sonda_driver.ultimo_ns.load()) / 1e9;
+          if (ultimo && s >= 5.0) {
+            REXLOG_WARN("[mali-sonda] {:.1f} s sin marcas; la ultima fue al salir de {}", s, ultimo);
+          }
+          continue;
+        }
+        const double s = double(AhoraNs() - g_sonda_driver.desde_ns.load()) / 1e9;
+        if (s >= 3.0) {
+          REXLOG_WARN("[mali-sonda] el anillo lleva {:.1f} s dentro de {} (VS n{} PS n{})", s, que,
+                      g_sonda_driver.vs.load(), g_sonda_driver.ps.load());
+        }
+      }
+    }).detach();
+  });
+}
+
+class MarcaSonda {
+ public:
+  MarcaSonda(bool activa, const char* que, int vs, int ps) : activa_(activa) {
+    if (activa_) {
+      g_sonda_driver.vs = vs;
+      g_sonda_driver.ps = ps;
+      g_sonda_driver.desde_ns = AhoraNs();
+      g_sonda_driver.que = que;
+    }
+  }
+  ~MarcaSonda() {
+    if (activa_) {
+      g_sonda_driver.ultimo = g_sonda_driver.que.load();
+      g_sonda_driver.ultimo_ns = AhoraNs();
+      g_sonda_driver.que = nullptr;
+    }
+  }
+
+ private:
+  bool activa_;
+};
+
 namespace gr = rex::graphics;
 namespace xenos = rex::graphics::xenos;
 using rex::ui::vulkan::VulkanDevice;
@@ -1133,6 +1206,8 @@ constexpr uint32_t kRegBooleanos = 0x4900;
 constexpr uint32_t kRegistrosConstantes = 0x400;  // 256 constantes x 4
 
 constexpr uint32_t kCapacidadMonton[4] = {4096, 16, 64, 512};  // 2D, 3D, cubo, samplers
+// Mali mode: 160+16+64 = 240 sampled images (limit 256 per stage) and 96 samplers (limit 128).
+constexpr uint32_t kCapacidadMontonMali[4] = {160, 16, 64, 96};
 // Work slots. The ones actually used are chosen by nfsmw_nativo_ranuras_trabajo; this is the room reserved
 // for them, and it has to match the array in nfsmw_nativo_destinos.cpp.
 constexpr size_t kRanurasDeTrabajo = 3;
@@ -2041,8 +2116,167 @@ struct RegistroPipeline {
 static_assert(std::has_unique_object_representations_v<RegistroPipeline>,
               "RegistroPipeline se guarda en disco byte a byte: sin relleno implicito");
 
+/*
+ * BC (DXT) decoding on the CPU, for GPUs that cannot sample BC (the Mali-G52: ETC2/ASTC only). Creating a
+ * BC image there and copying into it crashes inside the driver's vkCmdCopyBufferToImage (seen as a ring
+ * thread spinning in the signal handler). Mali mode only, and only when the format is not sampleable:
+ * BC1/BC2/BC3 -> RGBA8, BC4 -> R8, BC5 -> RG8 (the view swizzles stay the same).
+ */
+bool EsFormatoBc(VkFormat formato) {
+  return formato == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || formato == VK_FORMAT_BC2_UNORM_BLOCK ||
+         formato == VK_FORMAT_BC3_UNORM_BLOCK || formato == VK_FORMAT_BC4_UNORM_BLOCK ||
+         formato == VK_FORMAT_BC5_UNORM_BLOCK;
+}
+
+VkFormat FormatoBcDecodificado(VkFormat formato) {
+  switch (formato) {
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+      return VK_FORMAT_R8_UNORM;
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+      return VK_FORMAT_R8G8_UNORM;
+    default:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+  }
+}
+
+uint32_t BytesTexelBcDecodificado(VkFormat formato) {
+  return formato == VK_FORMAT_BC4_UNORM_BLOCK ? 1 : formato == VK_FORMAT_BC5_UNORM_BLOCK ? 2 : 4;
+}
+
+// The 4x4 colors of a BC1 color block, RGBA8. forzar_4 = BC2/BC3 (always the four-color mode).
+void DecodificarColorBc1(const uint8_t* b, bool forzar_4, uint8_t salida[16][4]) {
+  const uint16_t c0 = uint16_t(b[0] | (b[1] << 8));
+  const uint16_t c1 = uint16_t(b[2] | (b[3] << 8));
+  uint8_t paleta[4][4];
+  const auto expandir = [](uint16_t c, uint8_t* p) {
+    p[0] = uint8_t(((c >> 11) & 31) * 255 / 31);
+    p[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+    p[2] = uint8_t((c & 31) * 255 / 31);
+    p[3] = 255;
+  };
+  expandir(c0, paleta[0]);
+  expandir(c1, paleta[1]);
+  for (int k = 0; k < 3; ++k) {
+    if (c0 > c1 || forzar_4) {
+      paleta[2][k] = uint8_t((2 * paleta[0][k] + paleta[1][k]) / 3);
+      paleta[3][k] = uint8_t((paleta[0][k] + 2 * paleta[1][k]) / 3);
+    } else {
+      paleta[2][k] = uint8_t((paleta[0][k] + paleta[1][k]) / 2);
+      paleta[3][k] = 0;
+    }
+  }
+  paleta[2][3] = 255;
+  paleta[3][3] = (c0 > c1 || forzar_4) ? 255 : 0;
+  const uint32_t indices = uint32_t(b[4]) | (uint32_t(b[5]) << 8) | (uint32_t(b[6]) << 16) | (uint32_t(b[7]) << 24);
+  for (int i = 0; i < 16; ++i) {
+    std::memcpy(salida[i], paleta[(indices >> (2 * i)) & 3], 4);
+  }
+}
+
+// A BC4 block (also the alpha of BC3 and each channel of BC5): 16 values.
+void DecodificarCanalBc4(const uint8_t* b, uint8_t salida[16]) {
+  const uint32_t a0 = b[0], a1 = b[1];
+  uint8_t paleta[8];
+  paleta[0] = uint8_t(a0);
+  paleta[1] = uint8_t(a1);
+  if (a0 > a1) {
+    for (uint32_t i = 1; i < 7; ++i) paleta[i + 1] = uint8_t(((7 - i) * a0 + i * a1) / 7);
+  } else {
+    for (uint32_t i = 1; i < 5; ++i) paleta[i + 1] = uint8_t(((5 - i) * a0 + i * a1) / 5);
+    paleta[6] = 0;
+    paleta[7] = 255;
+  }
+  uint64_t indices = 0;
+  for (int i = 0; i < 6; ++i) indices |= uint64_t(b[2 + i]) << (8 * i);
+  for (int i = 0; i < 16; ++i) salida[i] = paleta[(indices >> (3 * i)) & 7];
+}
+
+// Decodes all levels, layer after layer, from the BC layout ReadLevel leaves (tight blocks per level) to
+// tight texels; rewrites desplazamiento_nivel for the new layout.
+void DecodificarBc(VkFormat formato, uint32_t ancho, uint32_t alto, uint32_t rebanadas, uint32_t niveles,
+                   const std::vector<uint8_t>& origen, std::array<uint32_t, 16>& desplazamientos,
+                   std::vector<uint8_t>& destino) {
+  const uint32_t bytes_bloque =
+      formato == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || formato == VK_FORMAT_BC4_UNORM_BLOCK ? 8 : 16;
+  const uint32_t bpp = BytesTexelBcDecodificado(formato);
+  size_t total = 0;
+  for (uint32_t n = 0; n < niveles; ++n) {
+    total += size_t(std::max(ancho >> n, 1u)) * std::max(alto >> n, 1u) * bpp * rebanadas;
+  }
+  destino.assign(total, 0);
+  size_t escrito = 0;
+  for (uint32_t n = 0; n < niveles; ++n) {
+    const uint32_t w = std::max(ancho >> n, 1u), h = std::max(alto >> n, 1u);
+    const uint32_t bx = (w + 3) / 4, by = (h + 3) / 4;
+    const size_t bytes_rebanada_bc = size_t(bx) * by * bytes_bloque;
+    const size_t bytes_rebanada = size_t(w) * h * bpp;
+    const size_t leido = desplazamientos[n];
+    desplazamientos[n] = uint32_t(escrito);
+    for (uint32_t r = 0; r < rebanadas; ++r) {
+      const uint8_t* bloques = origen.data() + leido + bytes_rebanada_bc * r;
+      if (leido + bytes_rebanada_bc * (r + 1) > origen.size()) {
+        break;  // incomplete data: the rest stays black
+      }
+      uint8_t* texels = destino.data() + escrito + bytes_rebanada * r;
+      for (uint32_t y = 0; y < by; ++y) {
+        for (uint32_t x = 0; x < bx; ++x) {
+          const uint8_t* b = bloques + (size_t(y) * bx + x) * bytes_bloque;
+          uint8_t rgba[16][4];
+          uint8_t canal0[16], canal1[16];
+          switch (formato) {
+            case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+              DecodificarColorBc1(b, false, rgba);
+              break;
+            case VK_FORMAT_BC2_UNORM_BLOCK:
+              DecodificarColorBc1(b + 8, true, rgba);
+              for (int i = 0; i < 16; ++i) {
+                const uint8_t a = uint8_t((b[i / 2] >> ((i & 1) * 4)) & 0xF);
+                rgba[i][3] = uint8_t(a * 17);
+              }
+              break;
+            case VK_FORMAT_BC3_UNORM_BLOCK:
+              DecodificarColorBc1(b + 8, true, rgba);
+              DecodificarCanalBc4(b, canal0);
+              for (int i = 0; i < 16; ++i) rgba[i][3] = canal0[i];
+              break;
+            case VK_FORMAT_BC4_UNORM_BLOCK:
+              DecodificarCanalBc4(b, canal0);
+              break;
+            default:  // BC5
+              DecodificarCanalBc4(b, canal0);
+              DecodificarCanalBc4(b + 8, canal1);
+              break;
+          }
+          for (uint32_t py = 0; py < 4; ++py) {
+            const uint32_t ty = y * 4 + py;
+            if (ty >= h) break;
+            for (uint32_t px = 0; px < 4; ++px) {
+              const uint32_t tx = x * 4 + px;
+              if (tx >= w) break;
+              const int i = int(py * 4 + px);
+              uint8_t* t = texels + (size_t(ty) * w + tx) * bpp;
+              if (bpp == 4) {
+                std::memcpy(t, rgba[i], 4);
+              } else if (bpp == 1) {
+                t[0] = canal0[i];
+              } else {
+                t[0] = canal0[i];
+                t[1] = canal1[i];
+              }
+            }
+          }
+        }
+      }
+    }
+    escrito += bytes_rebanada * rebanadas;
+  }
+}
+
 struct Textura {
   ImagenNativa imagen;
+  // Mali mode without BC sampling: the guest's BC format; the image is its decoded format and SubirTextura
+  // decodes on the CPU. VK_FORMAT_UNDEFINED for the rest.
+  VkFormat bc_en_cpu = VK_FORMAT_UNDEFINED;
   uint32_t capas = 1;  // 6 for cubemaps
   uint32_t fondo = 0;  // slices of 3D textures; 0 for the rest
   uint64_t huella = 0;
@@ -2186,6 +2420,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   bool Inicializar() {
     const auto& propiedades = dispositivo_->properties();
     modo_mali_ = DecidirModoMali(propiedades);
+    if (modo_mali_) {
+      LanzarVigilanteSonda();
+      VkFormatProperties bc1{};
+      dispositivo_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+          dispositivo_->physical_device(), VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &bc1);
+      bc_en_cpu_ = !(bc1.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+      REXLOG_INFO("[nativo] C3 modo Mali: texturas BC (DXT) {}", bc_en_cpu_ ? "NO soportadas: se descomprimen en la CPU"
+                                                                             : "soportadas por la GPU");
+    }
     // El indexado dinamico de arrays de imagenes es la unica feature que el camino acotado (modo Mali) SI
     // necesita del hardware; el resto (Int64, bufferDeviceAddress, runtimeDescriptorArray, el stack de
     // descriptor-indexing/bindless) se sustituye por equivalentes clasicos y aqui solo se advierte.
@@ -2233,11 +2476,26 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if ((!direccion_bufer_ && !modo_mali_) || !CrearSubida() || !CrearDescriptores()) {
       return false;
     }
+    PasoSonda("CrearDescriptores terminado");
     // The pool is created after CrearDescriptores (where texturas_mb_max_ is read) and before CrearVacias,
     // so the three empty images can already come from it. The slabs are prewarmed here, while the game is
     // still loading: a 32 MB memset during a race would be a 10-15 ms stutter.
-    pool_texturas_.Iniciar(dispositivo_, texturas_mb_max_);
-    return CrearVacias();
+    {
+      MarcaSonda sonda(modo_mali_, "pool_texturas_.Iniciar", -1, -1);
+      pool_texturas_.Iniciar(dispositivo_, texturas_mb_max_);
+    }
+    PasoSonda("pool de texturas iniciado");
+    MarcaSonda sonda(modo_mali_, "CrearVacias", -1, -1);
+    const bool vacias = CrearVacias();
+    PasoSonda(vacias ? "CrearVacias OK" : "CrearVacias FALLO");
+    return vacias;
+  }
+
+  // Mali (diagnostic): one log line per initialization step, to see where Inicializar stops.
+  void PasoSonda(const char* paso) const {
+    if (modo_mali_) {
+      REXLOG_INFO("[mali-sonda] init: {}", paso);
+    }
   }
 
   bool Dibujar(const PeticionDibujo& p) override {
@@ -3566,7 +3824,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       clave_enlazada_valida_ = false;  // the counter does not classify this bind
     }
     if (!sets_enlazados_) {
-      NFSMW_SUB(1, dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, 4,
+      NFSMW_SUB(1, dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, SetsMontones(),
                                                 sets_.data(), 0, nullptr));
       sets_enlazados_ = true;
     }
@@ -3613,7 +3871,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                           (offsets_ubo[1] != offsets_ubo_enlazados_[1] ? 2u : 0u) |
                           (offsets_ubo[2] != offsets_ubo_enlazados_[2] ? 4u : 0u)];
         }
-        NFSMW_SUB(2, dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 4, 1,
+        NFSMW_SUB(2, dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, SetUbo(), 1,
                                                   &sets_ubo_[ranura_actual_], 3, offsets_ubo.data()));
         offsets_ubo_enlazados_ = offsets_ubo;
         ranura_ubo_enlazada_ = ranura_actual_;
@@ -3876,7 +4134,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     eds_valido_ = false;  // the next draw sets all of its own again
     clave_enlazada_valida_ = false;  // The sky does not keep its key (ContarCambioPipeline)
     if (!sets_enlazados_) {
-      dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, 4,
+      dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, SetsMontones(),
                                    sets_.data(), 0, nullptr);
       sets_enlazados_ = true;
     }
@@ -3885,7 +4143,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                               sizeof(c.push), c.push);
     }
-    dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 4, 1,
+    dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, SetUbo(), 1,
                                  &sets_ubo_[c.ranura_ubo], 3, c.offsets_ubo.data());
     dfn_.vkCmdSetViewport(cmd, 0, 1, &c.viewport);
     dfn_.vkCmdSetScissor(cmd, 0, 1, &c.tijera);
@@ -8022,34 +8280,56 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     const VkDescriptorBindingFlags banderas_enlace =
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
         VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+    // Mali mode: no descriptor indexing (the extension is not even enabled) and per-stage limits of 256
+    // sampled images and 128 samplers. The bindless heaps (4096+16+64 images, 512 samplers, UPDATE_AFTER_BIND)
+    // are invalid there, and the Mali-G52 driver does not return an error: it hangs inside
+    // vkCreatePipelineLayout. So the heaps are bounded and created without the binding flags; a heap that
+    // fills up hands out slot 0 (the empty texture), as ReservarRanura already does.
+    // Mali mode also has maxBoundDescriptorSets = 4, one less than sets 0-3 + the UBO set 4. There the
+    // samplers go in set 0 binding 1 next to the 2D textures (the Mali library declares them so,
+    // NFSMW_MALI in shader_common.h) and the UBO set moves to 3: kSetsMontones() heap sets + 1.
+    const uint32_t* capacidades = modo_mali_ ? kCapacidadMontonMali : kCapacidadMonton;
     for (uint32_t i = 0; i < 4; ++i) {
-      VkDescriptorSetLayoutBinding enlace{};
-      enlace.binding = 0;
-      enlace.descriptorType = kTipos[i];
-      enlace.descriptorCount = kCapacidadMonton[i];
-      enlace.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+      montones_[i].capacidad = capacidades[i];
+      if (modo_mali_ && i == 3) {
+        continue;  // the samplers are binding 1 of set 0
+      }
+      VkDescriptorSetLayoutBinding enlaces[2]{};
+      enlaces[0].binding = 0;
+      enlaces[0].descriptorType = kTipos[i];
+      enlaces[0].descriptorCount = capacidades[i];
+      enlaces[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+      const bool con_samplers = modo_mali_ && i == 0;
+      if (con_samplers) {
+        enlaces[1] = enlaces[0];
+        enlaces[1].binding = 1;
+        enlaces[1].descriptorType = kTipos[3];
+        enlaces[1].descriptorCount = capacidades[3];
+      }
       VkDescriptorSetLayoutBindingFlagsCreateInfo banderas{};
       banderas.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
       banderas.bindingCount = 1;
       banderas.pBindingFlags = &banderas_enlace;
       VkDescriptorSetLayoutCreateInfo info{};
       info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-      info.pNext = &banderas;
-      info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-      info.bindingCount = 1;
-      info.pBindings = &enlace;
+      info.pNext = modo_mali_ ? nullptr : &banderas;
+      info.flags = modo_mali_ ? 0 : VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+      info.bindingCount = con_samplers ? 2 : 1;
+      info.pBindings = enlaces;
       if (dfn_.vkCreateDescriptorSetLayout(device_, &info, nullptr, &layouts_[i]) != VK_SUCCESS) {
         return false;
       }
-      montones_[i].capacidad = kCapacidadMonton[i];
+    }
+    if (modo_mali_) {
+      REXLOG_INFO("[nativo] C6 modo Mali: montones acotados sin UPDATE_AFTER_BIND: {} 2D, {} 3D, {} cubo, {} samplers",
+                  capacidades[0], capacidades[1], capacidades[2], capacidades[3]);
     }
     const VkDescriptorPoolSize tamanos[2] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-         kCapacidadMonton[0] + kCapacidadMonton[1] + kCapacidadMonton[2]},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, kCapacidadMonton[3]}};
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacidades[0] + capacidades[1] + capacidades[2]},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, capacidades[3]}};
     VkDescriptorPoolCreateInfo info_pool{};
     info_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    info_pool.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    info_pool.flags = modo_mali_ ? 0 : VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     info_pool.maxSets = 4;
     info_pool.poolSizeCount = 2;
     info_pool.pPoolSizes = tamanos;
@@ -8059,7 +8339,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     VkDescriptorSetAllocateInfo reserva{};
     reserva.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     reserva.descriptorPool = pool_;
-    reserva.descriptorSetCount = 4;
+    reserva.descriptorSetCount = SetsMontones();
     reserva.pSetLayouts = layouts_.data();
     if (dfn_.vkAllocateDescriptorSets(device_, &reserva, sets_.data()) != VK_SUCCESS) {
       return false;
@@ -8106,7 +8386,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     info_ubo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     info_ubo.bindingCount = 3;
     info_ubo.pBindings = enlaces_ubo.data();
+    PasoSonda("layout del set 4 (UBO)...");
     if (dfn_.vkCreateDescriptorSetLayout(device_, &info_ubo, nullptr, &layout_ubo_) != VK_SUCCESS) {
+      PasoSonda("layout del set 4 FALLO");
       return false;
     }
     const VkDescriptorPoolSize tamano_ubo{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3 * uint32_t(sets_ubo_.size())};
@@ -8115,7 +8397,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     info_pool_ubo.maxSets = uint32_t(sets_ubo_.size());
     info_pool_ubo.poolSizeCount = 1;
     info_pool_ubo.pPoolSizes = &tamano_ubo;
+    PasoSonda("pool del set 4...");
     if (dfn_.vkCreateDescriptorPool(device_, &info_pool_ubo, nullptr, &pool_ubo_) != VK_SUCCESS) {
+      PasoSonda("pool del set 4 FALLO");
       return false;
     }
     std::array<VkDescriptorSetLayout, kRanurasDeTrabajo> layouts_ubo;
@@ -8125,9 +8409,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     reserva_ubo.descriptorPool = pool_ubo_;
     reserva_ubo.descriptorSetCount = uint32_t(sets_ubo_.size());
     reserva_ubo.pSetLayouts = layouts_ubo.data();
+    PasoSonda("sets del set 4...");
     if (dfn_.vkAllocateDescriptorSets(device_, &reserva_ubo, sets_ubo_.data()) != VK_SUCCESS) {
+      PasoSonda("sets del set 4 FALLO");
       return false;
     }
+    PasoSonda("escribiendo los UBO...");
     for (size_t ranura = 0; ranura < sets_ubo_.size(); ++ranura) {
       const VkDescriptorBufferInfo bloques[3] = {{subidas_[ranura].bufer, 0, kUboBytesVs},
                                                  {subidas_[ranura].bufer, 0, kUboBytesPs},
@@ -8149,14 +8436,38 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                                     24};
     VkPipelineLayoutCreateInfo info_layout{};
     info_layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    const std::array<VkDescriptorSetLayout, 5> layouts_pipeline = {layouts_[0], layouts_[1], layouts_[2],
-                                                                    layouts_[3], layout_ubo_};
-    info_layout.setLayoutCount = 5;
+    std::array<VkDescriptorSetLayout, 5> layouts_pipeline = {layouts_[0], layouts_[1], layouts_[2],
+                                                              layouts_[3], layout_ubo_};
+    layouts_pipeline[SetUbo()] = layout_ubo_;  // Mali mode: set 3
+    info_layout.setLayoutCount = SetUbo() + 1;
     info_layout.pSetLayouts = layouts_pipeline.data();
     info_layout.pushConstantRangeCount = 1;
     info_layout.pPushConstantRanges = &rango;
-    return dfn_.vkCreatePipelineLayout(device_, &info_layout, nullptr, &layout_pipeline_) ==
-           VK_SUCCESS;
+    if (modo_mali_) {
+      VkPhysicalDeviceProperties limites_fisicos{};
+      dispositivo_->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(dispositivo_->physical_device(),
+                                                                                 &limites_fisicos);
+      const VkPhysicalDeviceLimits& l = limites_fisicos.limits;
+      REXLOG_INFO("[mali-sonda] limites: maxBoundDescriptorSets {}, maxPerStageResources {}, "
+                  "maxDescriptorSetSampledImages {}, maxDescriptorSetSamplers {}, "
+                  "maxDescriptorSetUniformBuffersDynamic {}, maxPushConstantsSize {}",
+                  l.maxBoundDescriptorSets, l.maxPerStageResources, l.maxDescriptorSetSampledImages,
+                  l.maxDescriptorSetSamplers, l.maxDescriptorSetUniformBuffersDynamic, l.maxPushConstantsSize);
+      if (l.maxBoundDescriptorSets < info_layout.setLayoutCount) {
+        // An invalid layout hangs this driver instead of failing: fail here, loudly.
+        REXLOG_ERROR("[nativo] C6 modo Mali: el layout usa {} sets y el dispositivo solo admite {}; "
+                     "hace falta la variante Mali de los shaders con menos sets",
+                     info_layout.setLayoutCount, l.maxBoundDescriptorSets);
+        return false;
+      }
+    }
+    PasoSonda("vkCreatePipelineLayout...");
+    MarcaSonda sonda(modo_mali_, "vkCreatePipelineLayout", -1, -1);
+    const VkResult resultado = dfn_.vkCreatePipelineLayout(device_, &info_layout, nullptr, &layout_pipeline_);
+    if (modo_mali_) {
+      REXLOG_INFO("[mali-sonda] init: vkCreatePipelineLayout -> VkResult {}", int(resultado));
+    }
+    return resultado == VK_SUCCESS;
   }
 
   // Slot 0 of each heap: a transparent black texture and a basic sampler, as the emulation does for an
@@ -8194,7 +8505,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       vacias_[i].ancho = vacias_[i].alto = 1;
       vacias_[i].formato = VK_FORMAT_R8G8B8A8_UNORM;
-      EscribirImagen(i, 0, vacias_[i].vista);
+      // Mali mode: without PARTIALLY_BOUND every slot of the bounded heap must hold a valid descriptor,
+      // so all of them start as the empty texture.
+      const uint32_t hasta = modo_mali_ ? montones_[i].capacidad : 1;
+      for (uint32_t ranura = 0; ranura < hasta; ++ranura) {
+        EscribirImagen(i, ranura, vacias_[i].vista);
+      }
     }
     VkSamplerCreateInfo sampler{};
     sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -8204,7 +8520,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (dfn_.vkCreateSampler(device_, &sampler, nullptr, &sampler_vacio_) != VK_SUCCESS) {
       return false;
     }
-    EscribirSampler(0, sampler_vacio_);
+    const uint32_t hasta_samplers = modo_mali_ ? montones_[3].capacidad : 1;
+    for (uint32_t ranura = 0; ranura < hasta_samplers; ++ranura) {
+      EscribirSampler(ranura, sampler_vacio_);
+    }
     return true;
   }
 
@@ -8261,6 +8580,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     escritura.descriptorCount = 1;
     escritura.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     escritura.pImageInfo = &imagen;
+    MarcaSonda sonda(modo_mali_, "vkUpdateDescriptorSets (imagen)", int(monton), int(ranura));
     dfn_.vkUpdateDescriptorSets(device_, 1, &escritura, 0, nullptr);
   }
 
@@ -8269,14 +8589,19 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     imagen.sampler = sampler;
     VkWriteDescriptorSet escritura{};
     escritura.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    escritura.dstSet = sets_[3];
-    escritura.dstBinding = 0;
+    escritura.dstSet = modo_mali_ ? sets_[0] : sets_[3];  // Mali mode: set 0 binding 1
+    escritura.dstBinding = modo_mali_ ? 1 : 0;
     escritura.dstArrayElement = ranura;
     escritura.descriptorCount = 1;
     escritura.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     escritura.pImageInfo = &imagen;
+    MarcaSonda sonda(modo_mali_, "vkUpdateDescriptorSets (sampler)", 3, int(ranura));
     dfn_.vkUpdateDescriptorSets(device_, 1, &escritura, 0, nullptr);
   }
+
+  // Heap descriptor sets and the UBO set's number: 4 and 4, or 3 and 3 in Mali mode (samplers inside set 0).
+  uint32_t SetsMontones() const { return modo_mali_ ? 3 : 4; }
+  uint32_t SetUbo() const { return SetsMontones(); }
 
   uint32_t ReservarRanura(uint32_t monton) {
     auto& m = montones_[monton];
@@ -8703,8 +9028,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       const auto antes_crear = std::chrono::steady_clock::now();
       const uint64_t espera_antes_crear = ns_espera_enlaces_total_;
       midiendo_creacion_ = true;
-      const bool creada = CrearTexturaEnHilo(textura, tf.formato, ancho_host, alto_host, capas, fondo, niveles) ||
-                          CrearTextura(textura.imagen, tf.formato, ancho_host, alto_host, capas, fondo, niveles);
+      // Mali mode without BC sampling: the image takes the decoded format (SubirTextura decodes).
+      textura.bc_en_cpu = bc_en_cpu_ && EsFormatoBc(tf.formato) ? tf.formato : VK_FORMAT_UNDEFINED;
+      const VkFormat formato_imagen =
+          textura.bc_en_cpu != VK_FORMAT_UNDEFINED ? FormatoBcDecodificado(tf.formato) : tf.formato;
+      const bool creada = CrearTexturaEnHilo(textura, formato_imagen, ancho_host, alto_host, capas, fondo, niveles) ||
+                          CrearTextura(textura.imagen, formato_imagen, ancho_host, alto_host, capas, fondo, niveles);
       midiendo_creacion_ = false;
       {
         const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -8811,7 +9140,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                     nivel_empaquetado == UINT32_MAX ? std::string("ninguno") : std::to_string(nivel_empaquetado));
       }
     }
-    ranura = RanuraVista(textura.imagen.imagen, tf.formato, swizzle, tf.swizzle_host, monton);
+    ranura = RanuraVista(textura.imagen.imagen,
+                         textura.bc_en_cpu != VK_FORMAT_UNDEFINED ? FormatoBcDecodificado(tf.formato) : tf.formato,
+                         swizzle, tf.swizzle_host, monton);
     ancho_host_out = textura.imagen.ancho;  // the host's, which is what the shader sees
     alto_host_out = textura.imagen.alto;
     if (textura.fotograma == fotograma_) {
@@ -9012,7 +9343,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                                              mips_en_copia);
             }
           }
-          if (plan_ok && PlanearHuella(textura, clave, n_lecturas, crudo_base, extension, crudo_mips, extension_mips,
+          if (plan_ok && textura.bc_en_cpu == VK_FORMAT_UNDEFINED && PlanearHuella(textura, clave, n_lecturas, crudo_base, extension, crudo_mips, extension_mips,
                                        tf, (f[1] >> 6) & 0x3, bytes_plan, desplazamientos, base, ancho, alto,
                                        formato, bytes_subida)) {
             return;  // applying phase: the thread prepares it; the tail of this function is already done
@@ -9720,6 +10051,14 @@ class DibujosVulkanImpl final : public DibujosVulkan {
      * and the copy are recorded below as usual: the GPU does not read the upload buffer until
      * vkQueueSubmit.
      */
+    if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED) {
+      // Mali mode without BC sampling: the image is the decoded format (never the hash thread's path).
+      std::vector<uint8_t> decodificado;
+      DecodificarBc(textura.bc_en_cpu, textura.imagen.ancho, textura.imagen.alto,
+                    textura.capas * (textura.fondo ? textura.fondo : 1), textura.niveles, textura.datos,
+                    textura.desplazamiento_nivel, decodificado);
+      textura.datos.swap(decodificado);
+    }
     if (textura.huella_trabajo && textura.huella_trabajo != kTrabajoHuellaPublicado) {
       const size_t bytes = BytesHuellaPlaneada(textura);
       Reservar(bytes, 16, offset);  // BC: offset multiple of the block
@@ -9935,7 +10274,11 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
     }
     VkSampler sampler;
-    if (dfn_.vkCreateSampler(device_, &info, nullptr, &sampler) != VK_SUCCESS) {
+    std::optional<MarcaSonda> sonda_sampler;
+    sonda_sampler.emplace(modo_mali_, "vkCreateSampler", -1, -1);
+    const VkResult resultado_sampler = dfn_.vkCreateSampler(device_, &info, nullptr, &sampler);
+    sonda_sampler.reset();
+    if (resultado_sampler != VK_SUCCESS) {
       Avisar(36, "no se pudo crear un sampler");
       return 0;
     }
@@ -11594,6 +11937,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       Avisar(50, "colision de huellas de pipeline");
       return VK_NULL_HANDLE;
     }
+    const int sonda_vs = int(p.vs->numero);
+    const int sonda_ps = clave.ps ? int(p.ps->numero) : -1;
+    std::optional<MarcaSonda> sonda_modulos;
+    sonda_modulos.emplace(modo_mali_, "vkCreateShaderModule", sonda_vs, sonda_ps);
     const VkShaderModule vs = ModuloDe(*p.vs);
     VkShaderModule ps = VK_NULL_HANDLE;
     if (clave.ps && (clave.especializacion & kSpecResplandorNatural)) {
@@ -11607,6 +11954,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     } else if (clave.ps) {
       ps = ModuloDe(*p.ps);
     }
+    sonda_modulos.reset();
     if (vs == VK_NULL_HANDLE || (clave.ps && ps == VK_NULL_HANDLE)) {
       Rechazar(51, "no se pudo crear un modulo de shader");
       return VK_NULL_HANDLE;
@@ -11616,7 +11964,16 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     uint32_t n_colores = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     const auto inicio_creacion = std::chrono::steady_clock::now();
-    if (CrearPipelineVulkan(clave, entrada, vs, ps, pase_rp_, true, pipeline, n_colores) != VK_SUCCESS) {
+    if (modo_mali_ && pipelines_.size() < 16) {
+      REXLOG_INFO("[mali-sonda] creando pipeline {} (VS n{} PS n{})...", pipelines_.size() + 1, sonda_vs,
+                  sonda_ps);
+    }
+    VkResult resultado_creacion;
+    {
+      MarcaSonda sonda(modo_mali_, "vkCreateGraphicsPipelines", sonda_vs, sonda_ps);
+      resultado_creacion = CrearPipelineVulkan(clave, entrada, vs, ps, pase_rp_, true, pipeline, n_colores);
+    }
+    if (resultado_creacion != VK_SUCCESS) {
       Rechazar(53, "no se pudo crear un pipeline");
       pipeline = VK_NULL_HANDLE;
     } else {
@@ -11625,6 +11982,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     const uint64_t ns_creacion = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                               std::chrono::steady_clock::now() - inicio_creacion)
                                               .count());
+    if (modo_mali_ && pipelines_.size() < 16) {
+      REXLOG_INFO("[mali-sonda] pipeline {} -> VkResult {} en {:.1f} ms", pipelines_.size() + 1,
+                  int(resultado_creacion), double(ns_creacion) / 1e6);
+    }
     ns_pipelines_ += ns_creacion;
     AnotarPipelineCreado(clave, entrada, p, pipeline, ns_creacion);  // List and measurement
     pipelines_.emplace(huella, std::make_pair(clave, pipeline));
@@ -12167,6 +12528,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   // Inicializar() a partir del cvar y de las features del dispositivo, y gobierna el gate de requisitos[],
   // el forzado de las constantes por UBO y que no se use la direccion de buffer de 64 bits.
   bool modo_mali_ = false;
+  bool bc_en_cpu_ = false;  // Mali mode and the device cannot sample BC1: decode BC on the CPU
 
   VkBuffer subida_ = VK_NULL_HANDLE;
   VkDeviceMemory subida_memoria_ = VK_NULL_HANDLE;
@@ -13146,6 +13508,23 @@ std::unique_ptr<DibujosVulkan> DibujosVulkan::Crear(const VulkanDevice* disposit
   }
   REXLOG_INFO("[nativo] C6: dibujos nativos preparados");
   return dibujos;
+}
+
+void SondaMaliEntrar(const char* que) {
+  if (g_sonda_activa.load(std::memory_order_relaxed)) {
+    g_sonda_driver.vs = -1;
+    g_sonda_driver.ps = -1;
+    g_sonda_driver.desde_ns = AhoraNs();
+    g_sonda_driver.que = que;
+  }
+}
+
+void SondaMaliSalir() {
+  if (g_sonda_activa.load(std::memory_order_relaxed)) {
+    g_sonda_driver.ultimo = g_sonda_driver.que.load();
+    g_sonda_driver.ultimo_ns = AhoraNs();
+    g_sonda_driver.que = nullptr;
+  }
 }
 
 }  // namespace nfsmw::nativo
