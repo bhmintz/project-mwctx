@@ -127,6 +127,21 @@ cd D:\users\projects\x360\extract-xiso-Win64_Release\nfsmw-android-main
 - AGP 8.7.3, Gradle wrapper pide 8.9 (cacheado hay 8.10.2 / 9.2 / 9.3; 8.10.2 va bien con AGP 8.7.3).
 - **No hay compilador de host nativo en Windows** (ni VS ni LLVM); por eso el codegen se hace en WSL.
 
+### 2.5 Atajo: `tools/recompilar_mali.py`
+Automatiza este flujo cruzando WSL↔Windows solo. **Ejecutarlo desde WSL** (también acepta Windows):
+
+```bash
+python3 tools/recompilar_mali.py             # SOLO el APK (iteración típica de cambios C++ en app/src/)
+python3 tools/recompilar_mali.py --codegen   # codegen + APK (cambió el .xex o el manifest)
+python3 tools/recompilar_mali.py --all       # desde cero: thirdparty + rexglue + codegen + APK
+python3 tools/recompilar_mali.py --install   # además, adb install -r al terminar
+```
+
+- Sin flags hace solo el APK porque un cambio C++ (p. ej. las fases del backend Mali) lo recompila
+  gradle al armar el APK; codegen/rexglue solo hacen falta si cambia el `.xex`/manifest.
+- Desde WSL, el paso del APK invoca `powershell.exe build_android.ps1`; desde Windows, delega los pasos
+  de Linux a `wsl.exe`. Reusa los mismos flags/arreglos de §2.2–2.3.
+
 ---
 
 ## 3. QUÉ ES EL PROYECTO (resumen de arquitectura)
