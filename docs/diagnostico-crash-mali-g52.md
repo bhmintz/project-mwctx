@@ -160,6 +160,54 @@ esta GPU, y es un proyecto en sí mismo.
 
 ---
 
+## 5bis. Prior art / referencias externas (investigado 2025-10-01)
+
+### Dato de hardware exacto (Vulkan GPU DB, Mali-G52)
+Separar límite de **hardware** (ningún driver lo dará) de **dependiente de driver**:
+
+| Feature | Mali-G52 | Tipo |
+|---|---|---|
+| `shaderInt64` | ❌ | hardware (Bifrost sin int64 en shaders) |
+| `vertexPipelineStoresAndAtomics` | ❌ | hardware (sin stores desde vertex stage) |
+| `descriptorIndexing` / `runtimeDescriptorArray` (bindless) | ❌ | hardware |
+| `fillModeNonSolid` | ❌ | hardware |
+| `bufferDeviceAddress` | ⚠️ | driver: false en r26p0/Vk1.1 (este tel), true en 25.x/Vk1.2 |
+| `geometryShader`, `fragmentStoresAndAtomics`, `shaderSampledImageArrayDynamicIndexing` | ✅ | — |
+
+→ Implica: el **renderizador nativo** (Int64+bindless+BDA) es **inviable** en Mali-G52, no por
+config sino por silicio. Actualizar driver no lo salva (sigue sin Int64/bindless/vertex-stores).
+
+### Los dos backends de GPU en ESTE árbol
+- **Renderizador nativo** (`app/src/nfsmw_nativo_*`, `sdk/src/ui/vulkan/`): pide Int64+bindless+BDA → muro.
+- **Backend portable de Xenia** (`sdk/src/graphics/vulkan/command_processor.cpp`): revisado, solo pide
+  `vertexPipelineStoresAndAtomics` + `fillModeNonSolid` (los mismos dos ya parcheados). **NO** pide
+  Int64/bindless/BDA. Es el candidato real para Mali. Falta ver si es seleccionable para este juego
+  (el port gatea lo nativo con `nfsmw::nativo::Activo()`, `app/src/nfsmw_ajustes_graficos.cpp:319`).
+
+### Proyectos de referencia (no reinventar la rueda)
+- **Xenia / xenia-canary** (upstream directo de este port): su backend Vulkan **convierte los vertex
+  shaders de memexport a compute shaders** cuando el vertex stage no soporta stores → elimina la
+  necesidad de `vertexPipelineStoresAndAtomics`. Equivalente en este árbol:
+  `sdk/src/graphics/pipeline/shader/spirv_translator_memexport.cpp`. **Esta es la pieza clave a portar/activar.**
+- **Dolphin** (`Source/Core/VideoBackends/Vulkan`): render Vulkan con descriptores clásicos que corre en
+  Mali/Adreno. Referencia de gestión de descriptores sin bindless.
+- **MoltenVK** (ya en `sdk/thirdparty/moltenvk`): patrones para emular features ausentes (p.ej. fillModeNonSolid→sólido).
+- **Mesa PanVK/Panfrost**: driver Vulkan Mali open-source; NO intercambiable en A32 de stock, solo referencia.
+- **Vita3K (emu de PS Vita)** — DATO DEL USUARIO: corre MK9 en ESTE mismo Mali-G52 (baja resolución +
+  shaders precompilados). **Prueba de existencia** de que un emulador Vulkan dibuja bien en esta GPU.
+  Transferible: su modelo de **descriptores clásicos + pipeline cache + precompilado de shaders**.
+  NO transferible: la PS Vita (PowerVR SGX543) no tiene memexport tipo Xenos, así que Vita3K **no**
+  resuelve el problema de `vertexPipelineStoresAndAtomics` — para eso, Xenia. Repo: github.com/Vita3K/Vita3K.
+
+### Plan con prior art (si se retoma, sin prisa)
+1. Ver si el juego puede ir por el **backend portable** en vez del nativo (leer el gate `nativo::Activo()`).
+2. Traer el **memexport→compute** de Xenia para quitar el requisito de `vertexPipelineStoresAndAtomics`.
+3. `fillModeNonSolid` → fallback a relleno sólido (patrón MoltenVK; ya trivial).
+> Caveat: el nativo probablemente existe porque el portable era lento/incompleto para NFSMW. El portable
+> podría ir lento en un G80 o no estar del todo cableado en este fork. Verificar, no es garantía.
+
+---
+
 ## 6. Datos de referencia (para no recapturar)
 
 - GPU: `Mali-G52 MC2`, vendor `0x13B5`, device `0x74021000`.
