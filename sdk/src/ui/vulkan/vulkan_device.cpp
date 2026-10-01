@@ -137,11 +137,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       return nullptr;
     }
     if (REXCVAR_GET(vulkan_require_fill_mode_non_solid) && !supported_features.fillModeNonSolid) {
+      // EXPERIMENTO Mali-G52: esta GPU no expone fillModeNonSolid. El motor tiene
+      // fallback a relleno solido para modos linea/punto, asi que continuamos en vez
+      // de rechazar el dispositivo. Revertir con git si rompe el render.
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support fillModeNonSolid, but "
-          "vulkan_require_fill_mode_non_solid=true",
+          "Vulkan device '{}' doesn't support fillModeNonSolid; continuando con "
+          "fallback a relleno solido (parche Mali-G52)",
           properties.deviceName);
-      return nullptr;
     }
   }
 
