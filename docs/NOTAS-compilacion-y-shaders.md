@@ -127,25 +127,35 @@ cd D:\users\projects\x360\extract-xiso-Win64_Release\nfsmw-android-main
 - AGP 8.7.3, Gradle wrapper pide 8.9 (cacheado hay 8.10.2 / 9.2 / 9.3; 8.10.2 va bien con AGP 8.7.3).
 - **No hay compilador de host nativo en Windows** (ni VS ni LLVM); por eso el codegen se hace en WSL.
 
-### 2.5 Atajo: `tools/recompilar_mali.py`
-Automatiza este flujo cruzando WSL↔Windows solo. **Ejecutarlo desde WSL** (también acepta Windows):
+### 2.5 Atajos: `tools/mw.py` y `tools/recompilar_mali.py`
+Desde **Windows** (con `adb` en el PATH), `tools/mw.py` hace el ciclo completo:
 
 ```bash
-python3 tools/recompilar_mali.py             # SOLO el APK (iteración típica de cambios C++ en app/src/)
-python3 tools/recompilar_mali.py --codegen   # codegen + APK (cambió el .xex o el manifest)
-python3 tools/recompilar_mali.py --all       # desde cero: thirdparty + rexglue + codegen + APK
-python3 tools/recompilar_mali.py --install   # además, adb install -r al terminar
+python tools/mw.py            # build + install + run
+python tools/mw.py --log      # ...y captura logcat (filtro NFSMW/errores)
+python tools/mw.py build|install|run|stop|log|codegen
+```
+Lee el SDK/NDK/CMake de `android/local.properties` (`sdk.dir` + versiones). `codegen` corre en WSL.
+
+`tools/recompilar_mali.py` es **lo mismo pero apuntando al backend Mali**: reusa `mw.py` y, antes de
+compilar, deja el proyecto listo para la Fase 0+:
+
+```bash
+python tools/recompilar_mali.py            # prep + build + install + run
+python tools/recompilar_mali.py --log      # ...y logcat con filtro del sub-modo Mali
+python tools/recompilar_mali.py --mali on  # forzar nfsmw_nativo_mali (def: auto = -1)
 ```
 
-- Sin flags hace solo el APK porque un cambio C++ (p. ej. las fases del backend Mali) lo recompila
-  gradle al armar el APK; codegen/rexglue solo hacen falta si cambia el `.xex`/manifest.
-- Desde WSL, el paso del APK invoca `powershell.exe build_android.ps1`; desde Windows, delega los pasos
-  de Linux a `wsl.exe`. Reusa los mismos flags/arreglos de §2.2–2.3.
-- **Antes del APK genera/completa `android/local.properties`** (gitignored → no viaja por git, por eso el
-  build caía a los defaults heredados: `[CXX1300] CMake 3.30.5 was not found`). Detecta tu `sdk.dir` y la
-  **mayor** versión instalada de CMake/NDK/plataforma y las escribe como `nfsmw.cmakeVersion` /
-  `nfsmw.ndkVersion` / `nfsmw.compileSdk`. Es **additivo**: respeta las claves que ya tengas. Overrides:
-  `--sdk-dir`, `--cmake-version`, `--ndk-version`, `--forzar-local-properties`, `--sin-local-properties`.
+La "prep" antes de compilar:
+- **toml** (`android/app/src/main/assets/nfsmw.toml`): fuerza `nfsmw_renderizador = "nativo"` y
+  `nfsmw_nativo_mali` (auto/-1 por defecto). Sin esto corre el backend `"xenos"` del experimento viejo y
+  la Fase 0 **ni se ejecuta**. (`--sin-config` para no tocarlo.)
+- **`android/local.properties`** (gitignored → no viaja por git; por eso el build caía al CMake heredado
+  `[CXX1300] CMake 3.30.5 was not found`): detecta tu `sdk.dir` y la **mayor** versión instalada de
+  CMake/NDK/plataforma. Es **additivo** (respeta lo que ya tengas). Overrides: `--sdk-dir`,
+  `--cmake-version`, `--ndk-version`, `--forzar-local-properties`, `--sin-local-properties`.
+
+En el logcat hay que buscar `[nativo] C6: sub-modo Mali (nfsmw_nativo_mali) = SI`.
 
 ---
 

@@ -45,9 +45,11 @@ nfsmw_nativo_pcf_barato_alternar_s = 0
 nfsmw_nativo_zcull = true
 nfsmw_nativo_sombras_escala = 100
 nfsmw_nativo_marcas_precisas = true
-# EXPERIMENTO Mali-G52: backend portable de Xenia (no necesita Int64/bindless/BDA, que la Mali no tiene).
-# Revertir a "nativo" para el renderizador nativo. Ver docs/diagnostico-crash-mali-g52.md.
-nfsmw_renderizador = "xenos"
+# Backend Mali (Fase 0+): renderizador nativo con sub-modo Mali (sin bindless/Int64/BDA).
+# nfsmw_nativo_mali: -1 auto (se activa en GPUs sin bindless, p.ej. Mali-G52), 0 off, 1 forzado.
+# Ver docs/plan-backend-mali.md y docs/diagnostico-crash-mali-g52.md.
+nfsmw_renderizador = "nativo"
+nfsmw_nativo_mali = -1
 nfsmw_resplandor_cielo = "natural"
 nfsmw_nativo_inv_tamano_tex_alternar_s = 0
 present_hilo_propio = false
