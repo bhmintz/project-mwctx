@@ -1,0 +1,70 @@
+plugins {
+    id 'com.android.application'
+}
+
+// Toolchain versions. The defaults are the canonical ones (also used by CI in .github/workflows/android.yml).
+// To build with a different SDK/NDK/CMake already on your machine, set any of these keys in
+// android/local.properties (which is git-ignored, so it never affects the repo or CI), for example:
+//   nfsmw.compileSdk=34
+//   nfsmw.targetSdk=34
+//   nfsmw.ndkVersion=29.0.14206865
+//   nfsmw.cmakeVersion=3.31.6
+def localProps = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+def cfg = { String key, String fallback -> localProps.getProperty(key) ?: fallback }
+
+android {
+    namespace 'com.nfsmw.android'
+    compileSdk cfg('nfsmw.compileSdk', '35').toInteger()
+
+    sourceSets {
+        main.java.srcDirs += ["$rootDir/../sdk/thirdparty/sdl3/android-project/app/src/main/java"]
+    }
+
+    defaultConfig {
+        applicationId 'com.nfsmw.android'
+        minSdk 26
+        targetSdk cfg('nfsmw.targetSdk', '35').toInteger()
+        versionCode 7
+        versionName '0.3.4'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++23'
+                arguments '-DANDROID_STL=c++_shared'
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+            // AGP builds release natives as RelWithDebInfo (-O2 -g); the game wants the SDK's Release
+            // flags (-O3, no asserts) and ThinLTO (src/main/cpp/CMakeLists.txt).
+            externalNativeBuild {
+                cmake {
+                    arguments '-DCMAKE_BUILD_TYPE=Release'
+                }
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version cfg('nfsmw.cmakeVersion', '3.30.5')
+        }
+    }
+
+    ndkVersion cfg('nfsmw.ndkVersion', '28.2.13676358')
+}
+
+dependencies {
+    implementation 'androidx.documentfile:documentfile:1.0.1'
+}
