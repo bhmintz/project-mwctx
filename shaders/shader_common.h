@@ -87,8 +87,9 @@ struct PushConstants
 static const PushConstants g_PushConstants = (PushConstants)0;
 template<typename T> T NfsmwSinPuntero(uint direccion) { return (T)0; }
 template<typename T> T NfsmwSinPuntero(uint direccion, uint alineacion) { return (T)0; }
-// maxBoundDescriptorSets = 4: the samplers go in set 0 binding 1 and the UBO set is 3.
-#define NFSMW_SET_UBO 3
+// maxBoundDescriptorSets = 4 and no UPDATE_AFTER_BIND: the textures are one set per draw (set 0) and the
+// UBO set is 1.
+#define NFSMW_SET_UBO 1
 #else
 struct PushConstants
 {
@@ -156,12 +157,13 @@ uint g_SpecConstants();
 #endif
 
 #ifdef NFSMW_MALI
-// Bounded heaps, no runtimeDescriptorArray (kCapacidadMontonMali in nfsmw_nativo_dibujos.cpp: 240 sampled
-// images and 96 samplers, under the 256 and 128 per stage of the Mali-G52).
-[[vk::binding(0, 0)]] Texture2D<float4> g_Texture2DDescriptorHeap[160];
-[[vk::binding(0, 1)]] Texture3D<float4> g_Texture3DDescriptorHeap[16];
-[[vk::binding(0, 2)]] TextureCube<float4> g_TextureCubeDescriptorHeap[64];
-[[vk::binding(1, 0)]] SamplerState g_SamplerDescriptorHeap[96];
+// The draw's own set, no runtimeDescriptorArray (SetMaliDelDibujo in nfsmw_nativo_dibujos.cpp). The indices
+// in the shared constants are local: the fetch register, or 16 + register in the 3D word (a 3D texture or
+// the 2D shadow pair). 80 sampled images and 16 samplers, under the Mali-G52's 256 and 128 per stage.
+[[vk::binding(0, 0)]] Texture2D<float4> g_Texture2DDescriptorHeap[32];
+[[vk::binding(1, 0)]] SamplerState g_SamplerDescriptorHeap[16];
+[[vk::binding(2, 0)]] Texture3D<float4> g_Texture3DDescriptorHeap[32];
+[[vk::binding(3, 0)]] TextureCube<float4> g_TextureCubeDescriptorHeap[16];
 #else
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
 Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);

@@ -1206,8 +1206,23 @@ constexpr uint32_t kRegBooleanos = 0x4900;
 constexpr uint32_t kRegistrosConstantes = 0x400;  // 256 constantes x 4
 
 constexpr uint32_t kCapacidadMonton[4] = {4096, 16, 64, 512};  // 2D, 3D, cubo, samplers
-// Mali mode: 160+16+64 = 240 sampled images (limit 256 per stage) and 96 samplers (limit 128).
-constexpr uint32_t kCapacidadMontonMali[4] = {160, 16, 64, 96};
+// Mali mode: the heaps above are only CPU tables (a view or sampler per slot). Each draw gets its own set
+// with these local arrays (shader_common.h, NFSMW_MALI), indexed by fetch register: 2D 0-15 and 16-31 for
+// the shadow pair, 3D 16-31 (the same word as the pair), cube 0-15 and samplers 0-15. 80 sampled images
+// and 16 samplers, under the Mali-G52's 256 and 128 per stage.
+constexpr uint32_t kMaliLocal2D = 32;
+constexpr uint32_t kMaliLocal3D = 32;
+constexpr uint32_t kMaliLocalCubo = 16;
+constexpr uint32_t kMaliLocalSamplers = 16;
+constexpr uint32_t kMaliSetsPorPool = 1024;
+// The Mali per-draw sets of one work slot (SetMaliDelDibujo, ReciclarSetsMali).
+struct SetsMaliRanura {
+  std::vector<VkDescriptorPool> pools;
+  size_t pool_actual = 0;
+  std::unordered_map<uint64_t, VkDescriptorSet> cache;  // same views and samplers, same set
+  uint64_t generacion = UINT64_MAX;                      // generacion_texturas_ of the cache
+  std::vector<VkImageView> vistas_retiradas;
+};
 // Work slots. The ones actually used are chosen by nfsmw_nativo_ranuras_trabajo; this is the room reserved
 // for them, and it has to match the array in nfsmw_nativo_destinos.cpp.
 constexpr size_t kRanurasDeTrabajo = 3;
@@ -2387,6 +2402,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (layout_pipeline_ != VK_NULL_HANDLE)
       dfn_.vkDestroyPipelineLayout(device_, layout_pipeline_, nullptr);
     if (pool_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorPool(device_, pool_, nullptr);
+    for (SetsMaliRanura& s : sets_mali_) {
+      for (VkImageView vista : s.vistas_retiradas) dfn_.vkDestroyImageView(device_, vista, nullptr);
+      for (VkDescriptorPool pool : s.pools) dfn_.vkDestroyDescriptorPool(device_, pool, nullptr);
+    }
     if (pool_ubo_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorPool(device_, pool_ubo_, nullptr);
     if (layout_ubo_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorSetLayout(device_, layout_ubo_, nullptr);
     for (VkDescriptorSetLayout layout : layouts_) {
@@ -3141,6 +3160,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
      * the bit already exist when applying starts. Every read is reported to C2, which decides and watches.
      */
     bool sombra_minimo_dibujo = false;
+    uint32_t parejas_sombra = 0;  // Mali mode: registers whose 3D word is that pair (SetMaliDelDibujo)
     if (ps && !ps->samplers.empty()) {
       if (const uint32_t dir_coches = contexto_->DireccionSombraCoches()) {
         for (const SamplerShader& s : ps->samplers) {
@@ -3165,6 +3185,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
             continue;
           }
           compartidas[16 + s.registro] = ranura_pareja;
+          parejas_sombra |= 1u << s.registro;
           sombra_minimo_dibujo = true;
         }
       }
@@ -3442,6 +3463,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     compartidas[69] = funcion_alfa;  // g_AlphaFunction
     std::memcpy(&compartidas[70], ndc, sizeof(ndc));
     std::copy(entrada->remapeos.begin(), entrada->remapeos.end(), compartidas + 74);
+    // Mali mode: the texture words become local slots of this draw's own set (before the comparison with the
+    // previous draw's block: with the same textures they come out identical).
+    VkDescriptorSet set_mali = VK_NULL_HANDLE;
+    if (modo_mali_) {
+      set_mali = SetMaliDelDibujo(compartidas, parejas_sombra);
+      if (set_mali == VK_NULL_HANDLE) {
+        return Rechazar(44, "modo Mali: sin set de descriptores para el dibujo");
+      }
+    }
     VkDeviceSize offset_compartidas;
     /*
      * How many draws really change the shared constants.
@@ -3789,6 +3819,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       c.categoria = CategoriaDeDestino(pitch, claves);
       c.dibujos_al_aplazar = dibujos_en_pase_;
       c.eds_modo = eds_modo_;  // phases 1 and 2: its pipeline lacks this state, so save it all
+      c.set_mali = set_mali;
       if (eds_modo_) {
         EstadoEdsDe(clave, c.eds, eds_modo_);
       }
@@ -3823,7 +3854,14 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       pipeline_enlazado_ = pipeline;
       clave_enlazada_valida_ = false;  // the counter does not classify this bind
     }
-    if (!sets_enlazados_) {
+    if (modo_mali_) {
+      if (!sets_enlazados_ || set_mali != set_mali_enlazado_) {
+        NFSMW_SUB(1, dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, 1,
+                                                  &set_mali, 0, nullptr));
+        set_mali_enlazado_ = set_mali;
+        sets_enlazados_ = true;
+      }
+    } else if (!sets_enlazados_) {
       NFSMW_SUB(1, dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, SetsMontones(),
                                                 sets_.data(), 0, nullptr));
       sets_enlazados_ = true;
@@ -4133,7 +4171,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     eds_valido_ = false;  // the next draw sets all of its own again
     clave_enlazada_valida_ = false;  // The sky does not keep its key (ContarCambioPipeline)
-    if (!sets_enlazados_) {
+    if (modo_mali_) {
+      dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, 1, &c.set_mali, 0,
+                                   nullptr);
+      set_mali_enlazado_ = c.set_mali;
+      sets_enlazados_ = true;
+    } else if (!sets_enlazados_) {
       dfn_.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_pipeline_, 0, SetsMontones(),
                                    sets_.data(), 0, nullptr);
       sets_enlazados_ = true;
@@ -5108,6 +5151,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     subida_datos_ = s.datos;
     subida_direccion_ = s.direccion;
     ranura_actual_ = uint32_t(ranura % subidas_.size());  // this slot's UBO set
+    if (modo_mali_) {
+      ReciclarSetsMali(ranura_actual_);
+    }
     subida_usado_ = 0;
     if (compartidas_aparte_) {
       const BuferSubida& c = compartidas_bufs_[ranura_actual_];
@@ -5572,7 +5618,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       EscribirImagen(it->second.monton, it->second.ranura, vacias_[it->second.monton].vista);
       montones_[it->second.monton].libres.push_back(it->second.ranura);
-      dfn_.vkDestroyImageView(device_, it->second.vista, nullptr);
+      RetirarVista(it->second.vista);
       vistas_por_imagen_.erase(it->second.imagen);  // all views of that image go
       it = vistas_.erase(it);
     }
@@ -5770,7 +5816,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       EscribirImagen(it->second.monton, it->second.ranura, vacias_[it->second.monton].vista);
       montones_[it->second.monton].libres.push_back(it->second.ranura);
-      dfn_.vkDestroyImageView(device_, it->second.vista, nullptr);
+      RetirarVista(it->second.vista);
       vistas_.erase(it);
     }
     vistas_por_imagen_.erase(indice);
@@ -6044,7 +6090,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       DecidirEnlaces();
     }
     // With the out-of-memory test enabled, everything goes through CrearTextura: that test lives there.
-    if (enlaces_fase_ == kEnlacesApagado || !pool_texturas_.Activo() || prueba_sin_memoria_cada_ > 0) {
+    // Mali mode too: the draw's set is written while recording, so the view cannot wait for RecogerEnlaces.
+    if (enlaces_fase_ == kEnlacesApagado || !pool_texturas_.Activo() || prueba_sin_memoria_cada_ > 0 || modo_mali_) {
       return false;
     }
     const VkImageCreateInfo info = InfoImagenTextura(formato, ancho, alto, capas, fondo, niveles);
@@ -8280,69 +8327,59 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     const VkDescriptorBindingFlags banderas_enlace =
         VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
         VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
-    // Mali mode: no descriptor indexing (the extension is not even enabled) and per-stage limits of 256
-    // sampled images and 128 samplers. The bindless heaps (4096+16+64 images, 512 samplers, UPDATE_AFTER_BIND)
-    // are invalid there, and the Mali-G52 driver does not return an error: it hangs inside
-    // vkCreatePipelineLayout. So the heaps are bounded and created without the binding flags; a heap that
-    // fills up hands out slot 0 (the empty texture), as ReservarRanura already does.
-    // Mali mode also has maxBoundDescriptorSets = 4, one less than sets 0-3 + the UBO set 4. There the
-    // samplers go in set 0 binding 1 next to the 2D textures (the Mali library declares them so,
-    // NFSMW_MALI in shader_common.h) and the UBO set moves to 3: kSetsMontones() heap sets + 1.
-    const uint32_t* capacidades = modo_mali_ ? kCapacidadMontonMali : kCapacidadMonton;
     for (uint32_t i = 0; i < 4; ++i) {
-      montones_[i].capacidad = capacidades[i];
-      if (modo_mali_ && i == 3) {
-        continue;  // the samplers are binding 1 of set 0
-      }
-      VkDescriptorSetLayoutBinding enlaces[2]{};
-      enlaces[0].binding = 0;
-      enlaces[0].descriptorType = kTipos[i];
-      enlaces[0].descriptorCount = capacidades[i];
-      enlaces[0].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-      const bool con_samplers = modo_mali_ && i == 0;
-      if (con_samplers) {
-        enlaces[1] = enlaces[0];
-        enlaces[1].binding = 1;
-        enlaces[1].descriptorType = kTipos[3];
-        enlaces[1].descriptorCount = capacidades[3];
-      }
-      VkDescriptorSetLayoutBindingFlagsCreateInfo banderas{};
-      banderas.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
-      banderas.bindingCount = 1;
-      banderas.pBindingFlags = &banderas_enlace;
-      VkDescriptorSetLayoutCreateInfo info{};
-      info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-      info.pNext = modo_mali_ ? nullptr : &banderas;
-      info.flags = modo_mali_ ? 0 : VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
-      info.bindingCount = con_samplers ? 2 : 1;
-      info.pBindings = enlaces;
-      if (dfn_.vkCreateDescriptorSetLayout(device_, &info, nullptr, &layouts_[i]) != VK_SUCCESS) {
+      montones_[i].capacidad = kCapacidadMonton[i];
+    }
+    // Mali mode: no descriptor indexing (the extension is not even enabled), per-stage limits of 256 sampled
+    // images and 128 samplers and maxBoundDescriptorSets = 4. The bindless heaps are invalid there (and the
+    // Mali-G52 driver does not return an error: it hangs inside vkCreatePipelineLayout). Without
+    // UPDATE_AFTER_BIND a set cannot be written once bound either, so each draw gets its own small set:
+    // CrearSetsMali, and the UBO set moves to 1.
+    if (modo_mali_) {
+      if (!CrearSetsMali()) {
         return false;
       }
-    }
-    if (modo_mali_) {
-      REXLOG_INFO("[nativo] C6 modo Mali: montones acotados sin UPDATE_AFTER_BIND: {} 2D, {} 3D, {} cubo, {} samplers",
-                  capacidades[0], capacidades[1], capacidades[2], capacidades[3]);
-    }
-    const VkDescriptorPoolSize tamanos[2] = {
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, capacidades[0] + capacidades[1] + capacidades[2]},
-        {VK_DESCRIPTOR_TYPE_SAMPLER, capacidades[3]}};
-    VkDescriptorPoolCreateInfo info_pool{};
-    info_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    info_pool.flags = modo_mali_ ? 0 : VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
-    info_pool.maxSets = 4;
-    info_pool.poolSizeCount = 2;
-    info_pool.pPoolSizes = tamanos;
-    if (dfn_.vkCreateDescriptorPool(device_, &info_pool, nullptr, &pool_) != VK_SUCCESS) {
-      return false;
-    }
-    VkDescriptorSetAllocateInfo reserva{};
-    reserva.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    reserva.descriptorPool = pool_;
-    reserva.descriptorSetCount = SetsMontones();
-    reserva.pSetLayouts = layouts_.data();
-    if (dfn_.vkAllocateDescriptorSets(device_, &reserva, sets_.data()) != VK_SUCCESS) {
-      return false;
+    } else {
+      for (uint32_t i = 0; i < 4; ++i) {
+        VkDescriptorSetLayoutBinding enlace{};
+        enlace.binding = 0;
+        enlace.descriptorType = kTipos[i];
+        enlace.descriptorCount = kCapacidadMonton[i];
+        enlace.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutBindingFlagsCreateInfo banderas{};
+        banderas.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        banderas.bindingCount = 1;
+        banderas.pBindingFlags = &banderas_enlace;
+        VkDescriptorSetLayoutCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        info.pNext = &banderas;
+        info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        info.bindingCount = 1;
+        info.pBindings = &enlace;
+        if (dfn_.vkCreateDescriptorSetLayout(device_, &info, nullptr, &layouts_[i]) != VK_SUCCESS) {
+          return false;
+        }
+      }
+      const VkDescriptorPoolSize tamanos[2] = {
+          {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kCapacidadMonton[0] + kCapacidadMonton[1] + kCapacidadMonton[2]},
+          {VK_DESCRIPTOR_TYPE_SAMPLER, kCapacidadMonton[3]}};
+      VkDescriptorPoolCreateInfo info_pool{};
+      info_pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+      info_pool.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+      info_pool.maxSets = 4;
+      info_pool.poolSizeCount = 2;
+      info_pool.pPoolSizes = tamanos;
+      if (dfn_.vkCreateDescriptorPool(device_, &info_pool, nullptr, &pool_) != VK_SUCCESS) {
+        return false;
+      }
+      VkDescriptorSetAllocateInfo reserva{};
+      reserva.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      reserva.descriptorPool = pool_;
+      reserva.descriptorSetCount = SetsMontones();
+      reserva.pSetLayouts = layouts_.data();
+      if (dfn_.vkAllocateDescriptorSets(device_, &reserva, sets_.data()) != VK_SUCCESS) {
+        return false;
+      }
     }
     // --- Set 4, the constants through dynamic UBOs ------------------------------------------------------
     // Always created: the shaders of the current library use it statically even with the bit off (it is
@@ -8569,6 +8606,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   }
 
   void EscribirImagen(uint32_t monton, uint32_t ranura, VkImageView vista) {
+    if (modo_mali_) {  // only the table: SetMaliDelDibujo copies it into each draw's set
+      mali_vistas_[monton][ranura] = vista;
+      return;
+    }
     VkDescriptorImageInfo imagen{};
     imagen.imageView = vista;
     imagen.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -8585,23 +8626,210 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   }
 
   void EscribirSampler(uint32_t ranura, VkSampler sampler) {
+    if (modo_mali_) {
+      mali_samplers_[ranura] = sampler;
+      return;
+    }
     VkDescriptorImageInfo imagen{};
     imagen.sampler = sampler;
     VkWriteDescriptorSet escritura{};
     escritura.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    escritura.dstSet = modo_mali_ ? sets_[0] : sets_[3];  // Mali mode: set 0 binding 1
-    escritura.dstBinding = modo_mali_ ? 1 : 0;
+    escritura.dstSet = sets_[3];
+    escritura.dstBinding = 0;
     escritura.dstArrayElement = ranura;
     escritura.descriptorCount = 1;
     escritura.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     escritura.pImageInfo = &imagen;
-    MarcaSonda sonda(modo_mali_, "vkUpdateDescriptorSets (sampler)", 3, int(ranura));
     dfn_.vkUpdateDescriptorSets(device_, 1, &escritura, 0, nullptr);
   }
 
-  // Heap descriptor sets and the UBO set's number: 4 and 4, or 3 and 3 in Mali mode (samplers inside set 0).
-  uint32_t SetsMontones() const { return modo_mali_ ? 3 : 4; }
+  // Heap descriptor sets and the UBO set's number: 4 and 4, or 1 and 1 in Mali mode (the draw's set).
+  uint32_t SetsMontones() const { return modo_mali_ ? 1 : 4; }
   uint32_t SetUbo() const { return SetsMontones(); }
+
+  // A texture view that is no longer in the heap. In Mali mode a draw's set already recorded may still
+  // point to it, so it lives until its work slot comes round again (ReciclarSetsMali).
+  void RetirarVista(VkImageView vista) {
+    if (modo_mali_) {
+      sets_mali_[ranura_actual_].vistas_retiradas.push_back(vista);
+      return;
+    }
+    dfn_.vkDestroyImageView(device_, vista, nullptr);
+  }
+
+  // Mali mode: the set layout of each draw (bindings as in shader_common.h with NFSMW_MALI), a pool per
+  // work slot and the heap tables.
+  bool CrearSetsMali() {
+    for (uint32_t i = 0; i < 3; ++i) {
+      mali_vistas_[i].assign(kCapacidadMonton[i], VK_NULL_HANDLE);
+    }
+    mali_samplers_.assign(kCapacidadMonton[3], VK_NULL_HANDLE);
+    static constexpr uint32_t kCuentas[4] = {kMaliLocal2D, kMaliLocalSamplers, kMaliLocal3D, kMaliLocalCubo};
+    VkDescriptorSetLayoutBinding enlaces[4]{};
+    for (uint32_t b = 0; b < 4; ++b) {
+      enlaces[b].binding = b;
+      enlaces[b].descriptorType = b == 1 ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      enlaces[b].descriptorCount = kCuentas[b];
+      enlaces[b].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    info.bindingCount = 4;
+    info.pBindings = enlaces;
+    if (dfn_.vkCreateDescriptorSetLayout(device_, &info, nullptr, &layouts_[0]) != VK_SUCCESS) {
+      return false;
+    }
+    for (SetsMaliRanura& s : sets_mali_) {
+      if (!CrearPoolMali(s)) {
+        return false;
+      }
+    }
+    REXLOG_INFO("[nativo] C6 modo Mali: un set por dibujo ({} 2D, {} 3D, {} cubo, {} samplers), pools de {} sets "
+                "por ranura de trabajo; montones en tablas de CPU ({} 2D, {} 3D, {} cubo, {} samplers)",
+                kMaliLocal2D, kMaliLocal3D, kMaliLocalCubo, kMaliLocalSamplers, kMaliSetsPorPool,
+                kCapacidadMonton[0], kCapacidadMonton[1], kCapacidadMonton[2], kCapacidadMonton[3]);
+    return true;
+  }
+
+  bool CrearPoolMali(SetsMaliRanura& s) {
+    const VkDescriptorPoolSize tamanos[2] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, (kMaliLocal2D + kMaliLocal3D + kMaliLocalCubo) * kMaliSetsPorPool},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, kMaliLocalSamplers * kMaliSetsPorPool}};
+    VkDescriptorPoolCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    info.maxSets = kMaliSetsPorPool;
+    info.poolSizeCount = 2;
+    info.pPoolSizes = tamanos;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    if (dfn_.vkCreateDescriptorPool(device_, &info, nullptr, &pool) != VK_SUCCESS) {
+      return false;
+    }
+    s.pools.push_back(pool);
+    return true;
+  }
+
+  // Mali mode, from UsarRanura: the GPU is done with this slot, so its sets and the views retired while it
+  // was recording can go.
+  void ReciclarSetsMali(uint32_t ranura) {
+    SetsMaliRanura& s = sets_mali_[ranura];
+    for (VkImageView vista : s.vistas_retiradas) {
+      dfn_.vkDestroyImageView(device_, vista, nullptr);
+    }
+    s.vistas_retiradas.clear();
+    for (VkDescriptorPool pool : s.pools) {
+      dfn_.vkResetDescriptorPool(device_, pool, 0);
+    }
+    s.pool_actual = 0;
+    s.cache.clear();
+    set_mali_enlazado_ = VK_NULL_HANDLE;
+  }
+
+  /*
+   * Mali mode: the draw's texture set.
+   *
+   * The global slots that the sampler loop left in `compartidas` (2D, 3D/pair, cube and sampler words of
+   * each fetch register) become local: the register, or 16 + register in the 3D word. Those are the indices
+   * the shader reads, and the set holds the matching views and samplers. Everything else is the empty
+   * texture: without PARTIALLY_BOUND every element of the arrays has to be valid. `parejas`: registers whose
+   * 3D word is the 2D shadow pair (nfsmw_nativo_sombra_minimo).
+   *
+   * Draws with the same textures share the set within the work slot; the cache is cleared whenever a view
+   * goes (generacion_texturas_).
+   */
+  VkDescriptorSet SetMaliDelDibujo(uint32_t* compartidas, uint32_t parejas) {
+    std::array<VkImageView, kMaliLocal2D> v2d;
+    std::array<VkImageView, kMaliLocal3D> v3d;
+    std::array<VkImageView, kMaliLocalCubo> vcubo;
+    std::array<VkSampler, kMaliLocalSamplers> samplers;
+    v2d.fill(vacias_[0].vista);
+    v3d.fill(vacias_[1].vista);
+    vcubo.fill(vacias_[2].vista);
+    samplers.fill(sampler_vacio_);
+    const auto vista = [&](uint32_t monton, uint32_t global) {
+      const std::vector<VkImageView>& tabla = mali_vistas_[monton];
+      return global && global < tabla.size() && tabla[global] != VK_NULL_HANDLE ? tabla[global] : vacias_[monton].vista;
+    };
+    for (uint32_t r = 0; r < 16; ++r) {
+      v2d[r] = vista(0, compartidas[r]);
+      compartidas[r] = r;
+      if ((parejas >> r) & 0x1) {
+        v2d[16 + r] = vista(0, compartidas[16 + r]);
+      } else {
+        v3d[16 + r] = vista(1, compartidas[16 + r]);
+      }
+      compartidas[16 + r] = 16 + r;
+      vcubo[r] = vista(2, compartidas[32 + r]);
+      compartidas[32 + r] = r;
+      const uint32_t global_sampler = compartidas[48 + r];
+      if (global_sampler && global_sampler < mali_samplers_.size() && mali_samplers_[global_sampler] != VK_NULL_HANDLE) {
+        samplers[r] = mali_samplers_[global_sampler];
+      }
+      compartidas[48 + r] = r;
+    }
+    SetsMaliRanura& s = sets_mali_[ranura_actual_];
+    if (s.generacion != generacion_texturas_) {
+      s.cache.clear();
+      s.generacion = generacion_texturas_;
+    }
+    uint64_t clave = XXH3_64bits(v2d.data(), sizeof(v2d));
+    clave = XXH3_64bits_withSeed(v3d.data(), sizeof(v3d), clave);
+    clave = XXH3_64bits_withSeed(vcubo.data(), sizeof(vcubo), clave);
+    clave = XXH3_64bits_withSeed(samplers.data(), sizeof(samplers), clave);
+    if (const auto it = s.cache.find(clave); it != s.cache.end()) {
+      ++sets_mali_reusados_;
+      return it->second;
+    }
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    VkDescriptorSetAllocateInfo reserva{};
+    reserva.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    reserva.descriptorSetCount = 1;
+    reserva.pSetLayouts = &layouts_[0];
+    for (;;) {
+      if (s.pool_actual == s.pools.size()) {
+        if (!CrearPoolMali(s)) {
+          Avisar(40, "modo Mali: no se pudo crear otro pool de descriptores");
+          return VK_NULL_HANDLE;
+        }
+        REXLOG_INFO("[nativo] C6 modo Mali: la ranura de trabajo {} pasa a {} pools de descriptores",
+                    ranura_actual_, s.pools.size());
+      }
+      reserva.descriptorPool = s.pools[s.pool_actual];
+      if (dfn_.vkAllocateDescriptorSets(device_, &reserva, &set) == VK_SUCCESS) {
+        break;
+      }
+      ++s.pool_actual;  // full (OUT_OF_POOL_MEMORY or FRAGMENTED_POOL): the next one
+    }
+    std::array<VkDescriptorImageInfo, kMaliLocal2D + kMaliLocalSamplers + kMaliLocal3D + kMaliLocalCubo> infos{};
+    VkDescriptorImageInfo* p = infos.data();
+    std::array<VkWriteDescriptorSet, 4> escrituras{};
+    const auto escritura = [&](uint32_t binding, VkDescriptorType tipo, uint32_t cuenta) {
+      VkWriteDescriptorSet& e = escrituras[binding];
+      e.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      e.dstSet = set;
+      e.dstBinding = binding;
+      e.descriptorCount = cuenta;
+      e.descriptorType = tipo;
+      e.pImageInfo = p;
+      p += cuenta;
+    };
+    for (uint32_t i = 0; i < kMaliLocal2D; ++i) p[i] = {VK_NULL_HANDLE, v2d[i], VK_IMAGE_LAYOUT_GENERAL};
+    escritura(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaliLocal2D);
+    for (uint32_t i = 0; i < kMaliLocalSamplers; ++i) p[i] = {samplers[i], VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
+    escritura(1, VK_DESCRIPTOR_TYPE_SAMPLER, kMaliLocalSamplers);
+    for (uint32_t i = 0; i < kMaliLocal3D; ++i) p[i] = {VK_NULL_HANDLE, v3d[i], VK_IMAGE_LAYOUT_GENERAL};
+    escritura(2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaliLocal3D);
+    for (uint32_t i = 0; i < kMaliLocalCubo; ++i) p[i] = {VK_NULL_HANDLE, vcubo[i], VK_IMAGE_LAYOUT_GENERAL};
+    escritura(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaliLocalCubo);
+    dfn_.vkUpdateDescriptorSets(device_, uint32_t(escrituras.size()), escrituras.data(), 0, nullptr);
+    s.cache.emplace(clave, set);
+    ++sets_mali_creados_;
+    if (sets_mali_creados_ >= sets_mali_informe_) {
+      sets_mali_informe_ = sets_mali_creados_ * 4;  // 1, 4, 16, 64, ...: a handful of lines per session
+      REXLOG_INFO("[nativo] C6 modo Mali: {} sets por dibujo creados, {} reutilizados", sets_mali_creados_,
+                  sets_mali_reusados_);
+    }
+    return set;
+  }
 
   uint32_t ReservarRanura(uint32_t monton) {
     auto& m = montones_[monton];
@@ -13030,6 +13258,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     uint64_t dibujos_al_aplazar = 0;   // position in the pass when it was deferred
     uint32_t eds_modo = 0;  // phases 1 and 2 its pipeline was looked up with (eds_modo_)
     EstadoEds eds{};        // and the state that pipeline lacks
+    VkDescriptorSet set_mali = VK_NULL_HANDLE;  // Mali mode: the draw's texture set
   };
   CieloAplazado cielo_{};
   bool cielo_pendiente_ = false;
@@ -13112,6 +13341,16 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   uint64_t grabacion_generacion_ = UINT64_MAX;
   VkPipeline pipeline_enlazado_ = VK_NULL_HANDLE;
   bool sets_enlazados_ = false;
+  // Mali mode: no UPDATE_AFTER_BIND, so each draw has its own small set (SetMaliDelDibujo), taken from its
+  // work slot's pools and reset when the slot is reused (UsarRanura: the GPU is done with it). The views
+  // released meanwhile are destroyed then too: a set already recorded may still point to them.
+  std::array<SetsMaliRanura, kRanurasDeTrabajo> sets_mali_{};
+  std::array<std::vector<VkImageView>, 3> mali_vistas_{};  // the heaps, as tables: global slot -> view
+  std::vector<VkSampler> mali_samplers_;
+  VkDescriptorSet set_mali_enlazado_ = VK_NULL_HANDLE;
+  uint64_t sets_mali_creados_ = 0;
+  uint64_t sets_mali_reusados_ = 0;
+  uint64_t sets_mali_informe_ = 0;
 
   uint32_t diagnosticos_ = 0;
   std::unordered_set<uint32_t> avisados_vs_;
