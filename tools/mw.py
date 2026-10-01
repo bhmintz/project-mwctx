@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import os
 import re
 import subprocess
@@ -42,6 +43,13 @@ APK = {
 PACKAGE = "com.nfsmw.android"
 ACTIVITY = f"{PACKAGE}/.MainActivity"
 LOG_DIR = REPO / "logs"
+# Prerrequisitos del build (un checkout recien clonado no los trae):
+#  - SDL: lo aporta tools/fetch_thirdparty.py (git). Sin el, SDLActivity no existe y la compilacion
+#    de Java revienta con decenas de "cannot find symbol" (getAssets, etc.) que NO arregla un clean.
+#  - codegen: lo aporta 'mw.py codegen' (WSL). Sin rexglue.cmake el CMake nativo del APK falla.
+SDL_SENTINEL = (REPO / "sdk" / "thirdparty" / "sdl3" / "android-project" / "app" / "src" / "main" /
+                "java" / "org" / "libsdl" / "app" / "SDLActivity.java")
+GEN_SENTINEL = REPO / "app" / "generated" / "rexglue.cmake"
 # Lo que normalmente interesa ver en vivo del motor y del sistema.
 LIVE_FILTER = re.compile(r"NFSMW|rex|FATAL|tombstone|VK_ERROR|SIGSEGV|DEBUG\b|AndroidRuntime|No se pudo",
                          re.IGNORECASE)
@@ -92,10 +100,43 @@ def _sdk_dir_from_local_properties() -> Path | None:
     return None
 
 
+# --- prerrequisitos (fresh checkout) -----------------------------------------------------------
+def _ensure_prereqs(auto: bool = True) -> None:
+    """Comprueba (y, con auto=True, resuelve) lo que un checkout recien clonado no trae.
+
+    Esto evita el fallo clasico del primer build: sin SDL salen ~43 'cannot find symbol' en Java, y
+    sin el codegen el CMake nativo no encuentra rexglue.cmake. Un 'clean' no arregla ninguno de los dos.
+    """
+    # 1) SDL (y demas thirdparty): tools/fetch_thirdparty.py, solo necesita git.
+    if not SDL_SENTINEL.exists():
+        if not auto or not have("git"):
+            die("faltan las fuentes de SDL (sdk/thirdparty). No es un problema de 'clean'.\n"
+                "       Arreglalo con:  python tools/fetch_thirdparty.py   (necesita git)")
+        c("Prerrequisito: faltan los thirdparty (SDL). Ejecutando tools/fetch_thirdparty.py")
+        rc = subprocess.run([sys.executable, str(REPO / "tools" / "fetch_thirdparty.py")],
+                            cwd=str(REPO)).returncode
+        if rc != 0:
+            die(f"fetch_thirdparty.py fallo (exit {rc}).", rc)
+        if not SDL_SENTINEL.exists():
+            die("fetch_thirdparty termino pero sigo sin ver SDLActivity.java. Revisa la salida de arriba.")
+        print("OK  thirdparty listos (SDL presente).")
+
+    # 2) Codegen: produce app/generated/rexglue.cmake. Corre en WSL.
+    if not GEN_SENTINEL.exists():
+        if not auto or not have("wsl"):
+            die("falta el codegen (app/generated/rexglue.cmake). No es un problema de 'clean'.\n"
+                "       Arreglalo con:  python tools/mw.py codegen   (necesita WSL)")
+        c("Prerrequisito: falta el codegen (app/generated). Ejecutando codegen en WSL")
+        cmd_codegen(argparse.Namespace(app="app"))
+        if not GEN_SENTINEL.exists():
+            die("el codegen termino pero sigo sin ver app/generated/rexglue.cmake.")
+
+
 # --- comandos ----------------------------------------------------------------------------------
 def cmd_build(args) -> None:
     if not GRADLEW.exists():
         die(f"no encuentro el wrapper de Gradle: {GRADLEW}")
+    _ensure_prereqs(auto=not getattr(args, "no_bootstrap", False))
     env = build_env()
     if not have("java") and not env.get("JAVA_HOME"):
         die("hace falta un JDK 17+ (java en el PATH o Android Studio instalado).")
@@ -202,30 +243,74 @@ def cmd_loop(args) -> None:
         cmd_log(args)
 
 
+def _wsl_distro() -> str:
+    """Distro WSL con el toolchain Linux. Por defecto 'Ubuntu' (override: MW_WSL_DISTRO).
+
+    'wsl' a secas usa la distro por defecto, que en esta maquina es 'docker-desktop' (sin bash/clang):
+    de ahi el '/bin/sh: bash: not found'. El toolchain (clang/cmake/ninja) esta en 'Ubuntu'.
+    """
+    return os.environ.get("MW_WSL_DISTRO", "Ubuntu")
+
+
 def cmd_codegen(args) -> None:
     """Regenera C++ desde el .xex. Necesita WSL (el codegen corre en Linux). Opcional/raro."""
     if not have("wsl"):
         die("no encuentro 'wsl'. El codegen corre en WSL; ver docs/building.md / NOTAS-compilacion.")
+    distro = _wsl_distro()
     wsl_repo = _to_wsl_path(REPO)
+    # Directorio de build de rexglue unico POR CHECKOUT. Compartir un solo build entre varios clones
+    # hace que CMake rechace el cache ("source ... does not match ... used to generate cache"), porque
+    # el cache recuerda la ruta de origen. La clave es un hash de la ruta del repo. Se usa $HOME (no '~',
+    # que entre comillas no expande) para que la ruta sea absoluta y sin sorpresas.
+    bdir = "$HOME/.cache/rexglue-build/" + hashlib.md5(str(REPO.resolve()).encode()).hexdigest()[:12]
     script = (
         "set -e\n"
         f'cd "{wsl_repo}"\n'
-        'echo "== compilando rexglue (host, incremental)"\n'
-        "cmake -S sdk -B ~/rexglue-build -G Ninja -DCMAKE_BUILD_TYPE=Release "
+        f'BDIR="{bdir}"\n'
+        'echo "== compilando rexglue (host, incremental) en $BDIR"\n'
+        'cmake -S sdk -B "$BDIR" -G Ninja -DCMAKE_BUILD_TYPE=Release '
         "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ "
         "-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_C_FLAGS=-msse4.1 -DCMAKE_CXX_FLAGS=-msse4.1\n"
-        'cmake --build ~/rexglue-build --target rexglue -j"$(nproc)"\n'
-        'RG=$(find ~/rexglue-build sdk/out -name rexglue -type f 2>/dev/null | head -1)\n'
+        'cmake --build "$BDIR" --target rexglue --parallel "$(nproc)"\n'
+        'RG=$(find "$BDIR" sdk/out -name rexglue -type f 2>/dev/null | head -1)\n'
         '[ -n "$RG" ] || { echo "no encuentro el binario rexglue"; exit 1; }\n'
+        # Ruta ABSOLUTA: codegen.sh hace 'cd app/' antes de ejecutar $REXGLUE, asi que una ruta
+        # relativa (sdk/out/...) dejaria de resolver desde app/.
+        'RG=$(realpath "$RG")\n'
+        'chmod +x "$RG" 2>/dev/null || true\n'
         'echo "== codegen con $RG"\n'
-        f'REXGLUE="$RG" PYTHON=python3 tools/codegen.sh {args.app}\n'
+        # Se invoca con 'bash' explicito: en /mnt/* los .sh de Windows no traen el bit de ejecucion y
+        # ejecutarlos directo da exit 126 (permission denied).
+        f'REXGLUE="$RG" PYTHON=python3 bash tools/codegen.sh {args.app}\n'
         'echo "== codegen OK"\n'
     )
-    c(f"Codegen en WSL ({args.app})")
-    rc = subprocess.run(["wsl", "bash", "-lc", script]).returncode
+    c(f"Codegen en WSL ({distro}, {args.app})")
+    # Se ejecuta como ARCHIVO, no como 'bash -lc <string>': pasar un script multilinea largo por -lc
+    # a wsl.exe pierde variables asignadas dentro del propio script (se vacian). Un archivo .sh en /tmp
+    # de WSL evita todo el enredo de comillas/escapado de la frontera Windows->wsl.
+    rc = _wsl_run_script(distro, script)
     if rc != 0:
         die(f"el codegen fallo (exit {rc}). Revisa la salida de arriba y app/*/codegen.log.", rc)
     print("OK  codegen terminado. Ahora compila el APK: python tools/mw.py build")
+
+
+def _wsl_run_script(distro: str, script: str) -> int:
+    """Corre un script bash en WSL escribiendolo primero en /tmp (evita el lio de 'bash -lc <string>')."""
+    name = f"/tmp/mw_{os.getpid()}.sh"
+    write = subprocess.run(["wsl", "-d", distro, "bash", "-c", f"cat > {name}"],
+                           input=script.encode("utf-8"))
+    if write.returncode != 0:
+        return write.returncode
+    try:
+        return subprocess.run(["wsl", "-d", distro, "bash", name]).returncode
+    finally:
+        subprocess.run(["wsl", "-d", distro, "rm", "-f", name])
+
+
+def cmd_bootstrap(args) -> None:
+    """Deja el checkout listo para compilar: thirdparty (SDL) + codegen. Idempotente."""
+    _ensure_prereqs(auto=True)
+    print("OK  prerrequisitos listos. Ya puedes: python tools/mw.py")
 
 
 def _to_wsl_path(p: Path) -> str:
@@ -251,6 +336,8 @@ def main(argv=None) -> None:
     sp = sub.add_parser("build", help="compilar el APK")
     add_variant(sp)
     sp.add_argument("--clean", action="store_true", help="gradle clean antes de compilar")
+    sp.add_argument("--no-bootstrap", action="store_true",
+                    help="no auto-resolver prerrequisitos (thirdparty/codegen); solo avisar")
     sp.set_defaults(func=cmd_build)
 
     sp = sub.add_parser("install", help="reinstalar el APK ya compilado")
@@ -272,11 +359,16 @@ def main(argv=None) -> None:
     sp.add_argument("--app", default="app", help="carpeta de la edicion (por defecto 'app')")
     sp.set_defaults(func=cmd_codegen)
 
+    sp = sub.add_parser("bootstrap", help="dejar el checkout listo: thirdparty (SDL) + codegen")
+    sp.set_defaults(func=cmd_bootstrap)
+
     # subcomando por defecto: loop (build+install+run)
     for name in ("loop", "all"):
         sp = sub.add_parser(name, help="build + install + run")
         add_variant(sp)
         sp.add_argument("--clean", action="store_true", help="gradle clean antes de compilar")
+        sp.add_argument("--no-bootstrap", action="store_true",
+                        help="no auto-resolver prerrequisitos (thirdparty/codegen); solo avisar")
         sp.add_argument("--no-install", action="store_true", help="no instalar")
         sp.add_argument("--no-run", action="store_true", help="no lanzar")
         sp.add_argument("--log", action="store_true", help="capturar logcat al final")
