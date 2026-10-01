@@ -217,3 +217,21 @@ Todo en `app/src/nfsmw_nativo_dibujos.cpp`. No toca el camino del nativo clásic
 > shaders sigue declarando el push-constant `uint64_t` y el heap bindless, así que el SPIR-V aún pide
 > Int64/bindless. Hasta la Fase 1 (sellar el `uint64_t` en `shader_common.h`) y la Fase 2 (texturas
 > acotadas) + regenerar el `.nfsp`, el modo Mali inicializa pero las pipelines no compilarán en la Mali.
+
+### Fase 0bis — features core-1.0 bajo el guard de 1.2 (hecho, hallazgo del logcat)
+Logcat del dispositivo (2025-10, Mali-G52 MC2, **API 1.1.131**) mostró que el gate abortaba en
+`shaderSampledImageArrayDynamicIndexing: no se dibuja` — no en `shaderInt64`. Causa: en
+`sdk/src/ui/vulkan/vulkan_device.cpp`, tres features **core de Vulkan 1.0**
+(`shaderInt64`, `shaderSampledImageArrayDynamicIndexing`, `pipelineStatisticsQuery`) estaban anidadas
+dentro de `if (apiVersion >= 1.2)`. Como la Mali reporta **1.1**, ese bloque se saltaba y las tres
+quedaban en `false` aunque el hardware las tenga → `properties_.shaderSampledImageArrayDynamicIndexing`
+falso → ni auto-detecta modo Mali ni pasa el gate.
+
+Fix: sacar esas tres core-1.0 a un bloque propio (solo bajo `vulkan_native_shader_features`), dejando en
+el guard de 1.2 solo las genuinas de 1.2 (`bufferDeviceAddress`, `runtimeDescriptorArray`,
+`descriptorBinding*`). `supported_features` se puebla con `vkGetPhysicalDeviceFeatures` sin condición, así
+que leerlas en 1.1 es correcto y seguro (si no están, no se habilitan).
+
+> Tras este fix, el rebuild dirá si `shaderSampledImageArrayDynamicIndexing` está de verdad (aparece
+> `sub-modo Mali = SI` y el gate pasa) o si es límite real de hardware (vuelve a abortar). Lo esperable es
+> que esté: es core-1.0 y la G52 suele tenerla; el muro era el guard de versión, no el silicio.
