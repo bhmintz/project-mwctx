@@ -115,6 +115,10 @@ class DestinosNativos {
   // GPU nanoseconds accumulated per category (kGpuOtros..., nfsmw_nativo_dibujos.h).
   virtual void TiempoGpuPorCategoria(
       std::array<uint64_t, kGpuCategorias>& nanosegundos) const = 0;
+  // nfsmw_nativo_desglose_por_fence: submissions per category and the calibration (empty submissions measured
+  // the same way, and their total ns), to subtract the fixed cost of each submit+wait from the breakdown.
+  virtual void CalibracionDesglose(std::array<uint64_t, kGpuCategorias>& envios, uint64_t& vacios,
+                                   uint64_t& ns_vacios) const {}
   // Shaded fragments, vertex invocations and clipped primitives, accumulated per pass category (only
   // with nfsmw_nativo_estadisticas_pipeline).
   virtual void EstadisticasPipeline(std::array<uint64_t, kGpuCategorias>& fragmentos,

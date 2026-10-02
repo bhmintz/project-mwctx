@@ -377,6 +377,20 @@ REXCVAR_DEFINE_INT32(nfsmw_nativo_sombra_minimo_alternar_s, 0, "NFSMW",
  * been drawn anywhere) and (c) the render target has not changed image through a swap nor received a
  * restore. With that it is impossible to skip a clear that is needed.
  */
+/*
+ * Clears inside the pass (Mali mode).
+ *
+ * On a tiler a whole-image vkCmdClearColorImage / vkCmdClearDepthStencilImage writes the entire image to
+ * memory, and the pass that follows reads it back (loadOp = LOAD) only to draw on top. A clear whose next
+ * use is a pass on that render target is deferred and handed to that pass as loadOp = CLEAR: nothing is
+ * written or read for it. Anything else recorded first (a copy, a blit, another pass, the end of the
+ * command buffer) records the deferred clears as before, so the order of every other command is kept.
+ * What the pass does not cover (the rows below its renderArea) is left as a band, cleared before any use
+ * that reaches it, like nfsmw_nativo_borrar_area_util. Mali mode only.
+ */
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_borrado_en_pase, true, "NFSMW",
+                    "Modo Mali: el borrado de un destino se hace al abrir el pase siguiente sobre el (loadOp = "
+                    "CLEAR) en vez de con un comando aparte que escribe la imagen entera. false = como antes");
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_saltar_borrados_repetidos, true, "NFSMW",
                     "Renderizador nativo (20/09 noche): saltarse un borrado cuando el destino ya esta borrado "
                     "con ese mismo valor y no se ha dibujado nada desde entonces. No cambia ni un pixel; "
@@ -676,10 +690,24 @@ FnBorrarProfundidad g_borrar_profundidad_real = nullptr;
 PFN_vkCmdPipelineBarrier g_barrera_real = nullptr;
 bool g_barrera_tras_transferencia = false;
 
+// nfsmw_nativo_mali_borrado_en_pase: the transfer wrappers record the deferred clears first when they touch
+// one of those images, so every command keeps its order relative to them. One that touches neither cannot
+// depend on them (the clear only writes its own image), so they stay pending.
+bool g_hay_borrados_aplazados = false;
+void (*g_vaciar_borrados)(void*, VkImage, VkImage) = nullptr;
+void* g_vaciar_borrados_dato = nullptr;
+uint64_t g_borrados_vaciados_por[10] = {};  // per cause, see VaciarBorradosAplazados
+inline void VaciarBorradosAplazadosGlobal(VkImage a, VkImage b) {
+  if (g_hay_borrados_aplazados && g_vaciar_borrados) {
+    g_vaciar_borrados(g_vaciar_borrados_dato, a, b);
+  }
+}
+
 void BarreraTrasTransferencia(VkCommandBuffer comandos) {
   if (!g_barrera_tras_transferencia || !g_barrera_real) {
     return;
   }
+  ++g_diag_transferencias[kTrBarreras];
   VkMemoryBarrier barrera{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
   barrera.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   barrera.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -690,21 +718,34 @@ void BarreraTrasTransferencia(VkCommandBuffer comandos) {
 void VKAPI_PTR CopiarImagenConBarrera(VkCommandBuffer comandos, VkImage origen, VkImageLayout layout_origen,
                                       VkImage destino, VkImageLayout layout_destino, uint32_t n,
                                       const VkImageCopy* regiones) {
+  VaciarBorradosAplazadosGlobal(origen, destino);
   g_copiar_real(comandos, origen, layout_origen, destino, layout_destino, n, regiones);
+  g_diag_transferencias[kTrCopias] += n;
+  for (uint32_t i = 0; i < n; ++i) {
+    g_diag_transferencias[kTrTexCopia] += uint64_t(regiones[i].extent.width) * regiones[i].extent.height;
+  }
   BarreraTrasTransferencia(comandos);
 }
 
 void VKAPI_PTR BlitConBarrera(VkCommandBuffer comandos, VkImage origen, VkImageLayout layout_origen,
                               VkImage destino, VkImageLayout layout_destino, uint32_t n,
                               const VkImageBlit* regiones, VkFilter filtro) {
+  VaciarBorradosAplazadosGlobal(origen, destino);
   g_blit_real(comandos, origen, layout_origen, destino, layout_destino, n, regiones, filtro);
+  g_diag_transferencias[kTrBlits] += n;
+  for (uint32_t i = 0; i < n; ++i) {
+    g_diag_transferencias[kTrTexBlit] += uint64_t(std::abs(regiones[i].dstOffsets[1].x - regiones[i].dstOffsets[0].x)) *
+                                         uint64_t(std::abs(regiones[i].dstOffsets[1].y - regiones[i].dstOffsets[0].y));
+  }
   BarreraTrasTransferencia(comandos);
 }
 
 void VKAPI_PTR BorrarProfundidadConBarrera(VkCommandBuffer comandos, VkImage imagen, VkImageLayout layout,
                                            const VkClearDepthStencilValue* valor, uint32_t n,
                                            const VkImageSubresourceRange* rangos) {
+  VaciarBorradosAplazadosGlobal(imagen, VK_NULL_HANDLE);
   g_borrar_profundidad_real(comandos, imagen, layout, valor, n, rangos);
+  ++g_diag_transferencias[kTrBorradosProf];
   BarreraTrasTransferencia(comandos);
 }
 
@@ -1684,11 +1725,19 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
           }
         }
         // nfsmw_nativo_borrar_area_util. Only the rows in use; the bottom band, if needed.
-        if (!BorrarColorAreaUtil(*destino_render, color)) {
+        VkClearValue valor_aplazado{};
+        valor_aplazado.color = color;
+        if (AplazarBorrado(*destino_render, valor_aplazado, false)) {
+          QuitarBanda(*destino_render);
+        } else if (!BorrarColorAreaUtil(*destino_render, color)) {
+          VaciarBorradosAplazados(3);
           dfn_.vkCmdClearColorImage(comandos_trabajo_, destino_render->imagen,
                                     VK_IMAGE_LAYOUT_GENERAL, &color, 1, &kRangoColor);
+          ++g_diag_transferencias[kTrBorradosColor];
+          g_diag_transferencias[kTrTexColor] += uint64_t(destino_render->ancho) * destino_render->alto;
           BarreraTrasTransferencia(comandos_trabajo_);
           QuitarBanda(*destino_render);
+          QuitarBandaAplazada(destino_render->imagen);
         }
         ++borrados_;
         AnotarBorradoDiag(*destino_render, info_color & 0xFFF, formato_color, pitch, false, false);
@@ -1731,6 +1780,12 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       // content and the ZCULL hi-Z is not reset either (only a loadOp = CLEAR resets it), so the whole frame
       // culls against stale data. Without TRANSFER_DST there is no alternative path, so at least it is
       // counted and reported.
+      VkClearValue valor_zcull{};
+      valor_zcull.depthStencil = valor;
+      if (AplazarBorrado(*profundidad, valor_zcull, true, true)) {
+        return;  // the scene pass that uses it opens with loadOp = CLEAR
+      }
+      VaciarBorradosAplazados(4);
       if (!dibujos_->BorrarProfundidadEnPase(comandos_trabajo_, *profundidad, valor.depth,
                                              valor.stencil)) {
         if (++borrados_en_pase_fallidos_ <= 8) {
@@ -1741,8 +1796,14 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       }
       return;
     }
+    VkClearValue valor_aplazado{};
+    valor_aplazado.depthStencil = valor;
+    if (AplazarBorrado(*profundidad, valor_aplazado, true)) {
+      return;
+    }
     borrar_profundidad_(comandos_trabajo_, profundidad->imagen, VK_IMAGE_LAYOUT_GENERAL, &valor, 1,
                         &kRangoProfundidad);
+    QuitarBandaAplazada(profundidad->imagen);
   }
 
   // Depth copy: the rectangle of the depth render target to a resolved texture
@@ -2827,6 +2888,13 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     nanosegundos = gpu_categorias_ns_;
   }
 
+  void CalibracionDesglose(std::array<uint64_t, kGpuCategorias>& envios, uint64_t& vacios,
+                           uint64_t& ns_vacios) const override {
+    envios = envios_desglose_;
+    vacios = vacios_desglose_;
+    ns_vacios = ns_vacios_desglose_;
+  }
+
   void EstadisticasPipeline(std::array<uint64_t, kGpuCategorias>& fragmentos,
                             std::array<uint64_t, kGpuCategorias>& vertices,
                             std::array<uint64_t, kGpuCategorias>& primitivas) const override {
@@ -3081,6 +3149,237 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     bool area_util_apagada = false;  // its useful area is not stable: cleared entirely
   };
 
+  // --- nfsmw_nativo_mali_borrado_en_pase ---
+  struct BorradoAplazado {
+    VkImage imagen = VK_NULL_HANDLE;
+    bool profundidad = false;
+    VkClearValue valor{};
+    // ZCULL depth (no TRANSFER_DST): if it is flushed it is recorded with BorrarProfundidadEnPase, which needs
+    // the view and the size. A copy, not a pointer: the Imagen may be recreated before the flush.
+    bool en_pase = false;
+    ImagenNativa copia{};
+  };
+  struct BandaAplazada {
+    uint32_t desde = 0;  // first row the pass did not clear
+    bool profundidad = false;
+    VkClearValue valor{};
+  };
+  std::vector<BorradoAplazado> borrados_aplazados_;
+  std::unordered_map<VkImage, BandaAplazada> bandas_aplazadas_;
+  uint64_t aplazados_tomados_ = 0, aplazados_grabados_ = 0, bandas_aplazadas_completadas_ = 0,
+           bandas_aplazadas_fallidas_ = 0;
+  std::chrono::steady_clock::time_point informe_aplazados_{};
+  uint32_t diag_no_tomados_ = 0;
+
+  static void VaciarBorradosAplazadosDe(void* yo, VkImage a, VkImage b) {
+    DestinosVulkan* d = static_cast<DestinosVulkan*>(yo);
+    for (const BorradoAplazado& p : d->borrados_aplazados_) {
+      if (p.imagen == a || (b != VK_NULL_HANDLE && p.imagen == b)) {
+        d->VaciarBorradosAplazados(0);
+        return;
+      }
+    }
+  }
+
+  // Defers a whole clear of that render target (Mali mode). false = record it as always.
+  bool AplazarBorrado(const Imagen& imagen, const VkClearValue& valor, bool profundidad, bool en_pase = false) {
+    if (!dibujos_ || !dibujos_->ModoMali() || !REXCVAR_GET(nfsmw_nativo_mali_borrado_en_pase) || !grabando_ ||
+        imagen.imagen == VK_NULL_HANDLE) {
+      return false;
+    }
+    if (!g_vaciar_borrados) {
+      g_vaciar_borrados = &VaciarBorradosAplazadosDe;
+      g_vaciar_borrados_dato = this;
+      REXLOG_INFO("[nativo] C2 modo Mali: borrados dentro del pase (nfsmw_nativo_mali_borrado_en_pase)");
+    }
+    // A new whole clear replaces a pending one of the same image and its band.
+    for (auto it = borrados_aplazados_.begin(); it != borrados_aplazados_.end();) {
+      it = it->imagen == imagen.imagen ? borrados_aplazados_.erase(it) : it + 1;
+    }
+    QuitarBandaAplazada(imagen.imagen);
+    BorradoAplazado b{imagen.imagen, profundidad, valor};
+    if (en_pase) {
+      b.en_pase = true;
+      b.copia = imagen;
+    }
+    borrados_aplazados_.push_back(b);
+    g_hay_borrados_aplazados = true;
+    return true;
+  }
+
+  // Records every deferred clear now (something else is about to be recorded). Outside any pass.
+  // motivo: 0 a copy, blit or depth clear (the wrappers), 1 end of the buffer, 2 a pass that uses one of
+  // them, 3 a color clear recorded as always, 4 a ZCULL depth clear, 5 a new image, 6 a read-back, 7 a restore,
+  // 8 a band, 9 another use of a pending image (a swap).
+  void VaciarBorradosAplazados(uint32_t motivo) {
+    if (borrados_aplazados_.empty()) {
+      return;
+    }
+    ++g_borrados_vaciados_por[std::min(motivo, 9u)];
+    std::vector<BorradoAplazado> lista;
+    lista.swap(borrados_aplazados_);
+    g_hay_borrados_aplazados = false;
+    if (!grabando_) {
+      return;  // cannot happen: clears are only deferred while recording, and EnviarTrabajo empties them
+    }
+    for (const BorradoAplazado& b : lista) {
+      if (b.en_pase) {
+        if (!dibujos_ || !dibujos_->BorrarProfundidadEnPase(comandos_trabajo_, b.copia, b.valor.depthStencil.depth,
+                                                            b.valor.depthStencil.stencil)) {
+          if (++borrados_en_pase_fallidos_ <= 8) {
+            REXLOG_WARN("[nativo] C2: NO se pudo borrar la profundidad {}x{} (aplazada) abriendo un pase (fallo {})",
+                        b.copia.ancho, b.copia.alto, borrados_en_pase_fallidos_);
+          }
+        }
+      } else if (b.profundidad) {
+        borrar_profundidad_(comandos_trabajo_, b.imagen, VK_IMAGE_LAYOUT_GENERAL, &b.valor.depthStencil, 1,
+                            &kRangoProfundidad);
+      } else {
+        dfn_.vkCmdClearColorImage(comandos_trabajo_, b.imagen, VK_IMAGE_LAYOUT_GENERAL, &b.valor.color, 1,
+                                  &kRangoColor);
+        ++g_diag_transferencias[kTrBorradosColor];
+        BarreraTrasTransferencia(comandos_trabajo_);
+      }
+      ++aplazados_grabados_;
+    }
+  }
+
+  // Same, only if one of them clears that image: a command that touches no other image cannot depend on them.
+  void VaciarBorradosAplazadosSiUsa(VkImage imagen, uint32_t motivo) {
+    for (const BorradoAplazado& b : borrados_aplazados_) {
+      if (b.imagen == imagen) {
+        VaciarBorradosAplazados(motivo);
+        return;
+      }
+    }
+  }
+
+  void QuitarBandaAplazada(VkImage imagen) {
+    if (!bandas_aplazadas_.empty()) {
+      bandas_aplazadas_.erase(imagen);
+    }
+  }
+
+  void OlvidarBorradosAplazados(VkImage imagen) {
+    if (imagen == VK_NULL_HANDLE) {
+      return;
+    }
+    for (auto it = borrados_aplazados_.begin(); it != borrados_aplazados_.end();) {
+      it = it->imagen == imagen ? borrados_aplazados_.erase(it) : it + 1;
+    }
+    g_hay_borrados_aplazados = !borrados_aplazados_.empty();
+    QuitarBandaAplazada(imagen);
+  }
+
+  void CompletarBandaAplazada(const Imagen& imagen, std::unordered_map<VkImage, BandaAplazada>::iterator it) {
+    const BandaAplazada banda = it->second;
+    bandas_aplazadas_.erase(it);
+    ++bandas_aplazadas_completadas_;
+    if (banda.desde >= imagen.alto) {
+      return;
+    }
+    VaciarBorradosAplazados(8);
+    if (dibujos_ && Grabar() &&
+        dibujos_->BorrarEnPase(comandos_trabajo_, imagen, banda.valor, banda.profundidad,
+                               VkRect2D{{0, int32_t(banda.desde)}, {imagen.ancho, imagen.alto - banda.desde}})) {
+      return;
+    }
+    // The pass could not be opened. Clearing the whole image would erase what was drawn: only counted.
+    if (++bandas_aplazadas_fallidas_ <= 4) {
+      REXLOG_ERROR("[nativo] C2 borrado en pase: no se pudo completar la banda de {}x{} desde la fila {}",
+                   imagen.ancho, imagen.alto, banda.desde);
+    }
+  }
+
+  uint32_t TomarBorradosDePase(ImagenNativa* const imagenes[5], uint32_t ancho, uint32_t alto_pase,
+                               uint32_t& alto_abrir, VkClearValue valores[5]) override {
+    alto_abrir = alto_pase;
+    uint32_t mascara = 0;
+    if (!borrados_aplazados_.empty()) {
+      // A margin of 64 rows below the renderArea (like nfsmw_nativo_borrar_area_util): a linear blit can read
+      // the row below its rectangle, and the band must not be completed for that.
+      uint32_t alto_imagenes = UINT32_MAX;
+      for (uint32_t i = 0; i < 5; ++i) {
+        if (imagenes[i]) {
+          alto_imagenes = std::min(alto_imagenes, imagenes[i]->alto);
+        }
+      }
+      const uint32_t alto_con_margen = std::min(alto_imagenes, alto_pase + 64);
+      for (uint32_t i = 0; i < 5; ++i) {
+        const ImagenNativa* imagen = imagenes[i];
+        if (!imagen || imagen->ancho != ancho) {
+          continue;
+        }
+        for (auto it = borrados_aplazados_.begin(); it != borrados_aplazados_.end(); ++it) {
+          if (it->imagen == imagen->imagen && it->profundidad == (i == 4)) {
+            mascara |= 1u << i;
+            valores[i] = it->valor;
+            if (alto_con_margen < imagen->alto) {
+              bandas_aplazadas_[imagen->imagen] = {alto_con_margen, it->profundidad, it->valor};
+            }
+            borrados_aplazados_.erase(it);
+            ++aplazados_tomados_;
+            break;
+          }
+        }
+      }
+      if (mascara) {
+        alto_abrir = alto_con_margen;
+      }
+      // What is left is kept unless the pass uses one of those images (a width that does not cover it): the
+      // rest is recorded when something else touches it, or at the end of the buffer.
+      bool usa_pendiente = false;
+      for (const BorradoAplazado& b : borrados_aplazados_) {
+        for (uint32_t i = 0; i < 5; ++i) {
+          usa_pendiente |= imagenes[i] && imagenes[i]->imagen == b.imagen;
+        }
+      }
+      if (usa_pendiente) {
+        // Why the first ones were not taken: what was pending against the pass attachments.
+        if (diag_no_tomados_ < 6) {
+          ++diag_no_tomados_;
+          const BorradoAplazado& b = borrados_aplazados_.front();
+          REXLOG_INFO("[nativo] C2 borrado en pase: no tomado ({} pendientes; el primero {} {:p}); pase {}x{}: "
+                      "{:p} {:p} {:p} {:p} prof {:p} (anchos {} {} {} {} {})",
+                      borrados_aplazados_.size(), b.profundidad ? "profundidad" : "color",
+                      static_cast<const void*>(b.imagen),
+                      ancho, alto_pase,
+                      static_cast<const void*>(imagenes[0] ? imagenes[0]->imagen : VK_NULL_HANDLE),
+                      static_cast<const void*>(imagenes[1] ? imagenes[1]->imagen : VK_NULL_HANDLE),
+                      static_cast<const void*>(imagenes[2] ? imagenes[2]->imagen : VK_NULL_HANDLE),
+                      static_cast<const void*>(imagenes[3] ? imagenes[3]->imagen : VK_NULL_HANDLE),
+                      static_cast<const void*>(imagenes[4] ? imagenes[4]->imagen : VK_NULL_HANDLE),
+                      imagenes[0] ? imagenes[0]->ancho : 0, imagenes[1] ? imagenes[1]->ancho : 0,
+                      imagenes[2] ? imagenes[2]->ancho : 0, imagenes[3] ? imagenes[3]->ancho : 0,
+                      imagenes[4] ? imagenes[4]->ancho : 0);
+        }
+      }
+      if (usa_pendiente) {
+        VaciarBorradosAplazados(2);
+      }
+    }
+    const auto ahora = std::chrono::steady_clock::now();
+    if (g_vaciar_borrados && ahora - informe_aplazados_ >= std::chrono::seconds(20)) {
+      if (informe_aplazados_ != std::chrono::steady_clock::time_point{}) {
+        REXLOG_INFO("[nativo] C2 borrado en pase (20 s): {} borrados hechos al abrir su pase, {} grabados como "
+                    "antes, {} bandas completadas ({} fallidas), {} bandas pendientes; vaciados por: copia/blit/"
+                    "borrado de profundidad {}, fin del bufer {}, pase que la usa {}, borrado de color {}, ZCULL {}, "
+                    "imagen nueva {}, lectura {}, restauracion {}, banda {}, otro uso {}",
+                    aplazados_tomados_, aplazados_grabados_, bandas_aplazadas_completadas_,
+                    bandas_aplazadas_fallidas_, bandas_aplazadas_.size(), g_borrados_vaciados_por[0],
+                    g_borrados_vaciados_por[1], g_borrados_vaciados_por[2], g_borrados_vaciados_por[3],
+                    g_borrados_vaciados_por[4], g_borrados_vaciados_por[5], g_borrados_vaciados_por[6],
+                    g_borrados_vaciados_por[7], g_borrados_vaciados_por[8], g_borrados_vaciados_por[9]);
+        for (uint64_t& v : g_borrados_vaciados_por) {
+          v = 0;
+        }
+      }
+      informe_aplazados_ = ahora;
+      aplazados_tomados_ = aplazados_grabados_ = bandas_aplazadas_completadas_ = 0;
+    }
+    return mascara;
+  }
+
   // What is drawn in a pass on that render target (its renderArea). Called by DibujosVulkan in EmpezarPase.
   void AnotarAreaDePase(const ImagenNativa* imagen, uint32_t ancho, uint32_t alto) override {
     if (imagen) {
@@ -3115,6 +3414,19 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   // The rectangle from 0 to width and from 0 to height of that image is used (a pass, a resolve, a restore
   // or a swap). It only counts on render targets that have been cleared at least once.
   void AnotarUsoBorrado(const Imagen& imagen, uint32_t ancho, uint32_t alto) {
+    for (const BorradoAplazado& b : borrados_aplazados_) {
+      if (b.imagen == imagen.imagen) {
+        VaciarBorradosAplazados(9);
+        break;
+      }
+    }
+    // nfsmw_nativo_mali_borrado_en_pase: the band below a clear taken by a pass.
+    if (!bandas_aplazadas_.empty()) {
+      const auto it = bandas_aplazadas_.find(imagen.imagen);
+      if (it != bandas_aplazadas_.end() && std::min(alto, imagen.alto) >= it->second.desde) {
+        CompletarBandaAplazada(imagen, it);
+      }
+    }
     // nfsmw_nativo_borrar_area_util. While any band remains uncleared it is checked even if the diagnostic
     // was turned off at run time: a pending band is always completed before it is used.
     if (uso_borrados_.empty() || (!diag_borrados_ && !bandas_pendientes_)) {
@@ -3693,9 +4005,9 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   // what was recorded since the previous boundary: this pass plus the copies and clears before it. Without
   // timestamps that wall time (submission to fence) is the closest thing to its GPU time, and it goes into
   // the same per-category totals as the timestamps, so the usual C2 report shows it.
-  void EnviarYMedir(uint32_t categoria) override {
+  uint64_t EnviarYMedir(uint32_t categoria) override {
     if (!grabando_ || consultas_ != VK_NULL_HANDLE || categoria >= kGpuCategorias) {
-      return;  // with timestamps the usual measurement already applies
+      return 0;  // with timestamps the usual measurement already applies
     }
     if (!desglose_anotado_) {
       desglose_anotado_ = true;
@@ -3710,7 +4022,20 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     gpu_categorias_ns_[categoria] += ns;
     gpu_ns_ += ns;
     ++gpu_trabajos_;
+    ++envios_desglose_[categoria];
     Grabar();
+    // Calibration, one in eight: the same submit+wait with an empty command buffer (only what
+    // EmpezarGrabacion records). That is the fixed cost every measurement above carries.
+    if ((envios_desglose_[categoria] & 7) == 0) {
+      const auto antes_vacio = std::chrono::steady_clock::now();
+      EsperarGpu();
+      ns_vacios_desglose_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - antes_vacio)
+                                          .count());
+      ++vacios_desglose_;
+      Grabar();
+    }
+    return ns;
   }
 
   // The function above submits and continues; this one waits. Same order as every other place that must
@@ -4417,6 +4742,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     constexpr VkPipelineStageFlags kEscrituras =
         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VaciarBorradosAplazados(7);
     dfn_.vkCmdPipelineBarrier(comandos_trabajo_, kEscrituras, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrera, 0,
                               nullptr, 0, nullptr);
     VkImageCopy copia{};
@@ -4768,6 +5094,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
 
   void Destruir(Imagen& imagen) {
     CompuestaAlDestruir(imagen);  // nfsmw_nativo_compuesta_perezosa
+    OlvidarBorradosAplazados(imagen.imagen);  // nfsmw_nativo_mali_borrado_en_pase
     // nfsmw_nativo_frontal_perezoso. A deferred copy cannot keep a destroyed image. If the texture is
     // what gets destroyed (ObtenerResuelta recreates it with another size or format), its content is lost
     // just as before: the copy is simply dropped. If it is the source (only at shutdown: render targets
@@ -4857,6 +5184,9 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       }
     } else {
       const VkClearColorValue cero{};
+      if (comandos == comandos_trabajo_) {
+        VaciarBorradosAplazados(5);
+      }
       dfn_.vkCmdClearColorImage(comandos, imagen.imagen, VK_IMAGE_LAYOUT_GENERAL, &cero,
                                 1, &kRangoColor);
       BarreraTrasTransferencia(comandos);
@@ -5227,6 +5557,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       if (dibujos_) {
         dibujos_->AntesDeEnviar();  // closes the pass and publishes the upload buffer
       }
+      VaciarBorradosAplazados(1);  // nfsmw_nativo_mali_borrado_en_pase: before closing the buffer
       grabando_ = false;
       std::array<VkCommandBuffer, 2> bufers{};
       uint32_t n = 0;
@@ -5585,6 +5916,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     copia.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copia.imageOffset = {int32_t(dx), int32_t(dy), 0};
     copia.imageExtent = {ancho, alto, 1};
+    VaciarBorradosAplazadosSiUsa(resuelta.imagen.imagen, 6);  // only reads that image
     dfn_.vkCmdCopyImageToBuffer(comandos_trabajo_, resuelta.imagen.imagen, VK_IMAGE_LAYOUT_GENERAL,
                                 lectura.bufer, 1, &copia);
     BarreraTrasTransferencia(comandos_trabajo_);
@@ -5913,6 +6245,9 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   bool salida_sin_espera_ = false;
   bool marcas_precisas_ = false;
   bool desglose_anotado_ = false;  // nfsmw_nativo_desglose_por_fence, logged once
+  std::array<uint64_t, kGpuCategorias> envios_desglose_{};  // measured submissions per category
+  uint64_t vacios_desglose_ = 0;                            // empty calibration submissions
+  uint64_t ns_vacios_desglose_ = 0;
   int32_t alternar_marcas_s_ = 0;
   std::chrono::steady_clock::time_point inicio_marcas_{};
   bool invalidar_cada_copia_ = false;

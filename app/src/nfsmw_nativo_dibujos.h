@@ -73,7 +73,10 @@ inline constexpr uint32_t kGpuBorrados = 7;  // C2 color and depth clears
 inline constexpr uint32_t kGpuEscenaSinProfundidad = 8;
 // Not a pass type but the GPU gap between the end of one submission and the start of the next.
 inline constexpr uint32_t kGpuHuecoEntreTrabajos = 9;
-inline constexpr uint32_t kGpuCategorias = 10;
+// 320 targets without depth: the speed blur and the other downscaled full-screen passes ("320" is kept for
+// the ones with depth, the cubemap faces).
+inline constexpr uint32_t kGpu320SinProfundidad = 10;
+inline constexpr uint32_t kGpuCategorias = 11;
 // Buckets of the histogram of intervals between Swaps (originally <15, 15-18, 18-25, 25-30, 30-36, 36-50,
 // >=50 ms). Now 11 buckets: the top ones were all lumped into ">=50 ms", where 83 % of race frames fell,
 // so a 55 ms frame could not be told from a 150 ms one, which is exactly the difference between "slow"
@@ -104,6 +107,19 @@ class ContextoDestinos {
   virtual void LecturasDeProfundidadMuertas(bool muertas) { (void)muertas; }
   // nfsmw_nativo_diag_borrados. What a pass loads and stores of that render target (its renderArea): the
   // part of what was cleared that is actually used. Called before opening the pass.
+  // nfsmw_nativo_mali_borrado_en_pase. Just before opening a pass (outside any pass): the deferred clears
+  // of its attachments (indices 0-3 color, 4 depth) are handed to the pass as loadOp = CLEAR. Returns the
+  // mask of attachments to clear and their values; every other deferred clear is recorded now. alto_pase is
+  // the height the pass would open with; alto_abrir, the one to open with (it can grow a margin so the rows
+  // just below stay cleared too). ancho: the pass width (a clear is only taken if it covers the image width).
+  virtual uint32_t TomarBorradosDePase(ImagenNativa* const imagenes[5], uint32_t ancho, uint32_t alto_pase,
+                                       uint32_t& alto_abrir, VkClearValue valores[5]) {
+    (void)imagenes;
+    (void)ancho;
+    alto_abrir = alto_pase;
+    (void)valores;
+    return 0;
+  }
   virtual void AnotarAreaDePase(const ImagenNativa* imagen, uint32_t ancho, uint32_t alto) {
     (void)imagen;
     (void)ancho;
@@ -136,8 +152,8 @@ class ContextoDestinos {
   // Submits what was recorded and continues in the other slot, with its upload buffer empty.
   virtual bool EnviarYEsperar() = 0;
   // nfsmw_nativo_desglose_por_fence: submits what was recorded, waits for the GPU to finish everything and
-  // adds that wall time to the category (for GPUs without timestamps, such as the Mali-G52).
-  virtual void EnviarYMedir(uint32_t categoria) { (void)categoria; }
+  // adds that wall time to the category (for GPUs without timestamps, such as the Mali-G52). Returns it.
+  virtual uint64_t EnviarYMedir(uint32_t categoria) { (void)categoria; return 0; }
   // Waits for the GPU to finish everything pending and starts recording again. It is expensive (a
   // one-frame stutter), so it is only used as a last resort when memory runs out: with the GPU idle,
   // textures can be released regardless of when they were last used, because none is in use.
@@ -286,6 +302,16 @@ class DibujosVulkan {
                                        float profundidad, uint32_t stencil) = 0;
   // nfsmw_nativo_borrar_area_util. Clears only the `area` rectangle of a color image by opening a pass
   // with loadOp = CLEAR. Returns false if it could not.
+  // nfsmw_nativo_mali_borrado_en_pase. Like BorrarColorEnPase, color or depth (with its stencil).
+  virtual bool BorrarEnPase(VkCommandBuffer comandos, const ImagenNativa& imagen, const VkClearValue& valor,
+                            bool profundidad, const VkRect2D& area) {
+    (void)comandos;
+    (void)imagen;
+    (void)valor;
+    (void)profundidad;
+    (void)area;
+    return false;
+  }
   virtual bool BorrarColorEnPase(VkCommandBuffer comandos, const ImagenNativa& imagen, const VkClearColorValue& color,
                                  const VkRect2D& area) {
     (void)comandos;
@@ -337,6 +363,12 @@ class DibujosVulkan {
  * nfsmw_nativo_vertices_dedupe.h.
  */
 extern std::atomic<uint32_t> g_sincronizaciones_anillo;
+// nfsmw_nativo_desglose_por_fence: transfer work recorded so far (ring thread only), to tell what fills the
+// gaps between passes: copies, texels copied, blits, texels blitted, depth clears, color clears, color
+// texels cleared, transfer barriers, texture uploads, bytes uploaded.
+enum : uint32_t { kTrCopias, kTrTexCopia, kTrBlits, kTrTexBlit, kTrBorradosProf, kTrBorradosColor, kTrTexColor,
+                  kTrBarreras, kTrSubidas, kTrBytesSubida, kTrCampos };
+extern uint64_t g_diag_transferencias[kTrCampos];
 
 /*
  * The ring thread's reports are written on another thread (nfsmw_nativo_informes_diferidos).

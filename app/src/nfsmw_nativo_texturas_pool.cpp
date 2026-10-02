@@ -184,6 +184,7 @@ bool PoolTexturas::Iniciar(const rex::ui::vulkan::VulkanDevice* dispositivo, int
   const uint32_t slabs_iniciales =
       uint32_t(std::min<uint64_t>(((uint64_t(mb_inicial) << 20) + slab_bytes_ - 1) / slab_bytes_, slabs_tope_));
 
+  slabs_iniciales_ = slabs_iniciales;
   activo_ = true;  // CrearSlab lo necesita puesto
   for (uint32_t i = 0; i < slabs_iniciales; ++i) {
     if (!CrearSlab(false)) {
@@ -208,8 +209,27 @@ bool PoolTexturas::Iniciar(const rex::ui::vulkan::VulkanDevice* dispositivo, int
   return true;
 }
 
+uint32_t PoolTexturas::SlabsVivos() const {
+  uint32_t vivos = 0;
+  for (const Slab& slab : slabs_) {
+    vivos += slab.memoria != VK_NULL_HANDLE ? 1u : 0u;
+  }
+  return vivos;
+}
+
 bool PoolTexturas::CrearSlab(bool en_caliente) {
-  if (!activo_ || slabs_.size() >= slabs_tope_ || slabs_.size() >= kMaxSlabs) {
+  if (!activo_ || SlabsVivos() >= slabs_tope_) {
+    return false;
+  }
+  // A released slot is reused (its index is free: nothing points into it any more).
+  size_t hueco = slabs_.size();
+  for (size_t i = 0; i < slabs_.size(); ++i) {
+    if (slabs_[i].memoria == VK_NULL_HANDLE) {
+      hueco = i;
+      break;
+    }
+  }
+  if (hueco == slabs_.size() && slabs_.size() >= kMaxSlabs) {
     return false;
   }
   /*
@@ -234,11 +254,16 @@ bool PoolTexturas::CrearSlab(bool en_caliente) {
   slab.unidades = slab_unidades_;
   slab.ocupadas.assign((slab_unidades_ + 63) / 64, 0ull);
   slab.largo.assign(slab_unidades_, 0u);
-  slabs_.push_back(std::move(slab));
+  slab.vacio_desde = fotograma_;
+  if (hueco < slabs_.size()) {
+    slabs_[hueco] = std::move(slab);
+  } else {
+    slabs_.push_back(std::move(slab));
+  }
   if (en_caliente) {
     ++slabs_en_caliente_;
     REXLOG_INFO("[nativo] C3: pool de texturas: bloque {} nuevo en caliente; ya van {} MB reservados",
-                slabs_.size() - 1, (slabs_.size() * slab_bytes_) >> 20);
+                hueco, (uint64_t(SlabsVivos()) * slab_bytes_) >> 20);
   }
   return true;
 }
@@ -292,8 +317,23 @@ bool PoolTexturas::Reservar(const VkMemoryRequirements& requisitos, VkDeviceMemo
   const uint64_t alineacion = std::max<uint64_t>(requisitos.alignment, kUnidadPoolBytes);
   const uint32_t paso = uint32_t(std::max<uint64_t>(1, alineacion / kUnidadPoolBytes));
 
-  for (uint32_t s = 0; s < slabs_.size(); ++s) {
+  // liberar_vacios_: fullest slab first, so the emptier ones drain and can be released.
+  uint32_t orden[kMaxSlabs];
+  const uint32_t n_slabs = uint32_t(slabs_.size());
+  for (uint32_t i = 0; i < n_slabs; ++i) {
+    orden[i] = i;
+  }
+  if (liberar_vacios_) {
+    std::stable_sort(orden, orden + n_slabs, [this](uint32_t a, uint32_t b) {
+      return slabs_[a].unidades_en_uso > slabs_[b].unidades_en_uso;
+    });
+  }
+  for (uint32_t k = 0; k < n_slabs; ++k) {
+    const uint32_t s = orden[k];
     Slab& slab = slabs_[s];
+    if (slab.memoria == VK_NULL_HANDLE) {
+      continue;  // released
+    }
     uint32_t inicio = 0;
     if (!BuscarHueco(slab.ocupadas, slab.unidades, unidades, paso, inicio)) {
       continue;
@@ -301,6 +341,7 @@ bool PoolTexturas::Reservar(const VkMemoryRequirements& requisitos, VkDeviceMemo
     MarcarRango(slab.ocupadas, inicio, unidades, true);
     slab.largo[inicio] = unidades;
     slab.unidades_en_uso += unidades;
+    slab.vacio_desde = UINT64_MAX;
 
     memoria_out = slab.memoria;
     offset_out = VkDeviceSize(inicio) * kUnidadPoolBytes;
@@ -334,13 +375,54 @@ void PoolTexturas::Liberar(uint32_t bloque) {
   MarcarRango(slab.ocupadas, inicio, unidades, false);
   slab.largo[inicio] = 0u;
   slab.unidades_en_uso -= std::min(slab.unidades_en_uso, unidades);
+  if (slab.unidades_en_uso == 0) {
+    slab.vacio_desde = fotograma_;
+  }
   if (texturas_vivas_ > 0) {
     --texturas_vivas_;
   }
 }
 
+void PoolTexturas::LiberarSlabVacio(uint64_t fotograma) {
+  uint64_t libres = 0;
+  for (const Slab& slab : slabs_) {
+    libres += uint64_t(slab.unidades - slab.unidades_en_uso) * kUnidadPoolBytes;
+  }
+  // Never below the prewarmed slabs, and keeping twice the growth headroom free after releasing, so the
+  // next frame does not have to create it again.
+  if (SlabsVivos() <= slabs_iniciales_ || libres < slab_bytes_ + 2 * kHolguraBytes) {
+    return;
+  }
+  for (uint32_t s = 0; s < slabs_.size(); ++s) {
+    Slab& slab = slabs_[s];
+    if (slab.memoria == VK_NULL_HANDLE || slab.unidades_en_uso != 0 || slab.vacio_desde == UINT64_MAX ||
+        fotograma < slab.vacio_desde + kFotogramasEntreSlabs) {
+      continue;
+    }
+    dispositivo_->functions().vkFreeMemory(device_, slab.memoria, nullptr);
+    slab.memoria = VK_NULL_HANDLE;
+    slab.unidades = 0;
+    std::vector<uint64_t>().swap(slab.ocupadas);
+    std::vector<uint32_t>().swap(slab.largo);
+    slab.vacio_desde = UINT64_MAX;
+    ++slabs_liberados_;
+    ultimo_crecimiento_ = fotograma;  // no new slab right after releasing one
+    REXLOG_INFO("[nativo] C3: pool de texturas: bloque {} vacio devuelto al sistema; quedan {} MB reservados "
+                "({} devueltos)",
+                s, (uint64_t(SlabsVivos()) * slab_bytes_) >> 20, slabs_liberados_);
+    return;  // at most one per frame
+  }
+}
+
 void PoolTexturas::PorFotograma(uint64_t fotograma) {
-  if (!activo_ || slabs_.size() >= slabs_tope_) {
+  fotograma_ = fotograma;
+  if (!activo_) {
+    return;
+  }
+  if (liberar_vacios_) {
+    LiberarSlabVacio(fotograma);
+  }
+  if (SlabsVivos() >= slabs_tope_) {
     return;
   }
   if (fotograma < ultimo_crecimiento_ + kFotogramasEntreSlabs) {
@@ -361,8 +443,8 @@ EstadoPoolTexturas PoolTexturas::Estado() const {
   EstadoPoolTexturas e;
   e.activo = activo_;
   e.tipo_memoria = tipo_memoria_;
-  e.slabs = uint32_t(slabs_.size());
-  e.bytes_reservados = uint64_t(slabs_.size()) * slab_bytes_;
+  e.slabs = SlabsVivos();
+  e.bytes_reservados = uint64_t(e.slabs) * slab_bytes_;
   uint32_t mayor = 0;
   for (const Slab& slab : slabs_) {
     e.bytes_en_uso += uint64_t(slab.unidades_en_uso) * kUnidadPoolBytes;
@@ -376,6 +458,7 @@ EstadoPoolTexturas PoolTexturas::Estado() const {
   e.huecos_fallados = huecos_fallados_;
   e.slabs_en_caliente = slabs_en_caliente_;
   e.slabs_fallados = slabs_fallados_;
+  e.slabs_liberados = slabs_liberados_;
   return e;
 }
 
@@ -399,7 +482,7 @@ std::string PoolTexturas::Resumen() const {
          " %); " + std::to_string(e.texturas_colocadas) + " colocadas y " +
          std::to_string(e.texturas_dedicadas) + " a la ruta dedicada (" + std::to_string(e.huecos_fallados) +
          " sin hueco); bloques en caliente " + std::to_string(e.slabs_en_caliente) + ", negados " +
-         std::to_string(e.slabs_fallados);
+         std::to_string(e.slabs_fallados) + ", devueltos " + std::to_string(e.slabs_liberados);
 }
 
 }  // namespace nfsmw::nativo

@@ -125,6 +125,7 @@ struct EstadoPoolTexturas {
   uint64_t huecos_fallados = 0;      // times it did not fit in any slab
   uint64_t slabs_en_caliente = 0;    // slabs created after prewarming
   uint64_t slabs_fallados = 0;       // times vkAllocateMemory refused a slab
+  uint64_t slabs_liberados = 0;      // empty slabs returned to the system (ActivarLiberarVacios)
 };
 
 /*
@@ -190,6 +191,14 @@ class PoolTexturas {
    */
   void PorFotograma(uint64_t fotograma);
 
+  /*
+   * Mali mode (phones): fill the fullest slabs first, so the others drain, and return a slab to the
+   * system once it has been empty for kFotogramasEntreSlabs frames. Without it the pool only grew: 272 MB
+   * reserved with 170 in use, RAM that Android then took back from everything else (lmkd). The delay keeps
+   * the safety invariant: the last texture of the slab was already unused 120 frames before it was released.
+   */
+  void ActivarLiberarVacios(bool activar) { liberar_vacios_ = activar; }
+
   // A texture did not fit (or the pool is off) and took the dedicated path.
   void AnotarDedicada() { ++texturas_dedicadas_; }
 
@@ -205,6 +214,7 @@ class PoolTexturas {
     uint32_t unidades_en_uso = 0;
     std::vector<uint64_t> ocupadas;  // bitmap, one unit per bit
     std::vector<uint32_t> largo;     // units reserved from each start (0 = not a start)
+    uint64_t vacio_desde = UINT64_MAX;  // frame it became empty (liberar_vacios_)
   };
 
   // 8 MB of headroom: below that a new slab is requested.
@@ -215,6 +225,8 @@ class PoolTexturas {
   static constexpr uint32_t kMaxSlabs = 255;
 
   bool CrearSlab(bool en_caliente);
+  uint32_t SlabsVivos() const;
+  void LiberarSlabVacio(uint64_t fotograma);
   bool ElegirTipoDeMemoria(uint32_t& tipo_out, uint64_t& alineacion_vista_out) const;
 
   const rex::ui::vulkan::VulkanDevice* dispositivo_ = nullptr;
@@ -225,7 +237,12 @@ class PoolTexturas {
   uint32_t slab_unidades_ = 0;
   uint32_t slabs_tope_ = 0;
   uint64_t ultimo_crecimiento_ = 0;
+  // A released slab keeps its slot (memoria = VK_NULL_HANDLE, 0 units): its index is part of the block ids.
   std::vector<Slab> slabs_;
+  bool liberar_vacios_ = false;
+  uint32_t slabs_iniciales_ = 0;
+  uint64_t fotograma_ = 0;
+  uint64_t slabs_liberados_ = 0;
 
   uint64_t texturas_vivas_ = 0;
   uint64_t texturas_colocadas_ = 0;

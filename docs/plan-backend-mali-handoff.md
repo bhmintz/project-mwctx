@@ -280,6 +280,15 @@ no la imagen). Emular memexport→compute (Xenia, `spirv_translator_memexport.cp
   alguna vez; si sí, una compilación asíncrona ayudaría mientras tanto (no hay cvar `async_shader_compilation`
   en este árbol: habría que añadirla).
 - Puede haber otros puntos del nativo que asuman BDA/bindless fuera de los 3 identificados; aparecerán al iterar.
+- **Crash del guest con el juego quieto (pendiente, sin investigar):**
+  `[FATAL] Call to invalid or unregistered function at guest address 0x00000000`, hilo Main XThread,
+  `xstart → sub_82441CC8 → sub_823C83F8` (el ejecutor de la lista de comandos 0x82909650). Pasó 2 veces
+  (2026-10-01, 21:48 y 22:06), las dos con el juego quieto o en pausa en carrera; no depende de la resolución
+  ni de la GPU. Hipótesis: los hooks del traspaso de fotograma de `app/src/nfsmw_espera_fotograma.cpp`
+  (`nfsmw_ejecutor_sin_vueltas`, `nfsmw_espera_fotograma_bloqueante`, bandera 0x82A2CF40) con el orden de memoria
+  débil de ARM y fotogramas lentos: el ejecutor lee una entrada de la lista antes de que el preparador la publique.
+  Test propuesto: apagar las dos cvars y dejar la carrera quieta 5 min; si no crashea, poner barreras
+  acquire/release en la bandera en lugar de quitar los hooks.
 
 ---
 

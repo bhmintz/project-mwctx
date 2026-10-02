@@ -29,7 +29,13 @@
 //   rectangle lists, line loops and vertex formats without a direct Vulkan
 //   equivalent.
 
+#if defined(__ANDROID__)
+#include <dlfcn.h>
+#include <unwind.h>
+#endif
+#include <mutex>
 #include "nfsmw_nativo_dibujos.h"
+#include "nfsmw_nativo_sistema.h"  // SwapsNativos (nfsmw_nativo_desglose_por_fence)
 #include "nfsmw_esperas_tiron.h"
 
 #include "nfsmw_nativo_vertices_dedupe.h"
@@ -745,6 +751,38 @@ REXCVAR_DEFINE_BOOL(nfsmw_nativo_desglose_por_fence, false, "NFSMW",
                     "Diagnostico para GPUs sin marcas de tiempo (Mali-G52): al cerrar cada pase se envia lo grabado "
                     "y se espera a la GPU; ese tiempo va a la categoria del pase en el informe C2 (GPU por Swap). "
                     "Serializa CPU y GPU: los fps bajan, solo para medir");
+REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_sin_burbuja, 1, "NFSMW",
+                     "Modo Mali: las dependencias de los render pass no terminan en la etapa de vertices, para que "
+                     "la geometria de un pase se solape con el sombreado del anterior. 0 = como antes, 1 = sin "
+                     "burbuja, 2 = alternar cada 10 s y anotar los fps de cada tramo (A/B)");
+// The scenery is mostly BC1. Decoded to RGBA8 it takes 8 times the guest size, and that pushed the GPU memory
+// over 1 GB: at high speed the streaming grew it until Android started reclaiming (lmkd) and every thread of
+// the game stalled for hundreds of ms. BC1 only has 5/6/5 endpoints and a 1-bit alpha, so A1R5G5B5 keeps
+// almost all of it in half the size.
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_bc1_16bits, true, "NFSMW",
+                    "Modo Mali: las texturas BC1 (DXT1) descomprimidas en la CPU se guardan en A1R5G5B5 (2 bytes "
+                    "por texel) en vez de RGBA8 (4): la mitad de memoria. Se lee al arrancar");
+// Measured on the Mali-G52 (02/10): with the shadows off and the cache at 256 MB the GPU memory went from 1.08
+// to 0.81 GB, lmkd reclaims from 180 to 30 per run and the hitches above 400 ms at full speed from 21 to 8.
+// The shadow also showed as a translucent dark rectangle in front of the car, so nothing visible is lost.
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_diag_memoria, false, "NFSMW",
+                    "Modo Mali, diagnostico: cuenta cada vkAllocateMemory por quien la pide y lo informa con la "
+                    "memoria de la GPU (C3 diag memoria). Se lee al arrancar")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Measured in a race (02/10, histogram every 10 s): almost every frame fills <= 16 MB of its upload buffer,
+// a few reach 24, and only the loading bursts (one every 30-60 s) pass 32. Three 64 MB buffers were 192 MB
+// of GPU memory for that; at 32 MB a burst costs one extra submit, which the 64 MB ones already paid.
+REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_subida_mb, 32, "NFSMW",
+                     "Modo Mali: MB de cada bufer de subida (hay uno por fotograma en vuelo). 64 = como en el resto")
+    .range(16, 64)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sin_sombras, true, "NFSMW",
+                    "Modo Mali: no se graba el mapa de sombras (como nfsmw_nativo_omitir_sombras, solo en Mali)");
+REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_texturas_mb_max, 256, "NFSMW",
+                     "Modo Mali: tope de la cache de texturas en MB (el menor entre este y "
+                     "nfsmw_nativo_texturas_mb_max). 0 = usar solo nfsmw_nativo_texturas_mb_max")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_enviar_tras_sombras, false, "NFSMW",
                     "Renderizador nativo (20/09): enviar el trabajo a la GPU en cuanto se cierra el pase de "
                     "sombras, en vez de todo junto al final del fotograma. La GPU deja de estar parada "
@@ -1100,6 +1138,7 @@ namespace nfsmw::nativo {
 // Incremented by the ring thread when it handles a WAIT_REG_MEM (nfsmw_nativo_sistema.cpp). That is the
 // point where vertex deduplication must forget what it recorded.
 std::atomic<uint32_t> g_sincronizaciones_anillo{0};
+uint64_t g_diag_transferencias[kTrCampos] = {};
 namespace {
 
 /*
@@ -1122,7 +1161,7 @@ inline uint32_t CategoriaDeDestino(uint32_t pitch, const uint64_t* claves) {
     return kGpuReflejo;
   }
   if (pitch >= 320) {
-    return kGpu320;
+    return claves[4] ? kGpu320 : kGpu320SinProfundidad;
   }
   return kGpuMenores;
 }
@@ -2141,6 +2180,143 @@ static_assert(std::has_unique_object_representations_v<RegistroPipeline>,
  * thread spinning in the signal handler). Mali mode only, and only when the format is not sampleable:
  * BC1/BC2/BC3 -> RGBA8, BC4 -> R8, BC5 -> RG8 (the view swizzles stay the same).
  */
+#if defined(__ANDROID__)
+/*
+ * nfsmw_nativo_mali_diag_memoria. Every vkAllocateMemory of the device goes through here (the device function
+ * table is patched once; everyone reads it by reference). The bytes still allocated are grouped by the four
+ * return addresses of the caller (offsets inside our .so, to symbolize with llvm-addr2line on the unstripped
+ * library). What GL mtrack shows above the total is the driver's own memory (pipelines, command buffers,
+ * descriptors, swapchain).
+ */
+struct OrigenMemoria {
+  uintptr_t pila[4] = {};
+  bool operator==(const OrigenMemoria& o) const { return std::memcmp(pila, o.pila, sizeof(pila)) == 0; }
+};
+struct HashOrigenMemoria {
+  size_t operator()(const OrigenMemoria& o) const {
+    size_t h = 0;
+    for (uintptr_t v : o.pila) h = h * 1000003u ^ std::hash<uintptr_t>()(v);
+    return h;
+  }
+};
+struct UsoOrigenMemoria {
+  uint64_t bytes = 0;
+  uint64_t reservas = 0;
+  uint64_t pico = 0;
+  uint32_t tipo = 0;
+};
+std::mutex g_diag_memoria_mutex;
+std::unordered_map<VkDeviceMemory, std::pair<uint64_t, OrigenMemoria>> g_diag_memoria_vivas;
+std::unordered_map<OrigenMemoria, UsoOrigenMemoria, HashOrigenMemoria> g_diag_memoria_por_origen;
+uint64_t g_diag_memoria_total = 0, g_diag_memoria_pico = 0;
+PFN_vkAllocateMemory g_diag_memoria_reservar = nullptr;
+PFN_vkFreeMemory g_diag_memoria_liberar = nullptr;
+uintptr_t g_diag_memoria_base = 0;
+
+struct PilaDiagMemoria {
+  uintptr_t* salida;
+  int n;
+  int saltar;
+};
+_Unwind_Reason_Code PasoPilaDiagMemoria(struct _Unwind_Context* contexto, void* dato) {
+  PilaDiagMemoria* p = static_cast<PilaDiagMemoria*>(dato);
+  const uintptr_t ip = _Unwind_GetIP(contexto);
+  if (p->saltar > 0) {
+    --p->saltar;
+    return _URC_NO_REASON;
+  }
+  if (p->n >= 4) {
+    return _URC_END_OF_STACK;
+  }
+  p->salida[p->n++] = ip >= g_diag_memoria_base ? ip - g_diag_memoria_base : ip;
+  return _URC_NO_REASON;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL ReservarMemoriaDiag(VkDevice dispositivo, const VkMemoryAllocateInfo* info,
+                                                    const VkAllocationCallbacks* asignador, VkDeviceMemory* memoria) {
+  const VkResult r = g_diag_memoria_reservar(dispositivo, info, asignador, memoria);
+  if (r != VK_SUCCESS || !memoria || *memoria == VK_NULL_HANDLE) {
+    return r;
+  }
+  OrigenMemoria origen;
+  PilaDiagMemoria pila{origen.pila, 0, 1};  // skips this function
+  _Unwind_Backtrace(&PasoPilaDiagMemoria, &pila);
+  std::lock_guard<std::mutex> lock(g_diag_memoria_mutex);
+  g_diag_memoria_vivas[*memoria] = {info->allocationSize, origen};
+  UsoOrigenMemoria& u = g_diag_memoria_por_origen[origen];
+  u.bytes += info->allocationSize;
+  u.pico = std::max(u.pico, u.bytes);
+  u.tipo = info->memoryTypeIndex;
+  ++u.reservas;
+  g_diag_memoria_total += info->allocationSize;
+  g_diag_memoria_pico = std::max(g_diag_memoria_pico, g_diag_memoria_total);
+  return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL LiberarMemoriaDiag(VkDevice dispositivo, VkDeviceMemory memoria,
+                                               const VkAllocationCallbacks* asignador) {
+  if (memoria != VK_NULL_HANDLE) {
+    std::lock_guard<std::mutex> lock(g_diag_memoria_mutex);
+    const auto it = g_diag_memoria_vivas.find(memoria);
+    if (it != g_diag_memoria_vivas.end()) {
+      UsoOrigenMemoria& u = g_diag_memoria_por_origen[it->second.second];
+      u.bytes -= std::min(u.bytes, it->second.first);
+      g_diag_memoria_total -= std::min(g_diag_memoria_total, it->second.first);
+      g_diag_memoria_vivas.erase(it);
+    }
+  }
+  g_diag_memoria_liberar(dispositivo, memoria, asignador);
+}
+
+void InstalarDiagMemoria(const VulkanDevice* dispositivo) {
+  if (g_diag_memoria_reservar) {
+    return;
+  }
+  auto& dfn = const_cast<VulkanDevice::Functions&>(dispositivo->functions());
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void*>(&InstalarDiagMemoria), &info) && info.dli_fbase) {
+    g_diag_memoria_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  }
+  g_diag_memoria_reservar = dfn.vkAllocateMemory;
+  g_diag_memoria_liberar = dfn.vkFreeMemory;
+  dfn.vkAllocateMemory = &ReservarMemoriaDiag;
+  dfn.vkFreeMemory = &LiberarMemoriaDiag;
+  REXLOG_INFO("[nativo] C3 diag memoria: vkAllocateMemory/vkFreeMemory interceptados (base de la .so {:#x})",
+              g_diag_memoria_base);
+}
+
+void InformarDiagMemoria() {
+  if (!g_diag_memoria_reservar) {
+    return;
+  }
+  std::vector<std::pair<OrigenMemoria, UsoOrigenMemoria>> lista;
+  uint64_t total = 0, pico = 0, vivas = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_diag_memoria_mutex);
+    lista.assign(g_diag_memoria_por_origen.begin(), g_diag_memoria_por_origen.end());
+    total = g_diag_memoria_total;
+    pico = g_diag_memoria_pico;
+    vivas = g_diag_memoria_vivas.size();
+  }
+  std::sort(lista.begin(), lista.end(), [](const auto& a, const auto& b) { return a.second.bytes > b.second.bytes; });
+  REXLOG_INFO("[nativo] C3 diag memoria: {} MB vivos en {} reservas (pico {} MB); por origen:", total >> 20, vivas,
+              pico >> 20);
+  for (size_t i = 0; i < lista.size() && i < 14; ++i) {
+    const auto& o = lista[i].first;
+    const auto& u = lista[i].second;
+    REXLOG_INFO("[nativo] C3 diag memoria:   {:6.1f} MB (pico {:6.1f}) en {} reservas, tipo {}; pila {:#x} {:#x} {:#x} {:#x}",
+                double(u.bytes) / 1048576.0, double(u.pico) / 1048576.0, u.reservas, u.tipo, o.pila[0], o.pila[1],
+                o.pila[2], o.pila[3]);
+  }
+}
+#else
+void InstalarDiagMemoria(const VulkanDevice*) {}
+void InformarDiagMemoria() {}
+#endif
+
+// nfsmw_nativo_mali_bc1_16bits. Decided once in Inicializar (sizes are computed in several places).
+bool g_bc1_16bits = false;
+
 bool EsFormatoBc(VkFormat formato) {
   return formato == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || formato == VK_FORMAT_BC2_UNORM_BLOCK ||
          formato == VK_FORMAT_BC3_UNORM_BLOCK || formato == VK_FORMAT_BC4_UNORM_BLOCK ||
@@ -2153,12 +2329,17 @@ VkFormat FormatoBcDecodificado(VkFormat formato) {
       return VK_FORMAT_R8_UNORM;
     case VK_FORMAT_BC5_UNORM_BLOCK:
       return VK_FORMAT_R8G8_UNORM;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+      return g_bc1_16bits ? VK_FORMAT_A1R5G5B5_UNORM_PACK16 : VK_FORMAT_R8G8B8A8_UNORM;
     default:
       return VK_FORMAT_R8G8B8A8_UNORM;
   }
 }
 
 uint32_t BytesTexelBcDecodificado(VkFormat formato) {
+  if (formato == VK_FORMAT_BC1_RGBA_UNORM_BLOCK && g_bc1_16bits) {
+    return 2;
+  }
   return formato == VK_FORMAT_BC4_UNORM_BLOCK ? 1 : formato == VK_FORMAT_BC5_UNORM_BLOCK ? 2 : 4;
 }
 
@@ -2283,6 +2464,13 @@ void DecodificarBc(VkFormat formato, uint32_t ancho, uint32_t alto, uint32_t reb
               uint8_t* t = texels + (size_t(ty) * w + tx) * bpp;
               if (bpp == 4) {
                 std::memcpy(t, rgba[i], 4);
+              } else if (formato == VK_FORMAT_BC1_RGBA_UNORM_BLOCK) {
+                // A1R5G5B5: A bit 15, R 14-10, G 9-5, B 4-0 (little endian).
+                const uint32_t r5 = (uint32_t(rgba[i][0]) * 31 + 127) / 255;
+                const uint32_t g5 = (uint32_t(rgba[i][1]) * 31 + 127) / 255;
+                const uint32_t b5 = (uint32_t(rgba[i][2]) * 31 + 127) / 255;
+                const uint16_t v = uint16_t((rgba[i][3] >= 128 ? 0x8000u : 0u) | (r5 << 10) | (g5 << 5) | b5);
+                std::memcpy(t, &v, 2);
               } else if (bpp == 1) {
                 t[0] = canal0[i];
               } else {
@@ -2451,11 +2639,28 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     const auto& propiedades = dispositivo_->properties();
     modo_mali_ = DecidirModoMali(propiedades);
     if (modo_mali_) {
+      tamano_subida_ = VkDeviceSize(REXCVAR_GET(nfsmw_nativo_mali_subida_mb)) << 20;
+    }
+    if (modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_diag_memoria)) {
+      InstalarDiagMemoria(dispositivo_);
+    }
+    if (modo_mali_) {
       LanzarVigilanteSonda();
       VkFormatProperties bc1{};
       dispositivo_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
           dispositivo_->physical_device(), VK_FORMAT_BC1_RGBA_UNORM_BLOCK, &bc1);
       bc_en_cpu_ = !(bc1.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
+      VkFormatProperties a1r5g5b5{};
+      dispositivo_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+          dispositivo_->physical_device(), VK_FORMAT_A1R5G5B5_UNORM_PACK16, &a1r5g5b5);
+      constexpr VkFormatFeatureFlags kNecesarias = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                                   VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+      g_bc1_16bits = bc_en_cpu_ && REXCVAR_GET(nfsmw_nativo_mali_bc1_16bits) &&
+                     (a1r5g5b5.optimalTilingFeatures & kNecesarias) == kNecesarias;
+      if (bc_en_cpu_) {
+        REXLOG_INFO("[nativo] C3 modo Mali: BC1 descomprimida a {}", g_bc1_16bits ? "A1R5G5B5 (2 bytes)" : "RGBA8");
+      }
       REXLOG_INFO("[nativo] C3 modo Mali: texturas BC (DXT) {}", bc_en_cpu_ ? "NO soportadas: se descomprimen en la CPU"
                                                                              : "soportadas por la GPU");
     }
@@ -2513,6 +2718,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     {
       MarcaSonda sonda(modo_mali_, "pool_texturas_.Iniciar", -1, -1);
       pool_texturas_.Iniciar(dispositivo_, texturas_mb_max_);
+      pool_texturas_.ActivarLiberarVacios(modo_mali_);  // phones: give empty slabs back (RAM pressure)
     }
     PasoSonda("pool de texturas iniciado");
     MarcaSonda sonda(modo_mali_, "CrearVacias", -1, -1);
@@ -2811,7 +3017,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (destino_sombras) {
       // Step 2 of the 30 FPS guard. Removing the whole pass does not flicker; skipping it on 2 of every
       // 3 frames does, which is why that step no longer exists.
-      bool omitir = nfsmw::guardia30::SinSombras(REXCVAR_GET(nfsmw_nativo_omitir_sombras));
+      bool omitir = nfsmw::guardia30::SinSombras(REXCVAR_GET(nfsmw_nativo_omitir_sombras) ||
+                                                 (modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_sin_sombras)));
       const int32_t alternar = REXCVAR_GET(nfsmw_nativo_omitir_sombras_alternar_s);
       if (!omitir && alternar > 0) {
         const auto segundos = std::chrono::duration_cast<std::chrono::seconds>(
@@ -3065,6 +3272,16 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       contexto_->LecturasDeProfundidadMuertas(true);
     }
     bool lee_reflejo = false;  // nfsmw_reflejo_visibilidad
+    // nfsmw_nativo_desglose_por_fence: what each measured pass draws (PS and biggest texture sampled).
+    if (desglose_fotograma_ && ps && ps->shader) {
+      huella_ps_pase_ = huella_ps_pase_ * 31 + ps->shader->huella;
+    }
+    const auto anotar_textura = [&](uint32_t ancho_t, uint32_t alto_t) {
+      if (desglose_fotograma_ && uint64_t(ancho_t) * alto_t > uint64_t(tex_ancho_pase_) * tex_alto_pase_) {
+        tex_ancho_pase_ = ancho_t;
+        tex_alto_pase_ = alto_t;
+      }
+    };
     for (const SamplerShader& sampler :
          ps ? std::span<const SamplerShader>(ps->samplers) : std::span<const SamplerShader>()) {
       if (sampler.registro >= 16) {
@@ -3089,6 +3306,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         compartidas[cache.monton * 16 + sampler.registro] = cache.ranura;
         compartidas[48 + sampler.registro] = cache.sampler;
         EscribirInvTamano(compartidas, sampler.registro, cache.ancho, cache.alto);
+        anotar_textura(cache.ancho, cache.alto);
         ++samplers_cache_;
         continue;
       }
@@ -3146,6 +3364,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       compartidas[monton * 16 + sampler.registro] = ranura_textura;
       compartidas[48 + sampler.registro] = ranura_sampler;
       EscribirInvTamano(compartidas, sampler.registro, ancho_host, alto_host);
+      anotar_textura(ancho_host, alto_host);
       cache.fotograma = fotograma_;
       cache.generacion = generacion_texturas_;
       std::memcpy(cache.fetch.data(), fetch, sizeof(cache.fetch));
@@ -3222,13 +3441,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                                     (usar_ubo_ ? kUboBytesVs + kUboBytesPs + kUboBytesCompartidas +
                                                      3 * alineacion_ubo_
                                                : 0);
-    if (necesarios > kTamanoSubida) {
+    if (necesarios > tamano_subida_) {
       return Rechazar(13, "dibujo mayor que el bufer de subida");
     }
     const bool compartidas_llenas =
         compartidas_aparte_ && usar_ubo_ &&
         compartidas_usado_ + kUboBytesCompartidas + alineacion_ubo_ > kTamanoCompartidas;
-    if (subida_usado_ + necesarios > kTamanoSubida || compartidas_llenas) {
+    if (subida_usado_ + necesarios > tamano_subida_ || compartidas_llenas) {
       const auto antes_envio = std::chrono::steady_clock::now();
       const bool enviado = contexto_->EnviarYEsperar();
       ++envios_llenos_;
@@ -3648,7 +3867,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       const uint32_t categoria = CategoriaDeDestino(pitch, claves);
       static constexpr uint32_t kCategoriaDe[5] = {0, kGpuSombras, kGpuEscena, kGpu320,
                                                    kGpuEscenaSinProfundidad};
-      if (categoria_tijera <= 4 && categoria == kCategoriaDe[categoria_tijera]) {
+      if (categoria_tijera <= 4 && (categoria == kCategoriaDe[categoria_tijera] ||
+                                    (categoria_tijera == 3 && categoria == kGpu320SinProfundidad))) {
         tijera_final.extent = {1, 1};
       }
     }
@@ -4305,7 +4525,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       const bool bien = primero * zancada == offset &&
                         (desplazamiento + int64_t(vmin)) * int64_t(zancada) == int64_t(offset) &&
                         desplazamiento >= int64_t(INT32_MIN) && desplazamiento <= int64_t(INT32_MAX) &&
-                        offset + bytes <= kTamanoSubida && offset + bytes <= subida_tamano_real_;
+                        offset + bytes <= tamano_subida_ && offset + bytes <= subida_tamano_real_;
       if (!bien) {
         vertices_base_cero_apagado_ = true;
         vertices_base_cero_ = false;
@@ -5121,9 +5341,102 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         contexto_->EnviarYEsperar();
       }
       if (contexto_ && REXCVAR_GET(nfsmw_nativo_desglose_por_fence)) {
-        contexto_->EnviarYMedir(categoria_cerrada);
+        const uint64_t ns = contexto_->EnviarYMedir(categoria_cerrada);
+        AnotarPaseMedido(categoria_cerrada, ns, pase_ancho_, pase_alto_);
       }
+      huella_ps_pase_ = 0;
+      tex_ancho_pase_ = tex_alto_pase_ = 0;
     }
+  }
+
+  // ancho/alto: the pass (for kGpuCopias, the pass that comes after the measured gap).
+  void AnotarPaseMedido(uint32_t categoria, uint64_t ns, uint32_t ancho_p, uint32_t alto_p) {
+    if (dibujos_en_pase_ > 8) {
+      huella_ps_pase_ = 0;  // big passes (scene, cubemap): one entry per destination, not per PS mix
+    }
+    const uint64_t clave = XXH3_64bits_withSeed(&huella_ps_pase_, sizeof(huella_ps_pase_),
+                                                (uint64_t(categoria) << 48) ^ (uint64_t(ancho_p) << 32) ^
+                                                    (uint64_t(alto_p) << 16) ^ tex_ancho_pase_ ^
+                                                    (uint64_t(tex_alto_pase_) << 24));
+    PaseMedido& p = pases_medidos_[clave];
+    for (uint32_t i = 0; i < kTrCampos; ++i) {
+      p.tr[i] += g_diag_transferencias[i] - tr_vistas_[i];
+      tr_vistas_[i] = g_diag_transferencias[i];
+    }
+    p.categoria = categoria;
+    p.ancho = ancho_p;
+    p.alto = alto_p;
+    p.tex_ancho = tex_ancho_pase_;
+    p.tex_alto = tex_alto_pase_;
+    p.huella = huella_ps_pase_;
+    p.dibujos += dibujos_en_pase_;
+    ++p.veces;
+    p.ns += ns;
+    const uint64_t swaps = SwapsNativos();
+    if (fotograma_informe_pases_ == 0) {
+      fotograma_informe_pases_ = swaps;
+    }
+    const uint64_t fotogramas = swaps - fotograma_informe_pases_;
+    if (fotogramas < 200) {
+      return;
+    }
+    std::vector<PaseMedido> lista;
+    lista.reserve(pases_medidos_.size());
+    for (const auto& [k, v] : pases_medidos_) {
+      lista.push_back(v);
+    }
+    std::sort(lista.begin(), lista.end(), [](const PaseMedido& a, const PaseMedido& b) { return a.ns > b.ns; });
+    REXLOG_INFO("[nativo] C2 pases medidos ({} Swaps, los 16 mas caros, ms por Swap; cat 6 = lo grabado entre "
+                "pases, con el destino del pase siguiente):", fotogramas);
+    for (size_t i = 0; i < lista.size() && i < 16; ++i) {
+      const PaseMedido& p = lista[i];
+      REXLOG_INFO("[nativo]   cat {} {:.2f} ms ({:.2f} ms x {:.2f} por fotograma) destino {}x{} ps {:016X} "
+                  "textura mayor {}x{} dibujos por pase {:.1f}",
+                  p.categoria, double(p.ns) / 1e6 / double(fotogramas), double(p.ns) / 1e6 / double(p.veces),
+                  double(p.veces) / double(fotogramas), p.ancho, p.alto, p.huella, p.tex_ancho, p.tex_alto,
+                  double(p.dibujos) / double(p.veces));
+      const double v = double(p.veces);
+      REXLOG_INFO("[nativo]       por vez: copias {:.1f} ({:.0f} k texels), blits {:.1f} ({:.0f} k), borrados de "
+                  "profundidad {:.1f}, de color {:.1f} ({:.0f} k texels), barreras {:.1f}, subidas {:.1f}",
+                  p.tr[kTrCopias] / v, p.tr[kTrTexCopia] / v / 1e3, p.tr[kTrBlits] / v, p.tr[kTrTexBlit] / v / 1e3,
+                  p.tr[kTrBorradosProf] / v, p.tr[kTrBorradosColor] / v, p.tr[kTrTexColor] / v / 1e3,
+                  p.tr[kTrBarreras] / v, p.tr[kTrSubidas] / v);
+    }
+    pases_medidos_.clear();
+    fotograma_informe_pases_ = swaps;
+  }
+
+  void ElegirSinBurbuja() {
+    const int32_t modo = modo_mali_ ? REXCVAR_GET(nfsmw_nativo_mali_sin_burbuja) : 0;
+    if (modo != 2) {
+      sin_burbuja_fotograma_ = modo == 1;
+      return;
+    }
+    const auto ahora = std::chrono::steady_clock::now();
+    const uint64_t swaps = SwapsNativos();
+    if (ab_burbuja_inicio_ == std::chrono::steady_clock::time_point{}) {
+      ab_burbuja_inicio_ = ahora;
+      ab_burbuja_swaps_ = swaps;
+      return;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(ahora - ab_burbuja_inicio_).count();
+    if (ms < 10000) {
+      return;
+    }
+    const uint32_t i = sin_burbuja_fotograma_ ? 1 : 0;
+    const uint64_t d = swaps - ab_burbuja_swaps_;
+    ab_burbuja_tramos_[i][0] += d;
+    ab_burbuja_tramos_[i][1] += uint64_t(ms);
+    const auto fps = [&](uint32_t k) {
+      return ab_burbuja_tramos_[k][1] ? double(ab_burbuja_tramos_[k][0]) * 1000.0 / double(ab_burbuja_tramos_[k][1])
+                                      : 0.0;
+    };
+    REXLOG_INFO("[nativo] C2 A/B burbuja: tramo {} {:.2f} fps; acumulado con burbuja {:.2f} fps, sin burbuja {:.2f} "
+                "fps", sin_burbuja_fotograma_ ? "SIN burbuja" : "CON burbuja", double(d) * 1000.0 / double(ms),
+                fps(0), fps(1));
+    sin_burbuja_fotograma_ = !sin_burbuja_fotograma_;
+    ab_burbuja_inicio_ = ahora;
+    ab_burbuja_swaps_ = swaps;
   }
 
   bool ModoMali() const override { return modo_mali_; }
@@ -5169,6 +5482,25 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     ranura_actual_ = uint32_t(ranura % subidas_.size());  // this slot's UBO set
     if (modo_mali_) {
       ReciclarSetsMali(ranura_actual_);
+    }
+    subida_pico_ = std::max(subida_pico_, subida_usado_);  // C3 diag memoria
+    if (modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_diag_memoria)) {
+      // Per filled upload buffer: up to 8, 16, 24, 32, 48 and 64 MB.
+      static constexpr VkDeviceSize kCortes[6] = {8ull << 20, 16ull << 20, 24ull << 20, 32ull << 20, 48ull << 20,
+                                                  64ull << 20};
+      uint32_t i = 0;
+      while (i < 5 && subida_usado_ > kCortes[i]) ++i;
+      ++subida_histograma_[i];
+      const auto ahora = std::chrono::steady_clock::now();
+      if (ahora - subida_informe_ >= std::chrono::seconds(10)) {
+        REXLOG_INFO("[nativo] C3 diag memoria: bufer de subida en 10 s: <=8 MB {}, <=16 {}, <=24 {}, <=32 {}, <=48 {}, "
+                    "<=64 {}; el mayor {:.1f} MB; envios por bufer lleno {}",
+                    subida_histograma_[0], subida_histograma_[1], subida_histograma_[2], subida_histograma_[3],
+                    subida_histograma_[4], subida_histograma_[5], double(subida_pico_) / 1048576.0, envios_llenos_);
+        subida_histograma_ = {};
+        subida_pico_ = 0;
+        subida_informe_ = ahora;
+      }
     }
     subida_usado_ = 0;
     if (compartidas_aparte_) {
@@ -5242,6 +5574,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     tijera_prueba_ = TijeraDePrueba();
     sin_desenfoque_fotograma_ = REXCVAR_GET(nfsmw_nativo_sin_desenfoque);  // once per frame
+    desglose_fotograma_ = REXCVAR_GET(nfsmw_nativo_desglose_por_fence);
+    ElegirSinBurbuja();
     // The cheap PCF bit also changes the pipeline: once per frame.
     {
       bool nuevo = REXCVAR_GET(nfsmw_nativo_pcf_barato);
@@ -5516,6 +5850,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (pool_texturas_.Activo()) {
       REXLOG_INFO("[nativo] C3 {}", pool_texturas_.Resumen());
     }
+    InformarDiagMemoria();
+    if (modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_diag_memoria)) {
+      REXLOG_INFO("[nativo] C3 diag memoria: bufer de subida, el que mas se lleno desde el informe anterior: {:.1f} MB "
+                  "de {} MB ({} envios por bufer lleno en total)",
+                  double(subida_pico_) / 1048576.0, tamano_subida_ >> 20, envios_llenos_);
+      subida_pico_ = 0;
+    }
   }
 
   /*
@@ -5718,6 +6059,39 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     dfn_.vkCmdBeginRenderPass(comandos, &inicio, VK_SUBPASS_CONTENTS_INLINE);
     dfn_.vkCmdEndRenderPass(comandos);
     ++borrados_profundidad_en_pase_;
+    return true;
+  }
+
+  bool BorrarEnPase(VkCommandBuffer comandos, const ImagenNativa& imagen, const VkClearValue& valor,
+                    bool profundidad, const VkRect2D& area) override {
+    if (comandos == VK_NULL_HANDLE || imagen.vista == VK_NULL_HANDLE || !area.extent.width || !area.extent.height ||
+        area.offset.x < 0 || area.offset.y < 0 || uint32_t(area.offset.x) + area.extent.width > imagen.ancho ||
+        uint32_t(area.offset.y) + area.extent.height > imagen.alto) {
+      return false;
+    }
+    TerminarPase();  // a pass cannot be opened inside another
+    const uint32_t i = profundidad ? 4 : 0;
+    uint32_t formatos[5] = {};
+    formatos[i] = uint32_t(imagen.formato);
+    const VkRenderPass pase = PaseDe(formatos, kCargaBorrar);
+    if (pase == VK_NULL_HANDLE) {
+      return false;
+    }
+    std::array<VkImageView, 5> vistas{};
+    vistas[i] = imagen.vista;
+    const VkFramebuffer framebuffer = FramebufferDe(pase, vistas, imagen.ancho, imagen.alto);
+    if (framebuffer == VK_NULL_HANDLE) {
+      return false;
+    }
+    VkRenderPassBeginInfo inicio{};
+    inicio.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    inicio.renderPass = pase;
+    inicio.framebuffer = framebuffer;
+    inicio.renderArea = area;
+    inicio.clearValueCount = 1;
+    inicio.pClearValues = &valor;
+    dfn_.vkCmdBeginRenderPass(comandos, &inicio, VK_SUBPASS_CONTENTS_INLINE);
+    dfn_.vkCmdEndRenderPass(comandos);
     return true;
   }
 
@@ -7872,7 +8246,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
 
   bool Reservar(VkDeviceSize bytes, VkDeviceSize alineacion, VkDeviceSize& offset) {
     const VkDeviceSize inicio = (subida_usado_ + alineacion - 1) & ~(alineacion - 1);
-    if (inicio + bytes > kTamanoSubida) {
+    if (inicio + bytes > tamano_subida_) {
       offset = 0;
       return false;  // cannot happen: Dibujar checks the space first
     }
@@ -7886,7 +8260,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   // power of 2). Dibujar has already asked for space including that extra padding (hueco_base_cero).
   bool ReservarMultiplo(VkDeviceSize bytes, VkDeviceSize multiplo, VkDeviceSize& offset) {
     const VkDeviceSize inicio = (subida_usado_ + multiplo - 1) / multiplo * multiplo;
-    if (inicio + bytes > kTamanoSubida) {
+    if (inicio + bytes > tamano_subida_) {
       offset = 0;
       return false;  // cannot happen: Dibujar checks the space first
     }
@@ -8209,7 +8583,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   bool CrearBuferSubida() {
     VkBufferCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    info.size = kTamanoSubida;
+    info.size = tamano_subida_;
     // UNIFORM_BUFFER because it is also bound as a dynamic UBO (constants through UBOs, set 4).
     // En modo Mali no se pide SHADER_DEVICE_ADDRESS (la feature bufferDeviceAddress no esta habilitada y
     // crear el buffer con ese flag seria un error de validacion): las constantes van siempre por UBO.
@@ -8411,6 +8785,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     mipmaps_ = REXCVAR_GET(nfsmw_nativo_mipmaps);
     REXLOG_INFO("[nativo] C3: niveles de mip de las texturas (nfsmw_nativo_mipmaps) = {}", mipmaps_ ? "SI" : "no");
     texturas_mb_max_ = REXCVAR_GET(nfsmw_nativo_texturas_mb_max);
+    if (modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_texturas_mb_max) > 0 &&
+        (texturas_mb_max_ <= 0 || texturas_mb_max_ > REXCVAR_GET(nfsmw_nativo_mali_texturas_mb_max))) {
+      texturas_mb_max_ = REXCVAR_GET(nfsmw_nativo_mali_texturas_mb_max);  // RAM pressure on phones
+    }
     prueba_sin_memoria_cada_ = REXCVAR_GET(nfsmw_nativo_prueba_sin_memoria_cada);
     if (prueba_sin_memoria_cada_ > 0) {
       REXLOG_WARN("[nativo] C3: PRUEBA activa: se fingira falta de memoria cada {} reservas de textura",
@@ -10384,6 +10762,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       copia.imageExtent = {std::max(textura.imagen.ancho >> n, 1u), std::max(textura.imagen.alto >> n, 1u),
                            textura.fondo ? textura.fondo : 1};
     }
+    ++g_diag_transferencias[kTrSubidas];
     dfn_.vkCmdCopyBufferToImage(subida, subida_, textura.imagen.imagen, VK_IMAGE_LAYOUT_GENERAL,
                                 textura.niveles, copias.data());
   }
@@ -10729,7 +11108,21 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     contexto_->MarcarGpu(categoria_pase_);
     const bool sombras_sin_load =
         es_sombras && REXCVAR_GET(nfsmw_nativo_pase_sombras_sin_load);
-    const VkRenderPass pase = PaseDe(formatos, sombras_sin_load ? kCargaIgnorar : kCargaLeer);
+    // Only the rectangle the game uses (see nfsmw_nativo_pase_area_util).
+    uint32_t alto_pase = alto;
+    if (area_util_) {
+      const auto it = alto_util_.find(pitch);
+      if (it != alto_util_.end() && it->second < alto) {
+        alto_pase = it->second;
+      }
+    }
+    // nfsmw_nativo_mali_borrado_en_pase: the clears C2 deferred for these attachments open with the pass.
+    VkClearValue valores_borrar[5] = {};
+    uint32_t alto_abrir = alto_pase;
+    const uint32_t mascara_borrar =
+        modo_mali_ ? contexto_->TomarBorradosDePase(imagenes.data(), ancho, alto_pase, alto_abrir, valores_borrar) : 0;
+    const VkRenderPass pase =
+        PaseDe(formatos, sombras_sin_load ? kCargaIgnorar : kCargaLeer, mascara_borrar);
     if (pase == VK_NULL_HANDLE) {
       return Rechazar(42, "no se pudo crear el render pass");
     }
@@ -10743,6 +11136,21 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     const auto antes_abrir = cronometrar_ ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
+    // nfsmw_nativo_desglose_por_fence: what was recorded since the last pass (copies, resolves, clears,
+    // uploads) is measured apart, so it does not land on this pass.
+    if (desglose_fotograma_) {
+      const uint64_t ns_entre = contexto_->EnviarYMedir(kGpuCopias);
+      const uint64_t h = huella_ps_pase_;
+      const uint32_t ta = tex_ancho_pase_, tl = tex_alto_pase_, d = dibujos_en_pase_;
+      huella_ps_pase_ = 0;
+      tex_ancho_pase_ = tex_alto_pase_ = 0;
+      dibujos_en_pase_ = 0;
+      AnotarPaseMedido(kGpuCopias, ns_entre, ancho, alto);
+      huella_ps_pase_ = h;
+      tex_ancho_pase_ = ta;
+      tex_alto_pase_ = tl;
+      dibujos_en_pase_ = d;
+    }
     const VkCommandBuffer cmd = contexto_->ComandosTrabajo();
     if (!cmd) {
       return false;
@@ -10751,15 +11159,19 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     inicio.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     inicio.renderPass = pase;
     inicio.framebuffer = framebuffer;
-    // Only the rectangle the game uses (see nfsmw_nativo_pase_area_util).
-    uint32_t alto_pase = alto;
-    if (area_util_) {
-      const auto it = alto_util_.find(pitch);
-      if (it != alto_util_.end() && it->second < alto) {
-        alto_pase = it->second;
+    inicio.renderArea.extent = {ancho, alto_abrir};
+    // The clear values, in attachment order (CrearPase skips the empty slots).
+    std::array<VkClearValue, 5> valores_compactos{};
+    if (mascara_borrar) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < 5; ++i) {
+        if (formatos[i]) {
+          valores_compactos[n++] = valores_borrar[i];
+        }
       }
+      inicio.clearValueCount = n;
+      inicio.pClearValues = valores_compactos.data();
     }
-    inicio.renderArea.extent = {ancho, alto_pase};
     // nfsmw_nativo_diag_borrados. What this pass loads and stores of each render target, to compare with
     // what is cleared of it (C2 clears per target). Before opening the pass.
     for (const ImagenNativa* imagen : imagenes) {
@@ -10820,15 +11232,18 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   // TRANSFER_DST, the only ones eligible for a ZCULL plane.
   enum : uint32_t { kCargaLeer = 0, kCargaIgnorar = 1, kCargaBorrar = 2 };
 
-  VkRenderPass PaseDe(const uint32_t formatos[5], uint32_t modo_carga = kCargaLeer) {
+  // mascara_borrar (nfsmw_nativo_mali_borrado_en_pase): attachments (0-3 color, 4 depth) that open with
+  // loadOp = CLEAR whatever modo_carga says.
+  VkRenderPass PaseDe(const uint32_t formatos[5], uint32_t modo_carga = kCargaLeer, uint32_t mascara_borrar = 0) {
     // The mode is part of the key: two render passes with the same formats but a different loadOp are
     // different.
-    const uint64_t clave =
-        XXH3_64bits_withSeed(formatos, sizeof(uint32_t) * 5, modo_carga);
+    const uint64_t clave = XXH3_64bits_withSeed(formatos, sizeof(uint32_t) * 5,
+                                                modo_carga | (sin_burbuja_fotograma_ ? 0x100u : 0u) |
+                                                    (mascara_borrar << 9));
     if (const auto it = pases_.find(clave); it != pases_.end()) {
       return it->second;
     }
-    const VkRenderPass pase = CrearPase(formatos, modo_carga);  // the usual code, factored out
+    const VkRenderPass pase = CrearPase(formatos, modo_carga, mascara_borrar);  // the usual code, factored out
     if (pase == VK_NULL_HANDLE) {
       return VK_NULL_HANDLE;
     }
@@ -10964,7 +11379,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
 
   // The PaseDe render pass without its cache, with nothing changed. The pipeline prewarm also uses it
   // from its thread (a compatible one: the same formats). It only reads its arguments.
-  VkRenderPass CrearPase(const uint32_t formatos[5], uint32_t modo_carga) const {
+  VkRenderPass CrearPase(const uint32_t formatos[5], uint32_t modo_carga, uint32_t mascara_borrar = 0) const {
     std::array<VkAttachmentDescription, 5> adjuntos{};
     std::array<VkAttachmentReference, 4> colores{};
     VkAttachmentReference profundidad{};
@@ -10978,13 +11393,14 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       a.samples = VK_SAMPLE_COUNT_1_BIT;
       // With the test active, the shadow map does not load its previous content: the game clears it before
       // drawing it, so fetching the 1600x1600 tile only to throw it away is wasted work.
-      a.loadOp = modo_carga == kCargaIgnorar ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
-                 : modo_carga == kCargaBorrar ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                              : VK_ATTACHMENT_LOAD_OP_LOAD;
+      const bool borrar = modo_carga == kCargaBorrar || (mascara_borrar & (1u << i));
+      a.loadOp = borrar                        ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                 : modo_carga == kCargaIgnorar ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                               : VK_ATTACHMENT_LOAD_OP_LOAD;
       a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-      a.stencilLoadOp = i != 4                       ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
-                        : modo_carga == kCargaBorrar ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                                     : VK_ATTACHMENT_LOAD_OP_LOAD;
+      a.stencilLoadOp = i != 4 ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                        : borrar ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                 : VK_ATTACHMENT_LOAD_OP_LOAD;
       a.stencilStoreOp = i == 4 ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
       a.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
       a.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -11008,7 +11424,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     info.pSubpasses = &subpase;
     VkSubpassDependency dependencias[2]{};
     if (REXCVAR_GET(nfsmw_nativo_sincronizacion_gpu)) {
-      DependenciasImagenes(dependencias);
+      DependenciasImagenes(dependencias, sin_burbuja_fotograma_);  // Mali: no fragment -> vertex bubble
       info.dependencyCount = 2;
       info.pDependencies = dependencias;
     }
@@ -12810,6 +13226,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   uint8_t* subida_datos_ = nullptr;
   VkDeviceAddress subida_direccion_ = 0;
   VkDeviceSize subida_usado_ = 0;
+  VkDeviceSize tamano_subida_ = kTamanoSubida;  // nfsmw_nativo_mali_subida_mb in Mali mode
+  VkDeviceSize subida_pico_ = 0;  // nfsmw_nativo_mali_diag_memoria
+  std::array<uint32_t, 6> subida_histograma_{};
+  std::chrono::steady_clock::time_point subida_informe_{};
   bool subida_coherente_ = false;
   uint64_t epoca_subida_ = 0;
   uint64_t fotograma_ = 0;
@@ -13617,6 +14037,24 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   bool pcf_barato_ = false;                    // a single shadow map sample
   bool pase_coches_sombra_ = false;            // nfsmw_nativo_sombra_minimo, car pass
   bool sin_desenfoque_fotograma_ = true;       // nfsmw_nativo_sin_desenfoque, per frame
+  // nfsmw_nativo_desglose_por_fence, per frame: each measured pass by (category, PS, size), to know which
+  // passes cost. Reported every 300 frames, the most expensive first.
+  bool desglose_fotograma_ = false;
+  // nfsmw_nativo_mali_sin_burbuja, per frame (Mali mode only), and its A/B (mode 2).
+  bool sin_burbuja_fotograma_ = false;
+  std::chrono::steady_clock::time_point ab_burbuja_inicio_{};
+  uint64_t ab_burbuja_swaps_ = 0;
+  uint64_t ab_burbuja_tramos_[2][2] = {};  // [sin burbuja][swaps, ms]
+  uint64_t huella_ps_pase_ = 0;
+  uint32_t tex_ancho_pase_ = 0, tex_alto_pase_ = 0;
+  struct PaseMedido {
+    uint32_t categoria = 0, ancho = 0, alto = 0, tex_ancho = 0, tex_alto = 0, dibujos = 0;
+    uint64_t huella = 0, veces = 0, ns = 0;
+    uint64_t tr[kTrCampos] = {};  // g_diag_transferencias recorded in that stretch
+  };
+  uint64_t tr_vistas_[kTrCampos] = {};
+  std::unordered_map<uint64_t, PaseMedido> pases_medidos_;
+  uint64_t fotograma_informe_pases_ = 0;
   bool mip_puntual_prueba_ = false;            // Test: trilinear -> bilinear (measurement only)
   // Deduplication of vertex uploads within the frame.
   DedupeVertices dedupe_;

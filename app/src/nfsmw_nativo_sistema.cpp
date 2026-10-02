@@ -3966,11 +3966,43 @@ class SistemaGraficoNativo final : public rex::system::IGraphicsSystem {
                  double(presentados_intervalo);
         };
         NFSMW_INFORME_SEGUN(diferir_informe, "[nativo] C2: GPU por Swap: sombras {:.2f} ms, escena {:.2f}, reflejo {:.2f}, "
-                    "320 (cubo y desenfoque) {:.2f}, menores {:.2f}, copias {:.2f}, borrados {:.2f}, "
-                    "resto {:.2f}, escena sin profundidad {:.2f}, hueco entre trabajos {:.2f}",
+                    "320 con profundidad (cubo) {:.2f}, menores {:.2f}, copias {:.2f}, borrados {:.2f}, "
+                    "resto {:.2f}, escena sin profundidad {:.2f}, hueco entre trabajos {:.2f}, "
+                    "320 sin profundidad (desenfoque) {:.2f}",
                     ms(kGpuSombras), ms(kGpuEscena), ms(kGpuReflejo), ms(kGpu320),
                     ms(kGpuMenores), ms(kGpuCopias), ms(kGpuBorrados), ms(kGpuOtros),
-                    ms(kGpuEscenaSinProfundidad), ms(kGpuHuecoEntreTrabajos));
+                    ms(kGpuEscenaSinProfundidad), ms(kGpuHuecoEntreTrabajos), ms(kGpu320SinProfundidad));
+      }
+      {
+        // nfsmw_nativo_desglose_por_fence: the same breakdown without the fixed cost of each submit+wait
+        // (measured with empty submissions). Without the fence breakdown there are no submissions here.
+        std::array<uint64_t, kGpuCategorias> envios{};
+        uint64_t vacios = 0, ns_vacios = 0;
+        destinos_->CalibracionDesglose(envios, vacios, ns_vacios);
+        const uint64_t d_vacios = vacios - vacios_desglose_previos_;
+        if (presentados_intervalo && d_vacios) {
+          const double vacio_ms = double(ns_vacios - ns_vacios_desglose_previos_) / 1e6 / double(d_vacios);
+          const auto neto = [&](uint32_t c) {
+            const double crudo = double(categorias[c] - gpu_categorias_previas_[c]) / 1e6;
+            const double n = double(envios[c] - envios_desglose_previos_[c]);
+            return std::max(0.0, crudo - n * vacio_ms) / double(presentados_intervalo);
+          };
+          const auto por_swap = [&](uint32_t c) {
+            return double(envios[c] - envios_desglose_previos_[c]) / double(presentados_intervalo);
+          };
+          NFSMW_INFORME_SEGUN(diferir_informe, "[nativo] C2: desglose neto (envio vacio {:.2f} ms, {:.1f} envios por "
+                      "Swap): sombras {:.2f} ms, escena {:.2f}, reflejo {:.2f}, 320 con profundidad (cubo) {:.2f} "
+                      "({:.1f} envios), menores {:.2f} ({:.1f}), escena sin profundidad {:.2f}, 320 sin profundidad "
+                      "(desenfoque) {:.2f} ({:.1f})",
+                      vacio_ms,
+                      [&] { double t = 0; for (uint32_t c = 0; c < kGpuCategorias; ++c) t += por_swap(c); return t; }(),
+                      neto(kGpuSombras), neto(kGpuEscena), neto(kGpuReflejo), neto(kGpu320), por_swap(kGpu320),
+                      neto(kGpuMenores), por_swap(kGpuMenores), neto(kGpuEscenaSinProfundidad),
+                      neto(kGpu320SinProfundidad), por_swap(kGpu320SinProfundidad));
+        }
+        envios_desglose_previos_ = envios;
+        vacios_desglose_previos_ = vacios;
+        ns_vacios_desglose_previos_ = ns_vacios;
       }
       gpu_categorias_previas_ = categorias;
       // The size of the remaining copies.
@@ -4001,7 +4033,7 @@ class SistemaGraficoNativo final : public rex::system::IGraphicsSystem {
         destinos_->EstadisticasPipeline(frag, vert, prim);
         static constexpr const char* kTiposEstad[] = {"resto",  "sombras", "escena",  "reflejo",
                                                       "cubo",   "menores", "copias",  "borrados",
-                                                      "escena sin profundidad", "hueco"};
+                                                      "escena sin profundidad", "hueco", "320 sin profundidad"};
         std::string linea;
         for (uint32_t c = 0; presentados_intervalo && c < kGpuCategorias; ++c) {
           const uint64_t f = frag[c] - fragmentos_categoria_previos_[c];
@@ -4031,7 +4063,7 @@ class SistemaGraficoNativo final : public rex::system::IGraphicsSystem {
           fotogramas_diagnostico_previos_ = fotogramas;
           static constexpr const char* kTiposPs[] = {"resto",  "sombras", "escena",  "reflejo",
                                                      "cubo",   "menores", "copias",  "borrados",
-                                                     "escena sin profundidad", "hueco"};
+                                                     "escena sin profundidad", "hueco", "320 sin profundidad"};
           const size_t por_categoria = frag_ps.size() / kGpuCategorias;
           for (uint32_t c = 0; c < kGpuCategorias; ++c) {
             uint64_t total = 0;
@@ -4306,7 +4338,7 @@ class SistemaGraficoNativo final : public rex::system::IGraphicsSystem {
         if (presentados_intervalo) {
           static constexpr const char* kTipos[] = {"resto",  "sombras", "escena",  "reflejo",
                                                    "cubo",   "menores", "copias",  "borrados",
-                                                   "escena sin profundidad", "hueco"};
+                                                   "escena sin profundidad", "hueco", "320 sin profundidad"};
           std::string area;
           for (uint32_t c = 0; c < kGpuCategorias; ++c) {
             const uint64_t t = d.texels_por_categoria[c] - texels_categoria_previos_[c];
@@ -4847,6 +4879,9 @@ class SistemaGraficoNativo final : public rex::system::IGraphicsSystem {
   uint64_t gpu_trabajos_previos_ = 0;
   uint64_t presentados_previos_gpu_ = 0;
   std::array<uint64_t, kGpuCategorias> gpu_categorias_previas_{};
+  std::array<uint64_t, kGpuCategorias> envios_desglose_previos_{};
+  uint64_t vacios_desglose_previos_ = 0;
+  uint64_t ns_vacios_desglose_previos_ = 0;
   std::array<uint64_t, kGpuCategorias> fragmentos_categoria_previos_{};
   std::array<uint64_t, kGpuCategorias> vertices_categoria_previos_{};
   std::array<uint64_t, kGpuCategorias> primitivas_categoria_previas_{};

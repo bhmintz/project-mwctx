@@ -66,6 +66,11 @@ const dxc = {
     const src = local(input);
     const texto = fs.readFileSync(src, 'utf8').split('vk::RawBufferLoad<').join('NfsmwSinPuntero<');
     fs.writeFileSync(src, texto);
+    // NFSMW_VOLCAR_HLSL=<folder>: keep every translated HLSL, to read what a shader does.
+    if (process.env.NFSMW_VOLCAR_HLSL) {
+      fs.mkdirSync(process.env.NFSMW_VOLCAR_HLSL, { recursive: true });
+      fs.copyFileSync(src, path.join(process.env.NFSMW_VOLCAR_HLSL, path.basename(input)));
+    }
     const args = ['-spirv', '-T', vertex ? 'vs_6_6' : 'ps_6_6', '-E', 'main', '-HV', '2021',
       '-fspv-target-env=vulkan1.1spirv1.4', '-fvk-use-dx-layout', '-Werror=parameter-usage'];
     if (vertex) args.push('-fvk-invert-y');

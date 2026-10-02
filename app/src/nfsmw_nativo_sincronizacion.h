@@ -22,10 +22,22 @@ inline constexpr VkPipelineStageFlags kEtapasPase =
 inline constexpr VkAccessFlags kAccesosPase =
     kAccesosImagenes & ~(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
 
-inline void DependenciasImagenes(VkSubpassDependency (&dependencias)[2]) {
-  dependencias[0] = {VK_SUBPASS_EXTERNAL, 0, kEtapasImagenes, kEtapasPase,
+/*
+ * sin_vertices (Mali mode): no dependency ends in the vertex shader stage. On a tiler (Mali) a dependency from
+ * one pass's fragment work to the next pass's vertex stage stops the next pass's geometry until the previous
+ * pass has finished shading, and with ~20 passes per frame the vertex/tiler and fragment queues never
+ * overlap. No vertex shader of the game samples a texture (checked over the 98 translated ones), and vertex
+ * data comes from buffers the CPU writes, not from images, so nothing in the vertex stage reads what the
+ * passes write.
+ */
+inline void DependenciasImagenes(VkSubpassDependency (&dependencias)[2], bool sin_vertices = false) {
+  const VkPipelineStageFlags destino_entrada =
+      sin_vertices ? kEtapasPase & ~VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : kEtapasPase;
+  const VkPipelineStageFlags destino_salida =
+      sin_vertices ? kEtapasImagenes & ~VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : kEtapasImagenes;
+  dependencias[0] = {VK_SUBPASS_EXTERNAL, 0, kEtapasImagenes, destino_entrada,
                      kAccesosImagenes, kAccesosPase, 0};
-  dependencias[1] = {0, VK_SUBPASS_EXTERNAL, kEtapasPase, kEtapasImagenes,
+  dependencias[1] = {0, VK_SUBPASS_EXTERNAL, kEtapasPase, destino_salida,
                      kAccesosPase, kAccesosImagenes, 0};
 }
 
