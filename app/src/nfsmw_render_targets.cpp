@@ -97,6 +97,21 @@ REXCVAR_DEFINE_BOOL(nfsmw_render_prueba_mantener_msaa, false, "NFSMW",
                     "Solo pruebas: con nfsmw_render_sin_mosaico, no quitar el MSAA ni de los modos ni de los conjuntos")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+/*
+ * The game's own 1024x576 mode, for real.
+ *
+ * With nfsmw_resolucion_interna = 1024x576 the game picks its mode 1 (1024x576, which it registers with MSAA),
+ * but ForzarModoSinAa moved it to mode 2: the scene was drawn at 1280x720 and only shrunk to 1024x576 when
+ * resolving ("la escena de 1280x720 se encoge a 1024x576"). On the Mali-G52 the GPU is the limit and the
+ * scene is most of its work, so with this the game keeps mode 1 (its set is already registered without MSAA,
+ * and the table's MSAA for that mode is set to 0 like the others): 36 % fewer scene pixels. Off by default;
+ * the launcher turns it on for weak GPUs.
+ */
+REXCVAR_DEFINE_BOOL(nfsmw_render_1024_nativo, false, "NFSMW",
+                    "Con nfsmw_resolucion_interna = 1024x576: el juego dibuja de verdad a 1024x576 (su modo 1) en vez "
+                    "de dibujar a 1280x720 y encoger al resolver")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 // The internal resolution comes from nfsmw_resolucion_interna (Graficos category), and with
 // "automatico" it follows the dock live: 1920x1080 docked and 1280x720 handheld.
 //
@@ -114,6 +129,10 @@ REXCVAR_DECLARE(std::string, nfsmw_resolucion_interna);
 extern "C" void RexSwitchPerfResolution(unsigned ancho, unsigned alto);
 #endif
 
+namespace nfsmw::nativo {
+extern std::atomic<bool> g_escena_1024;  // nfsmw_nativo_dibujos.cpp: the scene render target is 1024 wide
+}
+
 namespace nfsmw::render_targets {
 namespace {
 
@@ -126,6 +145,7 @@ constexpr uint32_t kOffMsaa = 76;
 constexpr uint32_t kOffRects = 100;
 constexpr uint32_t kBytesPorModoRects = 64;  // 4 D3DRECT de 16 bytes
 constexpr uint32_t kModoSinAa = 2;
+constexpr uint32_t kModo1024 = 1;  // the game's own 1024x576 (nfsmw_render_1024_nativo)
 constexpr uint32_t kModo1080p = 4;  // its set becomes the 1920x1088 one
 constexpr uint32_t kAncho1080p = 1920;
 constexpr uint32_t kAlto1080p = 1088;   // 1080 rounded up to a multiple of 32, like its own 720 -> 736
@@ -168,6 +188,7 @@ struct Modo {
 // Original table MSAA per mode, valid once g_tabla_igualada is true.
 std::array<std::atomic<uint32_t>, kModos> g_msaa_original{};
 std::atomic<bool> g_tabla_igualada{false};
+std::atomic<bool> g_modo1024_valido{false};  // nfsmw_render_1024_nativo: mode 1 checked and without MSAA
 
 Modo LeerModo(const uint8_t* base, uint32_t obj, uint32_t m) {
   return {Leer32(base, obj + kOffTiras + 4 * m), Leer32(base, obj + kOffAncho + 4 * m),
@@ -225,6 +246,22 @@ void IgualarModosAlModoSinAa(uint8_t* base, uint32_t obj) {
     }
     // Only the first tile is read (sub_82458850 copies tiles*16 bytes).
     std::memcpy(base + obj + kOffRects + kBytesPorModoRects * m, base + rect2, 16);
+  }
+
+  // nfsmw_render_1024_nativo: mode 1 without MSAA, as long as it is the 1024x576 that was analyzed.
+  if (REXCVAR_GET(nfsmw_render_1024_nativo)) {
+    const Modo m1 = LeerModo(base, obj, kModo1024);
+    const uint32_t rect1 = obj + kOffRects + kBytesPorModoRects * kModo1024;
+    const uint32_t x2 = Leer32(base, rect1 + 8), y2 = Leer32(base, rect1 + 12);
+    if (m1.tiras == 1 && m1.ancho == 1024 && m1.alto >= 576 && x2 == 1024 && y2 >= 576 && y2 <= m1.alto) {
+      Escribir32(base, obj + kOffMsaa + 4 * kModo1024, 0);
+      g_modo1024_valido.store(true, std::memory_order_relaxed);
+      REXLOG_INFO("[resolucion] modo {} (1024x{}, area {}x{}) sin MSAA: la escena se dibuja a 1024x576",
+                  kModo1024, m1.alto, x2, y2);
+    } else {
+      REXLOG_WARN("[resolucion] el modo 1 no es el 1024x576 analizado ({} tira(s) {}x{}, rect {}x{}): se usa el 2",
+                  m1.tiras, m1.ancho, m1.alto, x2, y2);
+    }
   }
 
   // And mode 4 becomes the 1080p one, with its own set. That way the resolution changes live by choosing
@@ -300,17 +337,26 @@ std::atomic<int> g_salida_latch{-1};
  * So Reverse-NX decides the resolution, but it is read at startup. Changing it with the game running
  * moves the window and the clocks, not the internal resolution; that requires restarting the game.
  */
+// nfsmw_render_1024_nativo: the 720p-class mode is the game's own 1024x576 (mode 1) instead of mode 2.
+uint32_t ModoSinAaQueToca() {
+  return REXCVAR_GET(nfsmw_resolucion_interna) == "1024x576" && REXCVAR_GET(nfsmw_render_1024_nativo) &&
+                 g_modo1024_valido.load(std::memory_order_relaxed)
+             ? kModo1024
+             : kModoSinAa;
+}
+
 uint32_t ModoQueToca() {
   const int pestillo = g_salida_latch.load(std::memory_order_acquire);
   if (pestillo >= 0) {
-    const uint32_t quiero = pestillo > 0 ? kModo1080p : kModoSinAa;
+    const uint32_t quiero = pestillo > 0 ? kModo1080p : ModoSinAaQueToca();
     // Only once: if Reverse-NX asks for the opposite, say so. The game's output is already created and
     // cannot change on the fly, so neither can the internal resolution: a restart is needed.
     static std::atomic<bool> avisado{false};
     if (!avisado.load(std::memory_order_relaxed) &&
         REXCVAR_GET(nfsmw_resolucion_interna) == "automatico") {
       const bool sobremesa = EnSobremesa();
-      if ((sobremesa ? kModo1080p : kModoSinAa) != quiero && !avisado.exchange(true)) {
+      if ((sobremesa ? kModo1080p : kModoSinAa) != (quiero == kModo1024 ? kModoSinAa : quiero) &&
+          !avisado.exchange(true)) {
         REXLOG_INFO("[resolucion] Reverse-NX dice {} pero la salida del juego ya se creo para {}: la "
                     "resolucion interna NO cambia en marcha, hay que reiniciar el juego",
                     sobremesa ? "sobremesa" : "portatil",
@@ -326,7 +372,7 @@ uint32_t ModoQueToca() {
   if (r == "automatico") {
     return EnSobremesa() ? kModo1080p : kModoSinAa;
   }
-  return kModoSinAa;  // 1280x720 and 1024x576 (the latter goes through the video mode)
+  return ModoSinAaQueToca();  // 1280x720 and 1024x576 (the latter goes through the video mode)
 }
 
 std::atomic<uint32_t> g_modo_puesto{0};
@@ -341,6 +387,7 @@ void ForzarModoSinAa(uint8_t* base) {
   }
   const uint32_t modo = Leer32(base, obj);
   const uint32_t quiero = ModoQueToca();
+  nfsmw::nativo::g_escena_1024.store(quiero == kModo1024, std::memory_order_relaxed);
   if (modo == quiero) {
     return;
   }
@@ -352,7 +399,8 @@ void ForzarModoSinAa(uint8_t* base) {
   }
   Escribir32(base, obj, quiero);
   if (g_modo_puesto.exchange(quiero, std::memory_order_relaxed) != quiero) {
-    REXLOG_INFO("[resolucion] {} ({}): modo {}", quiero == kModo1080p ? "1920x1080" : "1280x720",
+    REXLOG_INFO("[resolucion] {} ({}): modo {}",
+                quiero == kModo1080p ? "1920x1080" : quiero == kModo1024 ? "1024x576" : "1280x720",
                 EnSobremesa() ? "sobremesa" : "portatil", quiero);
 #if REX_PLATFORM_SWITCH
     RexSwitchPerfResolution(quiero == kModo1080p ? kAncho1080p : 1280, quiero == kModo1080p ? kVisible1080p : 720);

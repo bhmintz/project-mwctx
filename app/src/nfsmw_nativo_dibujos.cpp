@@ -62,6 +62,13 @@ static const uint32_t kSpirvResplandorSuave[1] = {0};
 static const uint32_t kSpirvBloom4[1] = {0};
 static const uint32_t kSpirvBloomCero[1] = {0};
 #endif
+#if __has_include("nfsmw_nativo_resplandor_humo_spirv.h")
+// The smoke variant (nfsmw_humo = optimizado), derived from a game shader and not distributed either.
+#include "nfsmw_nativo_resplandor_humo_spirv.h"
+#define NFSMW_VARIANTE_HUMO 1
+#else
+static const uint32_t kSpirvHumoSinSombra[1] = {0};
+#endif
 #include "nfsmw_nativo_shaders.h"
 #include "nfsmw_nativo_ganchos.h"  // nfsmw_d3d_vegetacion_juego
 #include "nfsmw_reflejo_demanda.h"  // nfsmw_reflejo_visibilidad
@@ -844,6 +851,14 @@ REXCVAR_DEFINE_STRING(nfsmw_bloom, "nativo", "Graficos",
                       "Resplandor de las luces (bloom). nativo: como el juego (16 muestreos por pixel). optimizado: 4 "
                       "muestreos, casi igual y mas barato. desactivado: sin resplandor, lo mas rapido")
     .allowed({"nativo", "optimizado", "desactivado"});
+// The tyre smoke and dust (p_000101): stacked transparent quads over large areas, about a fifth of the scene's
+// GPU time on the Mali-G52. optimizado: with the shadows off, a variant without its shadow branch (the empty
+// map gives exactly the same 1.0, so the image does not change); with shadows on it is drawn as the game does.
+// desactivado: not drawn. (Dropping half the particles was tried: they alternate between frames and flicker.)
+REXCVAR_DEFINE_STRING(nfsmw_humo, "activado", "Graficos",
+                      "Humo y polvo de las ruedas. activado: como el juego. optimizado: igual a la vista y mas barato "
+                      "con las sombras apagadas (no calcula la sombra del humo). desactivado: sin humo, lo mas rapido")
+    .allowed({"activado", "optimizado", "desactivado"});
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sin_sombras, true, "NFSMW",
                     "Modo Mali: no se graba el mapa de sombras (como nfsmw_nativo_omitir_sombras, solo en Mali) "
                     "mientras nfsmw_sombras_cada sea 0 (automatico); la opcion de la app manda");
@@ -1221,6 +1236,9 @@ std::atomic<bool> g_nativo_modo_mali{false};
 std::atomic<bool> g_retrovisor_apagado{false};
 // nfsmw_cubemap_contenido = 4 in a race (set by nfsmw_recortes_carrera.cpp): the car reflects CuboFijo.
 std::atomic<bool> g_reflejo_fijo{false};
+// The game draws the scene in its own 1024x576 mode (nfsmw_render_1024_nativo, set by nfsmw_render_targets.cpp):
+// the scene render target is 1024 wide, not 1280.
+std::atomic<bool> g_escena_1024{false};
 namespace {
 
 /*
@@ -1236,7 +1254,10 @@ inline uint32_t CategoriaDeDestino(uint32_t pitch, const uint64_t* claves) {
   if (!color && claves[4] && pitch >= 1600) {
     return kGpuSombras;
   }
-  if (pitch >= 1280) {
+  // The scene is 1280 wide, or 1024 in the game's own 1024x576 mode (nfsmw_render_1024_nativo). EDRAM pitches are
+  // multiples of 80, so that one is 1040; with depth, because the 1040 front buffer passes (HUD, composite) are
+  // there too.
+  if (pitch >= 1280 || ((pitch == 1024 || pitch == 1040) && claves[4] && g_escena_1024.load(std::memory_order_relaxed))) {
     return claves[4] ? kGpuEscena : kGpuEscenaSinProfundidad;
   }
   if (pitch >= 640) {
@@ -1430,6 +1451,7 @@ constexpr uint32_t kSpecSombraMinimo = uint32_t(1) << 23;
 // (nfsmw_bloom): 4 taps, or zero.
 constexpr uint32_t kSpecBloom4 = uint32_t(1) << 21;
 constexpr uint32_t kSpecBloomCero = uint32_t(1) << 22;
+constexpr uint32_t kSpecHumoSinSombra = uint32_t(1) << 24;  // nfsmw_humo = optimizado (pipeline key only)
 constexpr uint64_t kHuellaComposicion = 0x19C0C358044A29BFull;  // p_000139, the race VisualTreatment
 // nfsmw_tratamiento_visual. The final composite (kHuellaComposicion, p_000139) tints each channel with a polynomial
 // curve (Coeffs0..3 = c6..c9, evaluated at MISCMAP1.w), mixes in a desaturated part with its x component and adds a
@@ -1484,6 +1506,7 @@ REXCVAR_DEFINE_BOOL(nfsmw_nativo_pase_area_util, true, "NFSMW",
                     "320x256. La imagen es identica: Vulkan solo carga y guarda el renderArea");
 constexpr uint64_t kHuellaBrightPass = 0xE849A9F6D3323B87ull;
 constexpr uint64_t kHuellaBloomReduccion = 0x7E1C6EED1AC24341ull;  // p_000091 (nfsmw_bloom)
+constexpr uint64_t kHuellaHumo = 0x212C84F87E2E3DC1ull;            // p_000101 (nfsmw_humo)
 /*
  * The pixel shader of the sky dome (nfsmw_nativo_cielo_aplazado).
  *
@@ -3279,6 +3302,27 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       indices_.swap(convertidos_);
     }
+    // nfsmw_humo. 0 as the game, 1 optimizado (variant without the shadow branch), 2 desactivado.
+    humo_dibujo_ = 0;
+    if (ps && ps->shader && ps->shader->huella == kHuellaHumo) {
+      const std::string& humo = REXCVAR_GET(nfsmw_humo);
+      humo_dibujo_ = humo == "desactivado" ? 2 : humo == "optimizado" ? 1 : 0;
+      if (humo_dibujo_ == 2) {
+        return true;
+      }
+#ifdef NFSMW_VARIANTE_HUMO
+      // The variant skips the shadow branch, which only gives the same 1.0 while the shadow map is empty: the
+      // same decision that skips the shadow pass (EmitirDibujo, destino_sombras).
+      const int32_t sombras_cada = REXCVAR_GET(nfsmw_sombras_cada);
+      const bool sin_sombras = REXCVAR_GET(nfsmw_nativo_omitir_sombras) || sombras_cada < 0 ||
+                               (modo_mali_ && sombras_cada == 0 && REXCVAR_GET(nfsmw_nativo_mali_sin_sombras));
+      if (humo_dibujo_ == 1 && !sin_sombras) {
+        humo_dibujo_ = 0;
+      }
+#else
+      humo_dibujo_ = 0;
+#endif
+    }
     CortarSubetapa(17, t_indices_185);  // indices
     // The indices stay as they come: vkCmdDrawIndexed subtracts vmin through vertexOffset.
     const uint32_t vertices = vmax - vmin + 1;
@@ -3622,6 +3666,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         ++pases_por_generacion_;
       } else if (!pase_activo_ && clave_pase == pase_clave_) {
         ++pases_reanudados_;
+        AnotarReanudado(pitch, claves);
       } else {
         ++pases_por_destino_;
       }
@@ -3812,6 +3857,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       especializacion |= modo == 1 ? kSpecResplandorNatural : modo == 2 ? kSpecResplandorSuave : 0;
     }
 #endif
+    if (humo_dibujo_ == 1) {
+      especializacion |= kSpecHumoSinSombra;  // the smoke without its shadow branch (empty shadow map)
+    }
 #ifdef NFSMW_VARIANTES_BLOOM
     if (ps && ps->shader && ps->shader->huella == kHuellaBloomReduccion) {
       const std::string& bloom = REXCVAR_GET(nfsmw_bloom);  // one draw per frame
@@ -5453,8 +5501,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                                       .count());
   }
 
+  void MotivoCierrePase(uint32_t motivo) override { motivo_cierre_pendiente_ = std::min(motivo, 8u); }
+
   void TerminarPase() override {
+    const uint32_t motivo = motivo_cierre_pendiente_;
+    motivo_cierre_pendiente_ = 0;  // only for this call
     if (pase_activo_) {
+      motivo_cierre_ = motivo;  // 0 = anything else (a submission, the frame end)
       /*
        * Fallback path of the deferred sky. If nothing has emitted it yet (no transparent draw arrived, or the
        * pass closes because of a copy, a resolve or a submission), it is emitted here, inside the pass and
@@ -11861,6 +11914,37 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     return true;
   }
 
+  // A pass reopened after a copy or a clear: what closed it (see MotivoCierrePase), reported every 20 s.
+  void AnotarReanudado(uint32_t pitch, const uint64_t* claves) {
+    const uint32_t escena = CategoriaDeDestino(pitch, claves) == kGpuEscena ? 0 : 1;
+    auto& r = reanudados_motivo_[motivo_cierre_][escena];
+    ++r[0];
+    r[1] += uint64_t(ancho_pase_diag_) * alto_pase_diag_;
+    const auto ahora = std::chrono::steady_clock::now();
+    if (reanudados_informe_ == std::chrono::steady_clock::time_point{}) {
+      reanudados_informe_ = ahora;
+    }
+    if (ahora - reanudados_informe_ < std::chrono::seconds(20)) {
+      return;
+    }
+    reanudados_informe_ = ahora;
+    static constexpr const char* kMotivos[9] = {"otro", "copia de color con borrado", "copia de color",
+                                                "copia de profundidad", "borrado de color", "borrado de profundidad",
+                                                "borrado de color y profundidad", "orden de copia vacia",
+                                                "copia aplazada"};
+    std::string lista;
+    for (uint32_t m = 0; m < 9; ++m) {
+      for (uint32_t e = 0; e < 2; ++e) {
+        if (reanudados_motivo_[m][e][0]) {
+          lista += fmt::format(" {} ({}): {} ({:.1f} Mtexels);", kMotivos[m], e == 0 ? "escena" : "otros",
+                               reanudados_motivo_[m][e][0], double(reanudados_motivo_[m][e][1]) / 1e6);
+        }
+      }
+    }
+    REXLOG_INFO("[nativo] C6 pases reanudados en 20 s, por lo que los cerro:{}", lista);
+    reanudados_motivo_ = {};
+  }
+
   // ZCULL: three load modes. kCargaBorrar is needed to clear the depth of images created without
   // TRANSFER_DST, the only ones eligible for a ZCULL plane.
   enum : uint32_t { kCargaLeer = 0, kCargaIgnorar = 1, kCargaBorrar = 2 };
@@ -13273,6 +13357,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       ps = ModuloVariante(3, kSpirvBloom4, sizeof(kSpirvBloom4));
     } else if (clave.ps && (clave.especializacion & kSpecBloomCero)) {
       ps = ModuloVariante(4, kSpirvBloomCero, sizeof(kSpirvBloomCero));
+    } else if (clave.ps && (clave.especializacion & kSpecHumoSinSombra)) {
+      ps = ModuloVariante(5, kSpirvHumoSinSombra, sizeof(kSpirvHumoSinSombra));
     } else if (clave.ps && (clave.especializacion & kSpecSoloAlfa)) {
       ps = ModuloSoloAlfa(*p.ps);
     } else if (clave.ps && (clave.especializacion & kSpecZTemprana)) {
@@ -13654,18 +13740,20 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                                 : (spec & kSpecResplandorSuave) ? 2
                                 : (spec & kSpecBloom4)          ? 5
                                 : (spec & kSpecBloomCero)       ? 6
+                                : (spec & kSpecHumoSinSombra)       ? 7
                                 : (spec & kSpecSoloAlfa)        ? 3
                                 : (spec & kSpecZTemprana)       ? 4
                                                                 : 0;
       if (variante == 0) {
         return normal(e);
       }
-      if (variante >= 5) {  // nfsmw_bloom: fixed modules, like the bright pass ones
+      if (variante >= 5) {  // nfsmw_bloom and nfsmw_humo: fixed modules, like the bright pass ones
         auto it_bloom = modulos.find(uint64_t(variante) << 32 | 0xFFFFFFFFull);
         if (it_bloom == modulos.end()) {
           it_bloom = modulos.emplace(uint64_t(variante) << 32 | 0xFFFFFFFFull,
-                                     variante == 5 ? crear(kSpirvBloom4, sizeof(kSpirvBloom4))
-                                                   : crear(kSpirvBloomCero, sizeof(kSpirvBloomCero)))
+                                     variante == 5   ? crear(kSpirvBloom4, sizeof(kSpirvBloom4))
+                                     : variante == 6 ? crear(kSpirvBloomCero, sizeof(kSpirvBloomCero))
+                                                     : crear(kSpirvHumoSinSombra, sizeof(kSpirvHumoSinSombra)))
                          .first;
         }
         return it_bloom->second;
@@ -14025,8 +14113,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   bool vacias_preparadas_ = false;
 
   std::unordered_map<const EntradaShader*, VkShaderModule> modulos_;
-  std::array<VkShaderModule, 5> modulos_variantes_{};  // 1 natural, 2 soft, 3 bloom 4 taps, 4 bloom zero
-  std::array<bool, 5> modulos_variantes_creados_{};
+  // 1 natural, 2 soft, 3 bloom 4 taps, 4 bloom zero, 5 smoke without shadow
+  std::array<VkShaderModule, 6> modulos_variantes_{};
+  std::array<bool, 6> modulos_variantes_creados_{};
+  uint32_t humo_dibujo_ = 0;  // nfsmw_humo for the current draw: 0 as the game, 1 optimizado
   int resplandor_anotado_ = 0;
   std::unordered_map<uint64_t, std::pair<ClavePipeline, VkPipeline>> pipelines_;
   // One-entry shortcut for PipelineDe (see the comment there).
@@ -14687,6 +14777,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   uint64_t pases_por_generacion_ = 0;
   uint64_t pases_por_destino_ = 0;
   uint64_t pases_reanudados_ = 0;
+  // Passes reopened after a copy or a clear, by what closed them (MotivoCierrePase) and by whether the pass is
+  // the scene: [motivo][0 scene, 1 other] = {reopenings, texels loaded again}. Reported every 20 s.
+  uint32_t motivo_cierre_pendiente_ = 0;
+  uint32_t motivo_cierre_ = 0;
+  std::array<std::array<std::array<uint64_t, 2>, 2>, 9> reanudados_motivo_{};
+  std::chrono::steady_clock::time_point reanudados_informe_{};
   uint64_t texels_pases_ = 0;
   std::array<uint64_t, kGpuCategorias> texels_por_categoria_{};
   std::array<uint64_t, kGpuCategorias> dibujos_por_categoria_{};

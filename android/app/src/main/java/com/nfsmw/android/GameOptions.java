@@ -66,8 +66,9 @@ final class GameOptions {
                     new String[] {"Nativa · la de la pantalla", "1080p · escalada por hardware",
                             "720p · escalada por hardware, más rendimiento", "576p · máximo rendimiento"}),
             new Option(FPS, "Límite de FPS", "nfsmw_limite_fps", "60",
-                    new String[] {"30", "60", "90", "120"},
-                    new String[] {"30 FPS · ahorra batería", "60 FPS", "90 FPS · experimental",
+                    new String[] {"30", "40", "45", "60", "90", "120"},
+                    new String[] {"30 FPS · ahorra batería", "40 FPS · estable, calienta menos",
+                            "45 FPS · estable, calienta menos", "60 FPS", "90 FPS · experimental",
                             "120 FPS · experimental"}),
             new Option(SHOW_FPS, "Mostrar FPS", "nfsmw_mostrar_fps", "false",
                     new String[] {"false", "true"},
@@ -110,7 +111,11 @@ final class GameOptions {
                     new String[] {"nativo", "optimizado", "desactivado"},
                     new String[] {"Nativo", "Optimizado · casi igual, más rendimiento",
                             "Desactivado · máximo rendimiento"}),
-            new Option("volume","Volumen del juego", "audio_ganancia_pct", "100",
+            new Option("smoke", "Humo de las ruedas", "nfsmw_humo", "activado", "optimizado",
+                    new String[] {"activado", "optimizado", "desactivado"},
+                    new String[] {"Activado", "Optimizado · igual, más rendimiento con las sombras apagadas",
+                            "Desactivado · máximo rendimiento"}),
+            new Option("volume", "Volumen del juego", "audio_ganancia_pct", "100",
                     new String[] {"100", "125", "150", "200"},
                     new String[] {"Normal", "Alto", "Muy alto", "Máximo · puede saturar"}),
             new Option("filter", "Filtro de imagen", "nfsmw_posproceso", "apagado",
@@ -190,6 +195,9 @@ final class GameOptions {
             // vkQueuePresentKHR; on the render thread that serialized CPU and GPU (100+ ms frames dropped
             // from ~17.6 to ~4.7 a minute in free roam with it, and the game never waited for the presenter).
             args.add("--present_hilo_propio=true");
+            // With "1024x576" the game really draws at 1024x576 (its own mode 1) instead of drawing at 1280x720
+            // and shrinking when resolving: 36 % fewer scene pixels where the GPU is the limit.
+            args.add("--nfsmw_render_1024_nativo=true");
         }
         return args;
     }

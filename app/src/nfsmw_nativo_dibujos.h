@@ -295,6 +295,10 @@ class DibujosVulkan {
   virtual bool Dibujar(const PeticionDibujo& peticion) = 0;
   // Before copies, clears and any command outside a pass.
   virtual void TerminarPase() = 0;
+  // Why the next TerminarPase closes the pass (C2 copy command kind), for the report of passes reopened after a
+  // copy or a clear: 1 color copy + clear, 2 color copy, 3 depth copy, 4 color clear, 5 depth clear, 6 both
+  // clears, 7 copy command with nothing to do, 8 deferred copy.
+  virtual void MotivoCierrePase(uint32_t motivo) { (void)motivo; }
   // ZCULL: clears a depth image by opening a pass with loadOp = CLEAR, instead of with
   // vkCmdClearDepthStencilImage. Needed for images created without TRANSFER_DST, the only ones the driver
   // can give a ZCULL plane. Returns false if it could not.

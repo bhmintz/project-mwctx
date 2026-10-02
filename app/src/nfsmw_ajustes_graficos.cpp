@@ -103,7 +103,9 @@ REXCVAR_DEFINE_STRING(nfsmw_limite_fps, "60", "Graficos",
                       "ritmo fijo de 30 FPS, sin altibajos, con el juego a su velocidad. Se aplica al reiniciar")
     // 90 and 120 (Android, experimental): the vblank the game counts runs at that rate, for high refresh
     // rate phone panels.
-    .allowed({"60", "30", "90", "120"})
+    // 40 and 45 (Android): a steady pace below 60 for GPUs that cannot hold it, so the GPU idles between
+    // frames, heats less and keeps its clock (the Mali-G52 drops from 950 to 586 MHz when hot).
+    .allowed({"60", "30", "40", "45", "90", "120"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 /*
@@ -292,7 +294,8 @@ void AplicarAjustesGraficos() {
   Poner("resolution", "");  // empty preset: the width and height above apply
   const std::string limite = REXCVAR_GET(nfsmw_limite_fps);
   Poner("video_mode_refresh_rate",
-        limite == "30" || limite == "90" || limite == "120" ? limite.c_str() : "60");
+        limite == "30" || limite == "40" || limite == "45" || limite == "90" || limite == "120" ? limite.c_str()
+                                                                                                 : "60");
   REXLOG_INFO("[ajustes] resolucion interna {} y limite de FPS {}: modo de video {}x{} a {} Hz", resolucion, limite,
               rex::cvar::GetFlagByName("video_mode_width"), rex::cvar::GetFlagByName("video_mode_height"),
               rex::cvar::GetFlagByName("video_mode_refresh_rate"));

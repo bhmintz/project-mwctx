@@ -1535,6 +1535,17 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     const uint64_t dibujos_antes = dibujados - dibujados_ultima_copia_;
     dibujados_ultima_copia_ = dibujados;
     if (dibujos_) {
+      {
+        const uint32_t c = reg.rb_copy_control;
+        const uint32_t orden = (c >> 20) & 0x3;
+        const bool copia = orden == uint32_t(xenos::CopyCommand::kRaw) || orden == uint32_t(xenos::CopyCommand::kConvert);
+        const bool borra_color = (c >> 8) & 0x1, borra_profundidad = (c >> 9) & 0x1;
+        dibujos_->MotivoCierrePase(copia ? ((c & 0x7) >= xenos::kMaxColorRenderTargets ? 3u : borra_color ? 1u : 2u)
+                                         : borra_color && borra_profundidad ? 6u
+                                         : borra_color                      ? 4u
+                                         : borra_profundidad                ? 5u
+                                                                            : 7u);
+      }
       dibujos_->TerminarPase();  // copying and clearing are not allowed inside a pass
       // No longer on every copy; see ObtenerResuelta and Preparar.
       if (invalidar_cada_copia_) {
@@ -3776,6 +3787,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       return;
     }
     if (dibujos_) {
+      dibujos_->MotivoCierrePase(8);
       dibujos_->TerminarPase();  // it can arrive from a draw (TexturaResuelta): the copy goes outside the pass
     }
     MarcarGpu(kGpuCopias);
