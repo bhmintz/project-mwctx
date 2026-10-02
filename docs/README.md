@@ -42,6 +42,7 @@ This is the path the game follows, from the Xbox 360 disc to the Switch screen:
 | [building.md](building.md) | How to build the NRO, the driver and the shader library, step by step |
 | [porting-another-game.md](porting-another-game.md) | What you can reuse for another game, and in which order to work |
 | [native-renderer.md](native-renderer.md) | How the port draws the game with Vulkan |
+| [backend-mali.md](backend-mali.md) | The native renderer's Mali mode for low-end Android GPUs (Mali-G52): architecture, frame and texture flow, every hack (in Spanish) |
 | [shaders.md](shaders.md) | How the game's shaders are translated, and what had to be fixed |
 | [toolchain.md](toolchain.md) | How the game's code is translated and compiled, and the build options that make it faster |
 | [mesa.md](mesa.md) | The graphics driver and this port's changes to it |

@@ -58,6 +58,26 @@ En GPU modestas (por ejemplo la **Mali-G52** del Helio G80, o Mali antiguas, Adr
 
 El juego se abre en horizontal. La superposición táctil incluye dirección, botones de acción, START, freno y acelerador. Desde el editor de controles puedes mover y redimensionar botones, ocultarlos y ajustar su opacidad. También se admiten mandos Bluetooth y USB.
 
+## Backend gráfico para Mali (Mali-G52)
+
+Las GPU Mali de gama baja no tienen lo que el renderizador nativo usa en otras GPU: Vulkan 1.2, punteros de 64 bits, texturas *bindless* ni muestreo de texturas BC (DXT). Para ellas el renderizador tiene un **modo Mali** que se activa solo:
+
+- **Descriptores clásicos**: un descriptor set por dibujo con las texturas de ese dibujo, constantes por UBO y una variante de los shaders (`NFSMW_MALI`, SPIR-V 1.4) sin capacidades de Vulkan 1.2.
+- **Texturas**: las BC se decodifican en la CPU (BC1 a 16 bits) o, mejor, se leen ya convertidas a **ETC2/EAC**, que la Mali muestrea de forma nativa. El botón **Preparar texturas** del launcher llena esa caché desde los archivos del juego. La opción **Calidad de texturas** baja solo el mundo; autos, vinilos, menús y HUD quedan intactos.
+- **Memoria e hilos**: caché de texturas con tope de 256 MB, hilo de grabación en los núcleos grandes con prioridad alta, presentación en un hilo propio y SDL sin girar en vacío. Así se eliminaron los congelones por falta de RAM al ir rápido.
+- **Efectos ajustables**: sombras, retrovisor, reflejo del asfalto y reflejos del coche, incluido un **cubemap fijo** de la ciudad que imita los reflejos sin el coste del cubemap dinámico.
+- **Contador de FPS** opcional, que se activa desde el launcher o dentro del juego.
+
+Desarrollado y probado en un **Samsung Galaxy A32 4G (2021)**:
+
+| | |
+|---|---|
+| CPU | MediaTek Helio G80: 2 × Cortex-A75 a 2,0 GHz + 6 × Cortex-A55 a 1,8 GHz (ARMv8.2-A) |
+| GPU | Mali-G52 MC2 (Bifrost, por tiles): ETC2 sí, BC/DXT no, sin timestamps |
+| API | **Vulkan 1.1.131** (driver r26p0), SPIR-V hasta 1.4; máximo 4 descriptor sets y 256 texturas por etapa |
+
+En ese teléfono el juego es jugable a 1024×576 o 1280×720, con unos 30 FPS en el mundo abierto. La arquitectura, el flujo de un fotograma y de una textura, y la lista completa de hacks están en [docs/backend-mali.md](docs/backend-mali.md).
+
 ## Gráficos en v0.3.4
 
 Se corrigieron bloques, manchas y reflejos incorrectos en la carrocería que aparecían tanto en el menú como durante las carreras del Galaxy A55. El renderizador ahora sincroniza las copias de texturas y sus lecturas entre pases de Vulkan. La mejora se comprobó en el teléfono y fue confirmada por su usuario. La corrección se activa automáticamente y no requiere cambiar los archivos del juego ni regenerar los shaders. Consulta [el diagnóstico de Xclipse](docs/android-xclipse-diagnostic.md) para los detalles de la prueba.
