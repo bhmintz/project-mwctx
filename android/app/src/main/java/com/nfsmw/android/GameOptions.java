@@ -49,6 +49,7 @@ final class GameOptions {
 
     static final String RESOLUTION = "resolution";
     static final String FPS = "fps";
+    static final String SHOW_FPS = "show_fps";
 
     // The fifth argument (lowEndDefault), where present, is the default used on a weak GPU (GpuInfo.TIER_LOW,
     // e.g. the Helio G80's Mali-G52) when the player has not chosen a value. It only ever lowers quality, and
@@ -62,6 +63,9 @@ final class GameOptions {
                     new String[] {"30", "60", "90", "120"},
                     new String[] {"30 FPS · ahorra batería", "60 FPS", "90 FPS · experimental",
                             "120 FPS · experimental"}),
+            new Option(SHOW_FPS, "Mostrar FPS", "nfsmw_mostrar_fps", "false",
+                    new String[] {"false", "true"},
+                    new String[] {"Desactivado", "Activado"}),
             new Option("aa", "Antialiasing", "nfsmw_antialiasing", "apagado",
                     new String[] {"apagado", "fxaa"},
                     new String[] {"Desactivado", "FXAA"}),

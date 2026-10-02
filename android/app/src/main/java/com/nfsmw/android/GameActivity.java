@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.graphics.Color;
+import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -14,6 +15,8 @@ import android.hardware.input.InputManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.util.Log;
@@ -47,6 +50,7 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 public final class GameActivity extends SDLActivity
         implements TouchControlsView.Host, InputManager.InputDeviceListener, SensorEventListener {
@@ -63,6 +67,24 @@ public final class GameActivity extends SDLActivity
     private Sensor gravity;
 
     private static native void nativeSetStretch(boolean stretch);
+    private static native long nativeFotogramas();
+
+    // FPS counter: frames the game handed to the screen (nativeFotogramas) over real time, refreshed every
+    // half second. Each time it is switched on, or the activity comes back, it starts from a fresh reading,
+    // so the time it was off or paused never counts.
+    private static final long FPS_INTERVAL_MS = 500;
+    private final Handler fpsHandler = new Handler(Looper.getMainLooper());
+    private TextView fpsView;
+    private boolean fpsOn;
+    private long fpsLastFrames = -1;
+    private long fpsLastNanos;
+    private final Runnable fpsTick = new Runnable() {
+        @Override
+        public void run() {
+            sampleFps();
+            fpsHandler.postDelayed(this, FPS_INTERVAL_MS);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle state) {
@@ -95,6 +117,19 @@ public final class GameActivity extends SDLActivity
         FrameLayout.LayoutParams barParams = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
         root.addView(toolbar, barParams);
+
+        fpsView = new TextView(this);
+        fpsView.setTextColor(0xFFFFFFFF);
+        fpsView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        fpsView.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        fpsView.setShadowLayer(3f, 1f, 1f, 0xFF000000);
+        fpsView.setPadding(dp(8), dp(4), dp(8), dp(4));
+        fpsView.setBackgroundColor(0x66000000);
+        fpsView.setVisibility(View.GONE);
+        root.addView(fpsView, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.START));
+        fpsOn = Boolean.parseBoolean(GameOptions.get(this, GameOptions.SHOW_FPS));
 
         inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
         sensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
@@ -150,6 +185,39 @@ public final class GameActivity extends SDLActivity
         }
         updateTiltListener();
         applyStretch(controls.stretch);
+        setFpsVisible(fpsOn);
+    }
+
+    private void setFpsVisible(boolean on) {
+        fpsOn = on;
+        fpsHandler.removeCallbacks(fpsTick);
+        fpsLastFrames = -1;  // the next reading is the new starting point
+        if (!on) {
+            fpsView.setVisibility(View.GONE);
+            return;
+        }
+        fpsView.setText("-- FPS");
+        fpsView.setVisibility(View.VISIBLE);
+        sampleFps();
+        fpsHandler.postDelayed(fpsTick, FPS_INTERVAL_MS);
+    }
+
+    private void sampleFps() {
+        long frames;
+        try {
+            frames = nativeFotogramas();
+        } catch (UnsatisfiedLinkError e) {
+            return;
+        }
+        long now = System.nanoTime();
+        if (fpsLastFrames >= 0 && now > fpsLastNanos && frames >= fpsLastFrames) {
+            double seconds = (now - fpsLastNanos) / 1e9;
+            double fps = (frames - fpsLastFrames) / seconds;
+            String ms = fps > 0.5 ? String.format(Locale.ROOT, " · %.1f ms", 1000.0 / fps) : "";
+            fpsView.setText(String.format(Locale.ROOT, "%.0f FPS%s", fps, ms));
+        }
+        fpsLastFrames = frames;
+        fpsLastNanos = now;
     }
 
     private static void applyStretch(boolean stretch) {
@@ -162,6 +230,7 @@ public final class GameActivity extends SDLActivity
 
     @Override
     protected void onPause() {
+        fpsHandler.removeCallbacks(fpsTick);
         if (inputManager != null) {
             inputManager.unregisterInputDeviceListener(this);
         }
@@ -354,6 +423,10 @@ public final class GameActivity extends SDLActivity
         panel.addView(toggle("Imagen estirada a toda la pantalla", controls.stretch, on -> {
             controls.stretch = on;
             applyStretch(on);
+        }));
+        panel.addView(toggle("Mostrar FPS", fpsOn, on -> {
+            GameOptions.set(this, GameOptions.SHOW_FPS, Boolean.toString(on));
+            setFpsVisible(on);
         }));
         panel.addView(toggle("Vibrar al pulsar", controls.haptics, on -> controls.haptics = on));
         panel.addView(toggle("Ocultar los controles al usar un mando", controls.hideWithGamepad,

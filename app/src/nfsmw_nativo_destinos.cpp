@@ -666,6 +666,9 @@ void Informe();
 }  // namespace nfsmw::guardia30
 
 namespace nfsmw::nativo {
+// Frames of the game handed to the screen (each Swap that paints its image), for the launcher's FPS counter
+// (android_touch.cpp). Only ever incremented; the reader works with differences.
+std::atomic<uint64_t> g_fotogramas_mostrados{0};
 namespace shaders {
 // The same SPIR-V the SDK presenter uses to draw the game image
 // (vulkan_presenter.cpp:128-141).
@@ -2314,6 +2317,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
           });
       if (pintado_mosaico) {
         ++presentados_;
+        g_fotogramas_mostrados.fetch_add(1, std::memory_order_relaxed);
       }
       return pintado_mosaico;
     }
@@ -2351,6 +2355,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     }
     if (pintado) {
       ++presentados_;
+      g_fotogramas_mostrados.fetch_add(1, std::memory_order_relaxed);
     }
     return pintado;
   }
