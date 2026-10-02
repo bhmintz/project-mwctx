@@ -69,10 +69,18 @@ Teléfono: SM-A325M, Android 13, 4 GB de RAM.
 | ADPF (`APerformanceHint`) | El teléfono rechaza la sesión | Sin efecto |
 | Nombre de paquete de AnTuTu | El tope de 1,71 GHz sigue igual | Sin efecto |
 | Sets de descriptores persistentes | Sets creados: del 28 % de los dibujos a ~0 (1024 en toda la sesión); 8-10 µs por dibujo en vez de 10-15. FPS iguales (~28) | Activo (`nfsmw_nativo_mali_sets_persistentes`) |
-
-| Salida a 1600×720 escalada por hardware (`vulkan_swapchain_alto_max`, opción "Resolución de salida") | ~28 → ~31 FPS con la GPU topada a 586 MHz | Activo (720 por defecto en GPU débiles) |
+| Salida a 1600×720 escalada por hardware (`vulkan_swapchain_alto_max`, opción "Escala de salida") | ~28 → ~31 FPS con la GPU topada a 586 MHz | Activo (720 por defecto en GPU débiles) |
 | Copia del mapa de sombras vacío (`nfsmw_nativo_mali_sombra_sin_copia`) | Copias de sombras a 0; FPS dentro del ruido | Activo |
 | Bloom optimizado (`nfsmw_bloom`, opción "Resplandor de las luces") | A/B del bloom: 2,3 ms por fotograma (30,6 con, 32,9 sin). Con "optimizado" y el teléfono frío (GPU a 800-950 MHz): ~44 FPS de media, tramos de 60 | Activo ("optimizado" por defecto en GPU débiles) |
+| Escena nativa a 1024×576 (`nfsmw_render_escena_nativa`) | El juego dibuja la escena por su modo 1 en vez de 1280×720 encogida: 36 % menos píxeles. ~31 → ~36 FPS con la GPU topada | Activo en GPU débiles |
+| Escena nativa a 960×540 y 896×504 | El modo 1 se reescribe a ese tamaño. La salida y el posproceso del juego siguen a 1024×576, así que el resolve de la escena se estira a esa textura (sin eso quedaba en la esquina con el HUD corrido). 896×504 sin tope y bilineal: 35-48 FPS en carrera, casi todo 42-48 | Opciones del launcher |
+| Humo optimizado (`nfsmw_humo`) | Variante sin la lectura del mapa de sombras cuando las sombras están apagadas. Saltear partículas alternas parpadeaba: descartado | Activo ("optimizado" por defecto en GPU débiles) |
+| Límite de 40/45 FPS | Ritmo fijo por debajo de 60: la GPU descansa entre fotogramas y calienta menos | Opciones del launcher |
+| Filtrado bilineal (`nfsmw_filtro_texturas`) | El filtro entre mips pasa a NEAREST: la unidad de texturas hace la mitad. Mejora visible pero no grande | Activo ("bilineal" por defecto en GPU débiles) |
+
+**Desglose por fence, corrección:** los pases sin un solo dibujo (las copias) daban 1,4-2,8 ms cada uno, así que esos "~17 ms de copias" son sobre todo el costo de medir con una valla por pase. Las copias reales son ~10 por fotograma y chicas (~1,2 Mpíxeles). Lo caro es la escena.
+
+**Siguiente:** A/B por shader de la escena (`nfsmw_nativo_mali_ab_omitir_ps`) para encontrar los 2-3 que más pesan y hacerles variantes, y una variante más barata de la pasada final `19C0C358` (1024×576).
 
 **GPU y temperatura:** la GPU está al 98-99 % en carrera. Android la topa en 586 MHz (de 950) con el estado
 térmico 2; con el teléfono frío llega a 950 MHz. Medir siempre leyendo `/sys/kernel/gpu/gpu_clock` y

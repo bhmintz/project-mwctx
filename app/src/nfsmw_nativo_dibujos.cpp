@@ -908,6 +908,15 @@ REXCVAR_DEFINE_BOOL(nfsmw_nativo_prueba_mip_puntual, false, "NFSMW",
                     "puntual (trilineal -> bilineal). La TMU hace la mitad de trabajo y la ALU no cambia: "
                     "si la escena baja manda el muestreo, si no se mueve manda la ALU. Se ve el salto de "
                     "mip al alejarse: solo para medir");
+// The same thing as nfsmw_nativo_prueba_mip_puntual, as a setting (the launcher's "Filtrado de texturas"):
+// on a Mali-G52 every trilinear sample is two bilinear ones for the texture unit, and the scene samples a
+// lot. bilineal: the filter between mip levels becomes NEAREST, so the texture unit does half the work; the
+// switch between levels can be seen as a line on surfaces going into the distance. Read at start-up.
+REXCVAR_DEFINE_STRING(nfsmw_filtro_texturas, "trilineal", "Graficos",
+                      "Filtro de las texturas con mips. trilineal: el que pide el juego. bilineal: la mitad de "
+                      "trabajo de texturas en la GPU; el salto entre niveles de detalle puede verse a lo lejos")
+    .allowed({"trilineal", "bilineal"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_INT32(nfsmw_nativo_prueba_mip_puntual_alternar_s, 0, "NFSMW",
                      "Renderizador nativo (prueba, 21/09): con N > 0 alterna cada N segundos "
                      "nfsmw_nativo_prueba_mip_puntual (los dos samplers conviven en la cache, no hay "
@@ -5886,7 +5895,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     // The filter between mip levels is part of the sampler key, so it is also decided once per frame. Off
     // (the normal case), this is reading one cvar and comparing a bool.
     {
-      bool nuevo = REXCVAR_GET(nfsmw_nativo_prueba_mip_puntual);
+      static const bool bilineal = REXCVAR_GET(nfsmw_filtro_texturas) == "bilineal";
+      bool nuevo = bilineal || REXCVAR_GET(nfsmw_nativo_prueba_mip_puntual);
       const int32_t alternar_mip = REXCVAR_GET(nfsmw_nativo_prueba_mip_puntual_alternar_s);
       if (alternar_mip > 0) {
         const auto segundos = std::chrono::duration_cast<std::chrono::seconds>(

@@ -98,6 +98,10 @@ final class GameOptions {
             new Option("car_reflections_fixed_brightness", "Brillo del cubemap fijo", "nfsmw_cubemap_fijo_brillo", "25",
                     new String[] {"15", "25", "35", "50", "75", "100"},
                     new String[] {"Muy bajo", "Bajo", "Medio", "Alto", "Muy alto", "Original (sin atenuar)"}),
+            new Option("texture_filter", "Filtrado de texturas", "nfsmw_filtro_texturas", "trilineal", "bilineal",
+                    new String[] {"trilineal", "bilineal"},
+                    new String[] {"Trilineal · el del juego",
+                            "Bilineal · la mitad de trabajo de texturas, se puede ver el salto a lo lejos"}),
             new Option("texture_quality", "Calidad de texturas", "nfsmw_nativo_mali_calidad_texturas", "0",
                     new String[] {"0", "1", "2"},
                     new String[] {"Alta", "Media · menos memoria y más fluido",
@@ -137,7 +141,7 @@ final class GameOptions {
      * shows up, at the end.
      */
     static final String[][] SECTIONS = {
-            {"RENDERIZADO", RESOLUTION, "aa", "texture_quality"},
+            {"RENDERIZADO", RESOLUTION, "aa", "texture_quality", "texture_filter"},
             {"PANTALLA Y ESCALA", "output_resolution", STRETCH, "filter"},
             {"RENDIMIENTO", FPS, SHOW_FPS},
             {"LUCES Y EFECTOS", "shadows", "bloom", "sky", "smoke", "road_reflection"},
