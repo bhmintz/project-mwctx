@@ -280,15 +280,17 @@ no la imagen). Emular memexport→compute (Xenia, `spirv_translator_memexport.cp
   alguna vez; si sí, una compilación asíncrona ayudaría mientras tanto (no hay cvar `async_shader_compilation`
   en este árbol: habría que añadirla).
 - Puede haber otros puntos del nativo que asuman BDA/bindless fuera de los 3 identificados; aparecerán al iterar.
-- **Crash del guest con el juego quieto (pendiente, sin investigar):**
-  `[FATAL] Call to invalid or unregistered function at guest address 0x00000000`, hilo Main XThread,
-  `xstart → sub_82441CC8 → sub_823C83F8` (el ejecutor de la lista de comandos 0x82909650). Pasó 2 veces
-  (2026-10-01, 21:48 y 22:06), las dos con el juego quieto o en pausa en carrera; no depende de la resolución
-  ni de la GPU. Hipótesis: los hooks del traspaso de fotograma de `app/src/nfsmw_espera_fotograma.cpp`
-  (`nfsmw_ejecutor_sin_vueltas`, `nfsmw_espera_fotograma_bloqueante`, bandera 0x82A2CF40) con el orden de memoria
-  débil de ARM y fotogramas lentos: el ejecutor lee una entrada de la lista antes de que el preparador la publique.
-  Test propuesto: apagar las dos cvars y dejar la carrera quieta 5 min; si no crashea, poner barreras
-  acquire/release en la bandera en lugar de quitar los hooks.
+- **Crash del guest `Call to invalid or unregistered function at guest address 0x00000000` (arreglado
+  2026-10-02, en observación):** hilo Main XThread, `xstart → sub_82441CC8 → sub_823C83F8+276`, 8 veces idéntico
+  entre el 01/10 y el 02/10, en carrera y con el juego quieto. Causa: la lista de comandos 0x82909650. El
+  preparador (`sub_823C8378`) copia la entrada, escribe función y tamaño, mueve el final (+20) y suma el contador
+  (+0) sin barrera (el recompilador además no emite nada para `eieio`/`lwsync`); el ejecutor (`sub_823C83F8`) ve
+  contador > ejecutadas y llama a la función de la entrada. En x86 el orden de las escrituras se respeta; en ARM
+  el ejecutor podía ver el contador antes que la entrada (función 0). Arreglo en
+  `app/src/nfsmw_espera_fotograma.cpp`, solo Android: hook de `sub_823C8378` que hace lo mismo con barreras
+  release antes de publicar final y contador, y lectura acquire del contador antes de llamar al ejecutor.
+  Primera prueba: carrera contra 3 y varios minutos quieto sin crash. Si reaparece, mirar otros productores de la
+  lista (escriben en 0x82909650 desde varias funciones) y la Switch (también ARM, sin el arreglo).
 
 ---
 

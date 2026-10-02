@@ -208,6 +208,20 @@ uint32_t Leer32(const uint8_t* base, uint32_t direccion) {  // direccion < 0xE00
   return __builtin_bswap32(v);
 }
 
+#if defined(__ANDROID__)
+void Escribir32(uint8_t* base, uint32_t direccion, uint32_t valor) {
+  const uint32_t v = __builtin_bswap32(valor);
+  std::memcpy(base + direccion, &v, sizeof(v));
+}
+
+// A read followed by an acquire barrier: what other threads published before their release is visible after it.
+uint32_t LeerAdquirir32(const uint8_t* base, uint32_t direccion) {
+  const uint32_t v = Leer32(base, direccion);
+  std::atomic_thread_fence(std::memory_order_acquire);
+  return v;
+}
+#endif
+
 // Whether someone is waiting is checked with the lock held (as in nfsmw_espera_anillo.cpp): without the
 // lock, each side may not yet see what the other wrote and the notification is lost; here it would cost
 // the maximum time, a stutter of up to 1 ms.
@@ -412,7 +426,56 @@ REX_HOOK_RAW(sub_823C83F8) {
       nfsmw::esperas::Sumar(nfsmw::esperas::kEjecutorSinOrdenes, ns_sin_ordenes);
     }
   }
+#if defined(__ANDROID__)
+  // See the sub_823C8378 hook: everything the preparer published up to the count it released is visible from
+  // here on. The caller computed r4 from an earlier, plain read of +0, so its entries are all covered.
+  if (ctx.r4.u32 != 0) {
+    LeerAdquirir32(base, ctx.r3.u32);
+  }
+#endif
   __imp__sub_823C83F8(ctx, base);
+}
+
+/*
+ * ARM: the preparer's stores into the command list could become visible out of order (Android only).
+ *
+ * sub_823C8378 appends a command to the list 0x82909650: it copies the payload to the end pointer (+20),
+ * writes the function (+0 of the entry) and the size (+4), moves the end pointer and only then increments the
+ * written count (+0 of the list). The executor (sub_823C83F8) runs while written != executed, reading the
+ * entry's function and calling it. The PowerPC code has no barrier there (the recompiler emits nothing for
+ * eieio/lwsync anyway), and x86 keeps store order, so it never failed on PC. On ARM the executor could see the
+ * new count before the entry: "Call to invalid or unregistered function at guest address 0x00000000" in
+ * sub_823C83F8+276, eight times on the Samsung A32 (2026-10-01/02), always that exact spot.
+ *
+ * Here the open-list path is done as the game does it, with a release barrier before publishing the end
+ * pointer and the count; the closed-list path (the command runs at once) is the original's.
+ */
+REX_EXTERN(__imp__sub_823C8378);
+REX_HOOK_RAW(sub_823C8378) {
+#if defined(__ANDROID__)
+  constexpr uint32_t kLista = 0x82909650;
+  if (Leer32(base, kLista + 12) != 0) {
+    const uint32_t datos = ctx.r4.u32;
+    const uint32_t funcion = ctx.r5.u32;
+    const uint32_t tamano = (ctx.r6.u32 + 15) & ~15u;
+    const uint32_t entrada = Leer32(base, kLista + 20);
+    std::memmove(base + entrada, base + datos, tamano);
+    Escribir32(base, entrada, funcion);
+    Escribir32(base, entrada + 4, tamano);
+    std::atomic_thread_fence(std::memory_order_release);
+    Escribir32(base, kLista + 20, entrada + tamano);
+    const uint32_t escritas = Leer32(base, kLista);
+    std::atomic_thread_fence(std::memory_order_release);
+    Escribir32(base, kLista, escritas + 1);
+    // The registers the original leaves behind, in case a caller looks at them.
+    ctx.r3.u64 = entrada;
+    ctx.r5.u64 = tamano;
+    ctx.r6.u64 = escritas + 1;
+    ctx.r11.u64 = escritas;
+    return;
+  }
+#endif
+  __imp__sub_823C8378(ctx, base);
 }
 
 // Right after the flag is set to 1 (sub_82442058).
