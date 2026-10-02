@@ -55,16 +55,21 @@ final class GameOptions {
     // e.g. the Helio G80's Mali-G52) when the player has not chosen a value. It only ever lowers quality, and
     // only on GPUs the port expects to struggle; a chosen value always wins.
     static final Option[] ALL = {
-            new Option(RESOLUTION, "Resolución interna", "nfsmw_resolucion_interna", "1280x720", "1024x576",
-                    new String[] {"640x360", "1024x576", "1280x720", "1920x1080"},
-                    new String[] {"640x360 · máximo rendimiento", "1024x576 · rendimiento", "1280x720 · equilibrado",
-                            "1920x1080 · máxima calidad"}),
+            // 896x504, 960x540 and 1024x576 are drawn for real (the game's mode 1, nfsmw_render_escena_nativa in
+            // profileArguments); 640x360 only shrinks the 1280x720 scene when resolving.
+            new Option(RESOLUTION, "Resolución de renderizado", "nfsmw_resolucion_interna", "1280x720", "1024x576",
+                    new String[] {"896x504", "960x540", "1024x576", "1280x720", "1920x1080", "640x360"},
+                    new String[] {"896x504 · máximo rendimiento", "960x540 · más rendimiento",
+                            "1024x576 · rendimiento", "1280x720 · equilibrado, la de Xbox 360",
+                            "1920x1080 · máxima calidad",
+                            "640x360 · solo baja el posproceso, la escena sigue a 1280x720"}),
             // The swapchain height (vulkan_swapchain_alto_max): the picture goes to the screen scaled by the
             // display hardware instead of the GPU painting every screen pixel.
-            new Option("output_resolution", "Resolución de salida", "vulkan_swapchain_alto_max", "0", "720",
-                    new String[] {"0", "1080", "720", "576"},
+            new Option("output_resolution", "Escala de salida", "vulkan_swapchain_alto_max", "0", "720",
+                    new String[] {"0", "1080", "720", "576", "540"},
                     new String[] {"Nativa · la de la pantalla", "1080p · escalada por hardware",
-                            "720p · escalada por hardware, más rendimiento", "576p · máximo rendimiento"}),
+                            "720p · escalada por hardware, más rendimiento", "576p · más rendimiento",
+                            "540p · máximo rendimiento"}),
             new Option(FPS, "Límite de FPS", "nfsmw_limite_fps", "60",
                     new String[] {"30", "40", "45", "60", "90", "120"},
                     new String[] {"30 FPS · ahorra batería", "40 FPS · estable, calienta menos",
@@ -118,10 +123,27 @@ final class GameOptions {
             new Option("volume", "Volumen del juego", "audio_ganancia_pct", "100",
                     new String[] {"100", "125", "150", "200"},
                     new String[] {"Normal", "Alto", "Muy alto", "Máximo · puede saturar"}),
-            new Option("filter", "Filtro de imagen", "nfsmw_posproceso", "apagado",
+            new Option("filter", "Filtro de color", "nfsmw_posproceso", "apagado",
                     new String[] {"apagado", "cine", "vivo", "calido", "frio", "sepia", "noir", "crt"},
                     new String[] {"Sin filtro", "Cine", "Vivo", "Cálido", "Frío", "Sepia", "Blanco y negro",
                             "CRT"}),
+    };
+
+    /** The row that is not a game cvar: the picture stretched or 16:9 (MainActivity). */
+    static final String STRETCH = "@stretch";
+
+    /**
+     * How the launcher groups the options: a title, then the keys in order. An option missing from here still
+     * shows up, at the end.
+     */
+    static final String[][] SECTIONS = {
+            {"RENDERIZADO", RESOLUTION, "aa", "texture_quality"},
+            {"PANTALLA Y ESCALA", "output_resolution", STRETCH, "filter"},
+            {"RENDIMIENTO", FPS, SHOW_FPS},
+            {"LUCES Y EFECTOS", "shadows", "bloom", "sky", "smoke", "road_reflection"},
+            {"REFLEJOS", "car_reflections", "car_reflections_content", "car_reflections_fixed_brightness",
+                    "rear_mirror"},
+            {"AUDIO", "volume"},
     };
 
     private static final String PREFS = "nfsmw_game";
@@ -195,9 +217,10 @@ final class GameOptions {
             // vkQueuePresentKHR; on the render thread that serialized CPU and GPU (100+ ms frames dropped
             // from ~17.6 to ~4.7 a minute in free roam with it, and the game never waited for the presenter).
             args.add("--present_hilo_propio=true");
-            // With "1024x576" the game really draws at 1024x576 (its own mode 1) instead of drawing at 1280x720
-            // and shrinking when resolving: 36 % fewer scene pixels where the GPU is the limit.
-            args.add("--nfsmw_render_1024_nativo=true");
+            // With "1024x576", "960x540" or "896x504" the game really draws the scene at that size (its own mode
+            // 1) instead of drawing at 1280x720 and shrinking when resolving: 36-51 % fewer scene pixels where
+            // the GPU is the limit.
+            args.add("--nfsmw_render_escena_nativa=true");
         }
         return args;
     }

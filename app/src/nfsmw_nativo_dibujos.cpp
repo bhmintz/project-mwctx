@@ -1236,9 +1236,9 @@ std::atomic<bool> g_nativo_modo_mali{false};
 std::atomic<bool> g_retrovisor_apagado{false};
 // nfsmw_cubemap_contenido = 4 in a race (set by nfsmw_recortes_carrera.cpp): the car reflects CuboFijo.
 std::atomic<bool> g_reflejo_fijo{false};
-// The game draws the scene in its own 1024x576 mode (nfsmw_render_1024_nativo, set by nfsmw_render_targets.cpp):
-// the scene render target is 1024 wide, not 1280.
-std::atomic<bool> g_escena_1024{false};
+// The game draws the scene in its own mode 1 (nfsmw_render_escena_nativa, set by nfsmw_render_targets.cpp): the
+// scene render target is this wide (1024, 960 or 896) instead of 1280; 0 when not in use.
+std::atomic<uint32_t> g_escena_ancho{0};
 namespace {
 
 /*
@@ -1254,10 +1254,11 @@ inline uint32_t CategoriaDeDestino(uint32_t pitch, const uint64_t* claves) {
   if (!color && claves[4] && pitch >= 1600) {
     return kGpuSombras;
   }
-  // The scene is 1280 wide, or 1024 in the game's own 1024x576 mode (nfsmw_render_1024_nativo). EDRAM pitches are
-  // multiples of 80, so that one is 1040; with depth, because the 1040 front buffer passes (HUD, composite) are
-  // there too.
-  if (pitch >= 1280 || ((pitch == 1024 || pitch == 1040) && claves[4] && g_escena_1024.load(std::memory_order_relaxed))) {
+  // The scene is 1280 wide, or the width of the game's mode 1 (nfsmw_render_escena_nativa). EDRAM pitches are
+  // multiples of 80 (1024 -> 1040, 896 -> 960); with depth, because the front buffer passes of that same pitch
+  // (HUD, composite) are there too.
+  const uint32_t ancho_escena = g_escena_ancho.load(std::memory_order_relaxed);
+  if (pitch >= 1280 || (ancho_escena && claves[4] && pitch >= ancho_escena && pitch < ancho_escena + 80)) {
     return claves[4] ? kGpuEscena : kGpuEscenaSinProfundidad;
   }
   if (pitch >= 640) {

@@ -30,7 +30,8 @@ REXCVAR_DEFINE_STRING(nfsmw_resolucion_interna, kResolucionInternaPredeterminada
                       "Lo que ahorra es el posproceso, las copias y el cubo; la escena no se mueve. De 1280x720 a "
                       "1024x576 son 2,14 ms reales y el posproceso ya baja a 0,03, asi que por debajo queda poco "
                       "que rascar y el escalado si se ve")
-    .allowed({"automatico", "1280x720", "1920x1080", "1024x576", "640x360", "640x480"});
+    // 960x540 and 896x504 (Android): drawn for real through the game's mode 1 (nfsmw_render_escena_nativa).
+    .allowed({"automatico", "1280x720", "1920x1080", "1024x576", "960x540", "896x504", "640x360", "640x480"});
 
 /*
  * GPU MHz in handheld mode.

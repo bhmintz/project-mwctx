@@ -680,6 +680,7 @@ namespace nfsmw::nativo {
 // Frames of the game handed to the screen (each Swap that paints its image), for the launcher's FPS counter
 // (android_touch.cpp). Only ever incremented; the reader works with differences.
 std::atomic<uint64_t> g_fotogramas_mostrados{0};
+extern std::atomic<uint32_t> g_escena_ancho;  // nfsmw_nativo_dibujos.cpp (nfsmw_render_escena_nativa)
 namespace shaders {
 // The same SPIR-V the SDK presenter uses to draw the game image
 // (vulkan_presenter.cpp:128-141).
@@ -1668,10 +1669,18 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       // It only shrinks when the scene really has to be reduced (by a factor of 1.25 or more) and both images
       // are color: vkCmdBlitImage with a linear filter on a depth target is not valid and brings the process
       // down. Mismatches of a few pixels (320x184 -> 320x180) are still cropped as always.
+      //
+      // The other way round with nfsmw_render_escena_nativa at 960x540 or 896x504: the game draws the scene at
+      // that size but its output and post-processing textures stay at 1024x576. Copied 1 to 1, the scene
+      // filled only the top-left corner of them, with the rest black and the HUD out of place. The resolve of
+      // the whole scene is stretched to the texture instead, so everything after it sees a full image.
+      const uint32_t ancho_escena = g_escena_ancho.load(std::memory_order_relaxed);
+      const bool agrandar = ancho_escena != 0 && x0 == 0 && y0 == 0 && dx == 0 && dy == 0 &&
+                            pedido_ancho == ancho_escena && pedido_ancho < cabe_ancho && pedido_alto < cabe_alto;
       const bool encoger = blit_ != nullptr && cabe_ancho && cabe_alto &&
                            destino_render->formato == kFormatoColor &&
                            resuelta->imagen.formato == kFormatoColor &&
-                           (pedido_ancho * 4 >= cabe_ancho * 5 || pedido_alto * 4 >= cabe_alto * 5);
+                           (agrandar || pedido_ancho * 4 >= cabe_ancho * 5 || pedido_alto * 4 >= cabe_alto * 5);
       if (encoger && uint32_t(x0) < destino_render->ancho && uint32_t(y0) < destino_render->alto) {
         // nfsmw_nativo_frontal_perezoso. If this texture had a deferred copy, it is dropped if this resolve
         // covers it entirely, and recorded first otherwise.
@@ -1689,8 +1698,8 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
         ++copias_;
         ++reducciones_;
         if (reducciones_ <= 4) {
-          REXLOG_INFO("[resolucion] la escena de {}x{} se encoge a {}x{} al resolverla (superescalado)",
-                      pedido_ancho, pedido_alto, cabe_ancho, cabe_alto);
+          REXLOG_INFO("[resolucion] la escena de {}x{} se {} a {}x{} al resolverla", pedido_ancho, pedido_alto,
+                      agrandar ? "estira" : "encoge (superescalado)", cabe_ancho, cabe_alto);
         }
         AnotarCopia(cabe_ancho, cabe_alto);
         // A linear-filter blit reads the large rectangle and writes the small one, so it costs more than a copy

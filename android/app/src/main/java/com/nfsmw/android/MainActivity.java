@@ -311,22 +311,54 @@ public final class MainActivity extends Activity {
 
     private void refreshOptions() {
         optionsList.removeAllViews();
-        for (GameOptions.Option option : GameOptions.ALL) {
-            String value = GameOptions.get(this, option.key);
-            // The row shows only the short name ("720p", "Optimizado"); the part after " · " describes the
-            // choice and stays in the list the row opens, so long labels do not stretch the row.
-            String shown = option.label(value);
-            int note = shown.indexOf(" · ");
-            if (note > 0) shown = shown.substring(0, note);
-            optionsList.addView(optionRow(option.title, shown, () -> chooseOption(option)));
+        java.util.Set<String> shownKeys = new java.util.HashSet<>();
+        for (String[] section : GameOptions.SECTIONS) {
+            optionsList.addView(sectionHeader(section[0]));
+            for (int i = 1; i < section.length; i++) {
+                shownKeys.add(section[i]);
+                if (section[i].equals(GameOptions.STRETCH)) {
+                    addStretchRow();
+                } else {
+                    addOptionRow(GameOptions.find(section[i]));
+                }
+            }
         }
+        boolean header = false;
+        for (GameOptions.Option option : GameOptions.ALL) {
+            if (shownKeys.contains(option.key)) continue;
+            if (!header) {
+                optionsList.addView(sectionHeader("OTRAS"));
+                header = true;
+            }
+            addOptionRow(option);
+        }
+    }
+
+    private void addOptionRow(GameOptions.Option option) {
+        String value = GameOptions.get(this, option.key);
+        // The row shows only the short name ("720p", "Optimizado"); the part after " · " describes the
+        // choice and stays in the list the row opens, so long labels do not stretch the row.
+        String shown = option.label(value);
+        int note = shown.indexOf(" · ");
+        if (note > 0) shown = shown.substring(0, note);
+        optionsList.addView(optionRow(option.title, shown, () -> chooseOption(option)));
+    }
+
+    private void addStretchRow() {
         SharedPreferences controls = getSharedPreferences("nfsmw_controls", MODE_PRIVATE);
         boolean stretch = controls.getBoolean("stretch", true);
         optionsList.addView(optionRow("Formato de imagen",
-                stretch ? "Estirada a toda la pantalla" : "Original 16:9", () -> {
+                stretch ? "Estirada" : "Original 16:9", () -> {
                     controls.edit().putBoolean("stretch", !stretch).apply();
                     refreshOptions();
                 }));
+    }
+
+    private View sectionHeader(String title) {
+        TextView header = label(title, 11, 0x99FFFFFF, true);
+        header.setLetterSpacing(0.08f);
+        header.setPadding(dp(4), optionsList.getChildCount() == 0 ? dp(2) : dp(16), 0, dp(2));
+        return header;
     }
 
     private void chooseOption(GameOptions.Option option) {
