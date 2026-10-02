@@ -539,6 +539,7 @@ public final class TouchControlsView extends View {
                 lt == lastLT && rt == lastRT) {
             return;
         }
+        final boolean pressesChanged = buttons != lastButtons || lt != lastLT || rt != lastRT;
         lastButtons = buttons;
         lastLX = lx;
         lastLY = ly;
@@ -547,7 +548,31 @@ public final class TouchControlsView extends View {
         lastLT = lt;
         lastRT = rt;
         nativeSetTouchState(buttons, lx, ly, rx, ry, lt, rt);
+        requestRedraw(pressesChanged);
+    }
+
+    /*
+     * Redraws of the overlay. Every stick move or tilt sample used to redraw the whole view, up to once per
+     * vsync: on the Samsung A32 the UI thread and RenderThread took 20-50 ms of CPU each per 150 ms, on the
+     * same two big cores as the game's render thread, which showed up in its stutters. A press redraws at once;
+     * knob movement at most every 33 ms. The input sent to the game is not throttled, only the drawing.
+     */
+    private static final long KNOB_REDRAW_NS = 33_000_000L;
+    private long lastRedrawNs;
+    private boolean redrawPosted;
+    private final Runnable delayedRedraw = () -> {
+        redrawPosted = false;
         invalidate();
+    };
+
+    private void requestRedraw(boolean now) {
+        long elapsed = System.nanoTime() - lastRedrawNs;
+        if (now || elapsed >= KNOB_REDRAW_NS) {
+            invalidate();
+        } else if (!redrawPosted) {
+            redrawPosted = true;
+            postDelayed(delayedRedraw, Math.max(1L, (KNOB_REDRAW_NS - elapsed) / 1_000_000L));
+        }
     }
 
     private static int axis(float v) {
@@ -563,6 +588,7 @@ public final class TouchControlsView extends View {
     @Override
     protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
+        lastRedrawNs = System.nanoTime();
         if (hiddenByGamepad && !editing) {
             return;
         }

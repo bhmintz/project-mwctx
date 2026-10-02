@@ -66,6 +66,8 @@ set(NFSMW_SOURCES
     # The game's D3D waits without spinning: sleeps until the PM4 ring thread advances
     # (cvar nfsmw_espera_anillo_bloqueante).
     src/nfsmw_espera_anillo.cpp
+    # Android: the ring thread's priority and which threads take its core in a stutter.
+    src/nfsmw_hilos_android.cpp
     # Frame handoff between the game's two threads without a Sleep(0) loop
     # (cvar nfsmw_espera_fotograma_bloqueante).
     src/nfsmw_espera_fotograma.cpp

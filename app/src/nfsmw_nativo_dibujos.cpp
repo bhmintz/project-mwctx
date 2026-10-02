@@ -2739,6 +2739,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       MarcaSonda sonda(modo_mali_, "pool_texturas_.Iniciar", -1, -1);
       pool_texturas_.Iniciar(dispositivo_, texturas_mb_max_);
       pool_texturas_.ActivarLiberarVacios(modo_mali_);  // phones: give empty slabs back (RAM pressure)
+      pool_texturas_.ActivarHiloDeBloques(modo_mali_);  // and allocate new ones off the ring thread
     }
     PasoSonda("pool de texturas iniciado");
     MarcaSonda sonda(modo_mali_, "CrearVacias", -1, -1);
@@ -10835,11 +10836,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
      */
     if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED) {
       // Mali mode without BC sampling: the image is the decoded format (never the hash thread's path).
-      std::vector<uint8_t> decodificado;
+      // Into bc_decodificado_, which keeps its capacity: a new vector per texture was fresh pages every time
+      // (simpleperf on the A32: 62 % of the ring's page faults, ~20 MB and ~90 ms per big texture).
       DecodificarBc(textura.bc_en_cpu, textura.imagen.ancho, textura.imagen.alto,
                     textura.capas * (textura.fondo ? textura.fondo : 1), textura.niveles, textura.datos,
-                    textura.desplazamiento_nivel, decodificado);
-      textura.datos.swap(decodificado);
+                    textura.desplazamiento_nivel, bc_decodificado_);
+      textura.datos.swap(bc_decodificado_);
     }
     if (textura.huella_trabajo && textura.huella_trabajo != kTrabajoHuellaPublicado) {
       const size_t bytes = BytesHuellaPlaneada(textura);
@@ -10891,6 +10893,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     // again or touch fresh pages); the other is released.
     if (textura.datos.capacity() > temporal_.capacity()) {
       temporal_.swap(textura.datos);
+    }
+    // Mali mode: the second one is kept for the BC decode (the two buffers settle at the biggest sizes in a
+    // few textures), unless it is huge (a one-off texture is not worth pinning that much RAM).
+    if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED && textura.datos.capacity() > bc_decodificado_.capacity() &&
+        textura.datos.capacity() <= kMaxBufferReciclado) {
+      bc_decodificado_.swap(textura.datos);
     }
     std::vector<uint8_t>().swap(textura.datos);
     ++subidas_textura_;
@@ -13722,6 +13730,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   std::array<bool, 1024> sesgos_vistos_{};
   std::vector<Textura*> texturas_a_subir_;
   std::vector<uint8_t> temporal_;
+  std::vector<uint8_t> bc_decodificado_;  // SubirTextura, Mali mode: destination of DecodificarBc, reused
+  static constexpr size_t kMaxBufferReciclado = size_t(32) << 20;
   std::vector<uint32_t, SinInicializar<uint32_t>> indices_;
   std::vector<uint32_t, SinInicializar<uint32_t>> convertidos_;
   std::vector<uint16_t, SinInicializar<uint16_t>> indices16_;  // camino rapido: 16 bits sin convertir

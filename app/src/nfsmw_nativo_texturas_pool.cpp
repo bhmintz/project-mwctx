@@ -217,19 +217,24 @@ uint32_t PoolTexturas::SlabsVivos() const {
   return vivos;
 }
 
-bool PoolTexturas::CrearSlab(bool en_caliente) {
+bool PoolTexturas::HuecoParaSlab(size_t& hueco) const {
   if (!activo_ || SlabsVivos() >= slabs_tope_) {
     return false;
   }
   // A released slot is reused (its index is free: nothing points into it any more).
-  size_t hueco = slabs_.size();
+  hueco = slabs_.size();
   for (size_t i = 0; i < slabs_.size(); ++i) {
     if (slabs_[i].memoria == VK_NULL_HANDLE) {
       hueco = i;
       break;
     }
   }
-  if (hueco == slabs_.size() && slabs_.size() >= kMaxSlabs) {
+  return !(hueco == slabs_.size() && slabs_.size() >= kMaxSlabs);
+}
+
+bool PoolTexturas::CrearSlab(bool en_caliente) {
+  size_t hueco = 0;
+  if (!HuecoParaSlab(hueco)) {
     return false;
   }
   /*
@@ -248,7 +253,11 @@ bool PoolTexturas::CrearSlab(bool en_caliente) {
     ++slabs_fallados_;
     return false;
   }
+  InstalarSlab(hueco, memoria, en_caliente);
+  return true;
+}
 
+void PoolTexturas::InstalarSlab(size_t hueco, VkDeviceMemory memoria, bool en_caliente) {
   Slab slab;
   slab.memoria = memoria;
   slab.unidades = slab_unidades_;
@@ -262,14 +271,80 @@ bool PoolTexturas::CrearSlab(bool en_caliente) {
   }
   if (en_caliente) {
     ++slabs_en_caliente_;
-    REXLOG_INFO("[nativo] C3: pool de texturas: bloque {} nuevo en caliente; ya van {} MB reservados",
-                hueco, (uint64_t(SlabsVivos()) * slab_bytes_) >> 20);
+    REXLOG_INFO("[nativo] C3: pool de texturas: bloque {} nuevo en caliente{}; ya van {} MB reservados",
+                hueco, hilo_bloques_.joinable() ? " (reservado en su hilo)" : "",
+                (uint64_t(SlabsVivos()) * slab_bytes_) >> 20);
   }
-  return true;
+}
+
+void PoolTexturas::ActivarHiloDeBloques(bool activar) {
+  if (!activar || !activo_ || hilo_bloques_.joinable()) {
+    return;
+  }
+  salir_bloques_ = false;
+  hilo_bloques_ = std::thread([this] { BucleBloques(); });
+}
+
+void PoolTexturas::BucleBloques() {
+  const auto& dfn = dispositivo_->functions();
+  std::unique_lock<std::mutex> l(mutex_bloques_);
+  for (;;) {
+    cv_bloques_.wait(l, [this] {
+      return salir_bloques_ || !bloques_a_liberar_.empty() ||
+             (pedido_bloque_ && bloque_listo_ == VK_NULL_HANDLE && !bloque_fallado_);
+    });
+    if (salir_bloques_) {
+      return;
+    }
+    std::vector<VkDeviceMemory> liberar;
+    liberar.swap(bloques_a_liberar_);
+    const bool reservar = pedido_bloque_ && bloque_listo_ == VK_NULL_HANDLE && !bloque_fallado_;
+    l.unlock();
+    for (VkDeviceMemory m : liberar) {
+      dfn.vkFreeMemory(device_, m, nullptr);
+    }
+    VkDeviceMemory memoria = VK_NULL_HANDLE;
+    bool fallo = false;
+    if (reservar) {
+      VkMemoryAllocateInfo reserva{};
+      reserva.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      reserva.allocationSize = slab_bytes_;
+      reserva.memoryTypeIndex = tipo_memoria_;
+      fallo = dfn.vkAllocateMemory(device_, &reserva, nullptr, &memoria) != VK_SUCCESS;
+    }
+    l.lock();
+    if (reservar) {
+      bloque_listo_ = memoria;
+      bloque_fallado_ = fallo;
+    }
+  }
+}
+
+void PoolTexturas::PararHiloDeBloques() {
+  if (!hilo_bloques_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> l(mutex_bloques_);
+    salir_bloques_ = true;
+  }
+  cv_bloques_.notify_one();
+  hilo_bloques_.join();
+  const auto& dfn = dispositivo_->functions();
+  for (VkDeviceMemory m : bloques_a_liberar_) {
+    dfn.vkFreeMemory(device_, m, nullptr);
+  }
+  bloques_a_liberar_.clear();
+  if (bloque_listo_ != VK_NULL_HANDLE) {
+    dfn.vkFreeMemory(device_, bloque_listo_, nullptr);
+    bloque_listo_ = VK_NULL_HANDLE;
+  }
+  pedido_bloque_ = false;
 }
 
 void PoolTexturas::Terminar() {
   if (device_ != VK_NULL_HANDLE) {
+    PararHiloDeBloques();
     const auto& dfn = dispositivo_->functions();
     for (Slab& slab : slabs_) {
       if (slab.memoria != VK_NULL_HANDLE) {
@@ -399,7 +474,16 @@ void PoolTexturas::LiberarSlabVacio(uint64_t fotograma) {
         fotograma < slab.vacio_desde + kFotogramasEntreSlabs) {
       continue;
     }
-    dispositivo_->functions().vkFreeMemory(device_, slab.memoria, nullptr);
+    if (hilo_bloques_.joinable()) {
+      // Unused for kFotogramasEntreSlabs frames, so the GPU is long done with it: freed on its thread.
+      {
+        std::lock_guard<std::mutex> l(mutex_bloques_);
+        bloques_a_liberar_.push_back(slab.memoria);
+      }
+      cv_bloques_.notify_one();
+    } else {
+      dispositivo_->functions().vkFreeMemory(device_, slab.memoria, nullptr);
+    }
     slab.memoria = VK_NULL_HANDLE;
     slab.unidades = 0;
     std::vector<uint64_t>().swap(slab.ocupadas);
@@ -419,6 +503,40 @@ void PoolTexturas::PorFotograma(uint64_t fotograma) {
   if (!activo_) {
     return;
   }
+  if (hilo_bloques_.joinable()) {
+    // A slab the thread finished is installed here, on the ring thread like the rest of the pool.
+    VkDeviceMemory listo = VK_NULL_HANDLE;
+    bool fallado = false;
+    bool en_camino = false;
+    {
+      std::lock_guard<std::mutex> l(mutex_bloques_);
+      if (pedido_bloque_ && (bloque_listo_ != VK_NULL_HANDLE || bloque_fallado_)) {
+        listo = bloque_listo_;
+        fallado = bloque_fallado_;
+        bloque_listo_ = VK_NULL_HANDLE;
+        bloque_fallado_ = false;
+        pedido_bloque_ = false;
+      }
+      en_camino = pedido_bloque_;
+    }
+    if (fallado) {
+      ++slabs_fallados_;
+    } else if (listo != VK_NULL_HANDLE) {
+      size_t hueco = 0;
+      if (HuecoParaSlab(hueco)) {
+        InstalarSlab(hueco, listo, true);
+      } else {
+        {
+          std::lock_guard<std::mutex> l(mutex_bloques_);
+          bloques_a_liberar_.push_back(listo);
+        }
+        cv_bloques_.notify_one();
+      }
+    }
+    if (en_camino) {
+      return;  // one at a time, and no release while one is on its way
+    }
+  }
   if (liberar_vacios_) {
     LiberarSlabVacio(fotograma);
   }
@@ -436,6 +554,17 @@ void PoolTexturas::PorFotograma(uint64_t fotograma) {
     return;
   }
   ultimo_crecimiento_ = fotograma;
+  if (hilo_bloques_.joinable()) {
+    size_t hueco = 0;
+    if (HuecoParaSlab(hueco)) {
+      {
+        std::lock_guard<std::mutex> l(mutex_bloques_);
+        pedido_bloque_ = true;
+      }
+      cv_bloques_.notify_one();
+    }
+    return;
+  }
   CrearSlab(true);
 }
 

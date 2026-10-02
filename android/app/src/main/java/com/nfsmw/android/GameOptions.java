@@ -159,6 +159,10 @@ final class GameOptions {
         List<String> args = new ArrayList<>();
         if (GpuInfo.isLowEnd(context)) {
             args.add("--nfsmw_nativo_sombras_escala=64");
+            // Present on the presenter's own thread. On the Mali-G52 the driver waits for the GPU inside
+            // vkQueuePresentKHR; on the render thread that serialized CPU and GPU (100+ ms frames dropped
+            // from ~17.6 to ~4.7 a minute in free roam with it, and the game never waited for the presenter).
+            args.add("--present_hilo_propio=true");
         }
         return args;
     }

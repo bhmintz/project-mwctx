@@ -27,6 +27,7 @@
 
 #include "nfsmw_nativo_destinos.h"
 #include "nfsmw_esperas_tiron.h"
+#include "nfsmw_hilos_android.h"  // ring priority and who takes its core in a stutter (Android)
 #include "nfsmw_nativo_shaders.h"  // Samplers of the PS (nfsmw_nativo_diag_lectores_s)
 #include "nfsmw_nativo_sincronizacion.h"
 #include "nfsmw_reflejo_demanda.h"  // road reflection only when it is read
@@ -55,6 +56,26 @@ extern "C" void RexSwitchPerfTiron(uint64_t inicio, uint64_t fin);
 #include <cmath>
 #include <cstring>
 #include <string>
+#if defined(__ANDROID__)
+#include <sched.h>
+#include <sys/resource.h>
+#include <cstdio>
+namespace {
+// /proc/thread-self/schedstat: ns on the CPU, ns runnable but waiting for a CPU, timeslices.
+bool LeerSchedstat(uint64_t& en_cpu_ns, uint64_t& esperando_ns) {
+  FILE* f = std::fopen("/proc/thread-self/schedstat", "re");
+  if (!f) {
+    return false;
+  }
+  unsigned long long a = 0, b = 0, c = 0;
+  const bool ok = std::fscanf(f, "%llu %llu %llu", &a, &b, &c) == 3;
+  std::fclose(f);
+  en_cpu_ns = a;
+  esperando_ns = b;
+  return ok;
+}
+}  // namespace
+#endif
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2025,6 +2046,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   bool Presentar(rex::ui::Presenter* presentador, const TexturaSwap& swap, uint32_t ancho,
                  uint32_t alto) override {
     nfsmw::reflejo_demanda::AnotarSwap();  // nfsmw_reflejo_bajo_demanda
+    nfsmw::hilos::AlPresentar();
     // The per-draw diagnostic window opens here, on the PM4 ring thread, which is the one that records the
     // draws. Inside the paint call it would be another thread and the window would catch an arbitrary piece
     // of the frame (33 of 500 shadow draws were measured).
@@ -2100,6 +2122,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
          */
         if (ms > 60.0 && avisos_tiron_ < 1000) {
           ++avisos_tiron_;
+          nfsmw::hilos::AnotarTiron(ms);
           /* gpu_ns_ are raw GPU timestamps: multiply by 1.627 to get real milliseconds (see docs/measuring.md). */
           const double gpu_ms = double(gpu_ns_ - tiron_gpu_ns_) / 1e6 * 1.627;
           // The three [tiron] lines go to the report thread (NFSMW_INFORME_ANILLO).
@@ -2183,7 +2206,51 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
                                delta(e::kPreparadorLista), veces(e::kPreparadorLista),
                                delta(e::kPreparadorEscenario), veces(e::kPreparadorEscenario),
                                delta(e::kPreparadorFuera), veces(e::kPreparadorFuera));
+#if defined(__ANDROID__)
+          /*
+           * Why the ring is slow in a stutter (Samsung A32, 2026-10-02). In the race stutters the ring had the
+           * usual ~2200 draws but took anywhere from 31 to 133 ms for them: the same work, four times the time.
+           * This thread's own counters tell which: CPU time close to the wall time with few switches is slow
+           * work (a little core or a low clock); CPU time far below it with forced switches is being preempted;
+           * major faults are pages coming back from swap (zram).
+           */
+          rusage uso{};
+          uint64_t en_cpu_ns = tiron_sched_cpu_ns_, espera_ns = tiron_sched_espera_ns_;
+          LeerSchedstat(en_cpu_ns, espera_ns);
+          if (getrusage(RUSAGE_THREAD, &uso) == 0) {
+            const auto us = [](const timeval& t) { return uint64_t(t.tv_sec) * 1000000u + uint64_t(t.tv_usec); };
+            NFSMW_INFORME_ANILLO("[tiron] hilo del anillo: CPU {:.1f} ms (usuario {:.1f}, sistema {:.1f}) de {:.1f} ms; "
+                                 "fallos de pagina {} menores y {} mayores; cambios de contexto {} voluntarios y {} "
+                                 "forzados; ahora en cpu{}; esperando turno (listo para correr, sin CPU) {:.1f} ms; "
+                                 "dormido o bloqueado {:.1f} ms",
+                                 double(us(uso.ru_utime) + us(uso.ru_stime) - tiron_us_cpu_) / 1000.0,
+                                 double(us(uso.ru_utime) - tiron_us_usuario_) / 1000.0,
+                                 double(us(uso.ru_stime) - (tiron_us_cpu_ - tiron_us_usuario_)) / 1000.0, ms,
+                                 uint64_t(uso.ru_minflt) - tiron_fallos_menores_,
+                                 uint64_t(uso.ru_majflt) - tiron_fallos_mayores_,
+                                 uint64_t(uso.ru_nvcsw) - tiron_cambios_voluntarios_,
+                                 uint64_t(uso.ru_nivcsw) - tiron_cambios_forzados_, sched_getcpu(),
+                                 double(espera_ns - tiron_sched_espera_ns_) / 1e6,
+                                 std::max(0.0, ms - double(en_cpu_ns - tiron_sched_cpu_ns_) / 1e6 -
+                                                   double(espera_ns - tiron_sched_espera_ns_) / 1e6));
+          }
+#endif
         }
+#if defined(__ANDROID__)
+        {
+          rusage uso{};
+          if (getrusage(RUSAGE_THREAD, &uso) == 0) {
+            const auto us = [](const timeval& t) { return uint64_t(t.tv_sec) * 1000000u + uint64_t(t.tv_usec); };
+            tiron_us_usuario_ = us(uso.ru_utime);
+            tiron_us_cpu_ = us(uso.ru_utime) + us(uso.ru_stime);
+            tiron_fallos_menores_ = uint64_t(uso.ru_minflt);
+            tiron_fallos_mayores_ = uint64_t(uso.ru_majflt);
+            tiron_cambios_voluntarios_ = uint64_t(uso.ru_nvcsw);
+            tiron_cambios_forzados_ = uint64_t(uso.ru_nivcsw);
+            LeerSchedstat(tiron_sched_cpu_ns_, tiron_sched_espera_ns_);
+          }
+        }
+#endif
         for (uint32_t t = 0; t < nfsmw::esperas::kNumTipos; ++t) {
           tiron_esperas_ns_[t] = nfsmw::esperas::g_ns[t].load(std::memory_order_relaxed);
           tiron_esperas_veces_[t] = nfsmw::esperas::g_veces[t].load(std::memory_order_relaxed);
@@ -6592,6 +6659,10 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   uint64_t tiron_ns_esperas_gpu_ = 0, tiron_ns_espera_salida_ = 0;
   uint64_t tiron_bytes_huella_ = 0, tiron_huellas_aplazadas_ = 0;
   uint64_t tiron_dibujos_ = 0, tiron_ns_anillo_ = 0, tiron_ns_texturas_ = 0;
+  // The ring thread's getrusage at the previous frame (the "[tiron] hilo del anillo" line, Android).
+  uint64_t tiron_us_usuario_ = 0, tiron_us_cpu_ = 0, tiron_fallos_menores_ = 0, tiron_fallos_mayores_ = 0;
+  uint64_t tiron_cambios_voluntarios_ = 0, tiron_cambios_forzados_ = 0;
+  uint64_t tiron_sched_cpu_ns_ = 0, tiron_sched_espera_ns_ = 0;  // /proc/thread-self/schedstat
   uint64_t tiron_texturas_subidas_ = 0, tiron_bytes_subidos_ = 0, tiron_texturas_creadas_ = 0;
   uint64_t tiron_ns_huella_cruda_ = 0, tiron_ns_huella_datos_ = 0;
   uint64_t tiron_ns_esperando_copias_ = 0, tiron_esperas_copias_ = 0;

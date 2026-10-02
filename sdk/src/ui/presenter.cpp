@@ -13,6 +13,9 @@
 #include <atomic>
 #include <cctype>
 #include <utility>
+#if defined(__ANDROID__)
+#include <sys/resource.h>
+#endif
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -1901,6 +1904,12 @@ void Presenter::PaintThreadMain() {
     REXLOG_WARN("Presenter: present_hilo_prioridad = {} fuera de 0x1C-0x3B: se deja la de serie",
                 prioridad);
   }
+#elif defined(__ANDROID__)
+  // The same weight as the ring thread (nfsmw_android_nice_anillo): it only wakes to present, and has to
+  // do it at once, or the ring waits for it.
+  const int r = setpriority(PRIO_PROCESS, 0, -10);
+  REXLOG_INFO("[presentador] hilo propio en Android: nice {} ({})", getpriority(PRIO_PROCESS, 0),
+              r == 0 ? "ok" : "rechazado");
 #endif
   for (;;) {
     {

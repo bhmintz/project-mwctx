@@ -94,8 +94,11 @@
 
 #include <rex/ui/vulkan/device.h>
 
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace nfsmw::nativo {
@@ -199,6 +202,14 @@ class PoolTexturas {
    */
   void ActivarLiberarVacios(bool activar) { liberar_vacios_ = activar; }
 
+  /*
+   * Mali mode: slabs are allocated and freed on a thread of their own. On the Samsung A32 the driver touches
+   * the whole 16 MB inside vkAllocateMemory (~4100 page faults, ~20 ms of kernel time) and every slab
+   * created in a race was a 90-110 ms frame of the ring thread. The pool asks on one frame and installs the
+   * slab on a later one; the headroom (kHolguraBytes) covers the wait.
+   */
+  void ActivarHiloDeBloques(bool activar);
+
   // A texture did not fit (or the pool is off) and took the dedicated path.
   void AnotarDedicada() { ++texturas_dedicadas_; }
 
@@ -225,6 +236,10 @@ class PoolTexturas {
   static constexpr uint32_t kMaxSlabs = 255;
 
   bool CrearSlab(bool en_caliente);
+  bool HuecoParaSlab(size_t& hueco) const;
+  void InstalarSlab(size_t hueco, VkDeviceMemory memoria, bool en_caliente);
+  void BucleBloques();
+  void PararHiloDeBloques();
   uint32_t SlabsVivos() const;
   void LiberarSlabVacio(uint64_t fotograma);
   bool ElegirTipoDeMemoria(uint32_t& tipo_out, uint64_t& alineacion_vista_out) const;
@@ -243,6 +258,15 @@ class PoolTexturas {
   uint32_t slabs_iniciales_ = 0;
   uint64_t fotograma_ = 0;
   uint64_t slabs_liberados_ = 0;
+  // ActivarHiloDeBloques. The pool itself stays on the ring thread; only these fields are shared.
+  std::thread hilo_bloques_;
+  std::mutex mutex_bloques_;
+  std::condition_variable cv_bloques_;
+  bool salir_bloques_ = false;
+  bool pedido_bloque_ = false;                     // a slab was requested and has not been installed yet
+  VkDeviceMemory bloque_listo_ = VK_NULL_HANDLE;   // allocated by the thread, waiting for PorFotograma
+  bool bloque_fallado_ = false;
+  std::vector<VkDeviceMemory> bloques_a_liberar_;
 
   uint64_t texturas_vivas_ = 0;
   uint64_t texturas_colocadas_ = 0;
