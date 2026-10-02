@@ -31,9 +31,11 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 
-REXCVAR_DEFINE_INT32(nfsmw_sombras_cada, 1, "NFSMW",
-                     "Actualizar los mapas de sombras 1 de cada N fotogramas (1 = como el juego)")
-    .range(1, 8);
+REXCVAR_DEFINE_INT32(nfsmw_sombras_cada, 0, "NFSMW",
+                     "Actualizar los mapas de sombras 1 de cada N fotogramas (1 = como el juego). 0 = automatico: "
+                     "como 1, salvo en el modo Mali con nfsmw_nativo_mali_sin_sombras (sin sombras). -1 = sin "
+                     "sombras (el renderer nativo no graba el mapa)")
+    .range(-1, 8);
 
 /*
  * One cascade instead of two.

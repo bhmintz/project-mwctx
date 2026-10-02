@@ -783,7 +783,9 @@ REXCVAR_DEFINE_STRING(nfsmw_nativo_mali_ab_omitir_ps, "", "NFSMW",
                       "Modo Mali, diagnostico: huella del pixel shader (16 hex, la del informe por pase) cuyos dibujos "
                       "se saltan 10 s si y 10 s no, anotando los fps de cada tramo (C6 A/B omitir PS). Vacio = nada");
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sin_sombras, true, "NFSMW",
-                    "Modo Mali: no se graba el mapa de sombras (como nfsmw_nativo_omitir_sombras, solo en Mali)");
+                    "Modo Mali: no se graba el mapa de sombras (como nfsmw_nativo_omitir_sombras, solo en Mali) "
+                    "mientras nfsmw_sombras_cada sea 0 (automatico); la opcion de la app manda");
+REXCVAR_DECLARE(int32_t, nfsmw_sombras_cada);
 REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_texturas_mb_max, 256, "NFSMW",
                      "Modo Mali: tope de la cache de texturas en MB (el menor entre este y "
                      "nfsmw_nativo_texturas_mb_max). 0 = usar solo nfsmw_nativo_texturas_mb_max")
@@ -1145,6 +1147,12 @@ namespace nfsmw::nativo {
 // point where vertex deduplication must forget what it recorded.
 std::atomic<uint32_t> g_sincronizaciones_anillo{0};
 uint64_t g_diag_transferencias[kTrCampos] = {};
+// Whether the native renderer runs in Mali mode, for the guest-side hooks that tune the game for it
+// (nfsmw_recortes_carrera.cpp: nfsmw_retrovisor_cada). Set once in Inicializar.
+std::atomic<bool> g_nativo_modo_mali{false};
+// nfsmw_retrovisor_cada = -1 (set by nfsmw_recortes_carrera.cpp while in the game world): the mirror face is
+// no longer drawn, and in Mali mode the HUD quad that shows it is skipped too (OmitirCuadroRetrovisor).
+std::atomic<bool> g_retrovisor_apagado{false};
 namespace {
 
 /*
@@ -2644,6 +2652,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   bool Inicializar() {
     const auto& propiedades = dispositivo_->properties();
     modo_mali_ = DecidirModoMali(propiedades);
+    g_nativo_modo_mali.store(modo_mali_, std::memory_order_relaxed);
     cache_fetch_mascara_ = modo_mali_ ? cache_fetch_.size() - 1 : 4095;
     if (modo_mali_ && !REXCVAR_GET(nfsmw_nativo_mali_ab_omitir_ps).empty()) {
       ab_ps_ = std::strtoull(REXCVAR_GET(nfsmw_nativo_mali_ab_omitir_ps).c_str(), nullptr, 16);
@@ -3028,8 +3037,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (destino_sombras) {
       // Step 2 of the 30 FPS guard. Removing the whole pass does not flicker; skipping it on 2 of every
       // 3 frames does, which is why that step no longer exists.
-      bool omitir = nfsmw::guardia30::SinSombras(REXCVAR_GET(nfsmw_nativo_omitir_sombras) ||
-                                                 (modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_sin_sombras)));
+      // nfsmw_sombras_cada (nfsmw_recorte_sombras.cpp): -1 = off; 0 = automatic, off in Mali mode with
+      // nfsmw_nativo_mali_sin_sombras; 1 or more (an explicit choice in the app) = on.
+      const int32_t sombras_cada = REXCVAR_GET(nfsmw_sombras_cada);
+      bool omitir = nfsmw::guardia30::SinSombras(
+          REXCVAR_GET(nfsmw_nativo_omitir_sombras) || sombras_cada < 0 ||
+          (modo_mali_ && sombras_cada == 0 && REXCVAR_GET(nfsmw_nativo_mali_sin_sombras)));
       const int32_t alternar = REXCVAR_GET(nfsmw_nativo_omitir_sombras_alternar_s);
       if (!omitir && alternar > 0) {
         const auto segundos = std::chrono::duration_cast<std::chrono::seconds>(
@@ -3269,6 +3282,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (ab_ps_omitir_ && ps && ps->shader && ps->shader->huella == ab_ps_) {
       ++ab_ps_saltados_;
       return true;  // nfsmw_nativo_mali_ab_omitir_ps
+    }
+    if (omitir_retrovisor_ && ps && OmitirCuadroRetrovisor(r, *ps, cuenta)) {
+      return true;  // the mirror is off: its HUD quad is not drawn
     }
     uint32_t compartidas[kPalabrasCompartidas] = {};
     VkDeviceSize bytes_texturas = 0;
@@ -5453,6 +5469,50 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     fotograma_informe_pases_ = swaps;
   }
 
+  /*
+   * Rear-view mirror off (nfsmw_retrovisor_cada = -1, Mali mode only). The mirror is cubemap face view 20,
+   * resolved to kCaraRetrovisor (07B8A000, 256x256, ~205-229 draws per copy). With the face no longer drawn
+   * it would show a stale picture, so the draw that puts it on screen goes too: a quad that samples the cube.
+   * Cube samples of the same memory (the car's reflection) are left alone. Every combination of PS and
+   * dimension that samples the cubemap is logged once, so a miss can be fixed from the log.
+   */
+  static constexpr uint32_t kCuboPrimera = 0x07A4A000;
+  static constexpr uint32_t kCuboFin = 0x07BCA000;  // six 256x256 32-bit faces
+  static constexpr uint32_t kCaraRetrovisor = 0x07B8A000;
+  bool OmitirCuadroRetrovisor(const uint32_t* r, const EntradaShader& ps, uint32_t cuenta) {
+    for (const SamplerShader& sampler : ps.samplers) {
+      if (sampler.registro >= 16) {
+        continue;
+      }
+      const uint32_t* f = r + kRegFetch + uint32_t(sampler.registro) * 6;
+      if ((f[0] & 0x3) != uint32_t(xenos::FetchConstantType::kTexture)) {
+        continue;
+      }
+      const uint32_t direccion = (f[1] & 0xFFFFF000u) & 0x1FFFFFFFu;
+      if (direccion < kCuboPrimera || direccion >= kCuboFin) {
+        continue;
+      }
+      const uint32_t dimension = (f[5] >> 9) & 0x3;
+      // Measured on the A32: the quad is PS 472299F7823C20E8, 4 vertices, sampling the whole cube (dimension 3)
+      // into its own surface. Every other cube sampler is geometry (car body, 30+ vertices).
+      const bool omitir = (direccion == kCaraRetrovisor &&
+                           dimension == uint32_t(xenos::DataDimension::k2DOrStacked)) ||
+                          (dimension == uint32_t(xenos::DataDimension::kCube) && cuenta <= 6);
+      const uint64_t huella = ps.shader ? ps.shader->huella : 0;
+      if (diag_retrovisor_.size() < 32 && diag_retrovisor_.insert(huella ^ (uint64_t(direccion) << 2) ^ dimension).second) {
+        REXLOG_INFO("[nativo] retrovisor apagado: PS {:016X} muestrea 0x{:08X} (dimension {}, {} vertices, "
+                    "superficie {:08X}): {}",
+                    huella, direccion, dimension, cuenta, r[gr::XE_GPU_REG_RB_SURFACE_INFO],
+                    omitir ? "se omite" : "se deja");
+      }
+      if (omitir) {
+        ++retrovisor_omitidos_;
+        return true;
+      }
+    }
+    return false;
+  }
+
   // nfsmw_nativo_mali_ab_omitir_ps, per frame.
   void ElegirAbOmitirPs() {
     if (!ab_ps_) {
@@ -5657,6 +5717,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     desglose_fotograma_ = REXCVAR_GET(nfsmw_nativo_desglose_por_fence);
     ElegirSinBurbuja();
     ElegirAbOmitirPs();
+    omitir_retrovisor_ = modo_mali_ && g_retrovisor_apagado.load(std::memory_order_relaxed);
     // The cheap PCF bit also changes the pipeline: once per frame.
     {
       bool nuevo = REXCVAR_GET(nfsmw_nativo_pcf_barato);
@@ -14132,6 +14193,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   std::chrono::steady_clock::time_point ab_burbuja_inicio_{};
   uint64_t ab_burbuja_swaps_ = 0;
   uint64_t ab_burbuja_tramos_[2][2] = {};  // [sin burbuja][swaps, ms]
+  // nfsmw_retrovisor_cada = -1 (OmitirCuadroRetrovisor), per frame
+  bool omitir_retrovisor_ = false;
+  uint64_t retrovisor_omitidos_ = 0;
+  std::unordered_set<uint64_t> diag_retrovisor_;
   // nfsmw_nativo_mali_ab_omitir_ps
   uint64_t ab_ps_ = 0;
   bool ab_ps_omitir_ = false;

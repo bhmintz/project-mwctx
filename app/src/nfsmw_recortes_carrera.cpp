@@ -295,6 +295,24 @@ REXCVAR_DEFINE_BOOL(nfsmw_retrovisor_recorte, true, "NFSMW",
                     "juego le quita a el solo. Dibuja 415 objetos donde sus hermanas dibujan 6-95, y son el "
                     "19,6 % de los dibujos del fotograma");
 
+/*
+ * The mirror is drawn every frame with ~205 draws, ~16 % of a race frame (Samsung A32, C2 "caras resueltas").
+ * On the Mali the render thread's CPU per draw is the limit, so draws are what costs. Every 2 frames the
+ * mirror (a small strip at the top) refreshes at ~12 Hz with the game at ~25.
+ */
+REXCVAR_DEFINE_INT32(nfsmw_retrovisor_cada, 0, "NFSMW",
+                     "Cada cuantos fotogramas de carrera se dibujan las caras fijas del cubemap (el retrovisor, "
+                     "nfsmw_cubemap_caras_siempre). 0 = automatico: 2 en el modo Mali, 1 en el resto. -1 = "
+                     "desactivado: sin objetos (solo el fondo) y renovado cada 8 fotogramas")
+    .range(-1, 8);
+REXCVAR_DEFINE_BOOL(nfsmw_retrovisor_ab, false, "NFSMW",
+                    "Diagnostico: el retrovisor alterna entre todos los fotogramas y 1 de cada 2 en cada informe de "
+                    "carrera (10 s), para comparar fps en la misma carrera");
+REXCVAR_DEFINE_INT32(nfsmw_retrovisor_detalle_minimo, 0, "NFSMW",
+                     "Objetos de menos de N pixeles que no se dibujan en el retrovisor (vista 20), como "
+                     "nfsmw_cubemap_detalle_minimo en las caras que rotan. 0 = el valor del juego")
+    .range(0, 64);
+
 REXCVAR_DEFINE_INT32(nfsmw_cubemap_caras_siempre, REX_PLATFORM_SWITCH != 0 ? 4 : 0, "NFSMW",
                      "Caras del mapa de entorno que se actualizan todos los fotogramas aunque haya "
                      "limite (bit i = cara i de la tabla del juego; no cuentan para "
@@ -336,8 +354,37 @@ REXCVAR_DEFINE_INT32(nfsmw_cubemap_diag_ciclo_s, 0, "NFSMW",
                      "retrovisor")
     .range(0, 60);
 
+namespace nfsmw::nativo {
+extern std::atomic<bool> g_nativo_modo_mali;
+extern std::atomic<bool> g_retrovisor_apagado;
+}
+
 namespace nfsmw::recortes_carrera {
 namespace {
+
+bool g_retrovisor_ab_cada2 = false;  // nfsmw_retrovisor_ab: the mode of the current report window
+
+// nfsmw_retrovisor_cada = -1: once the six faces have been drawn (the car reflection needs that first
+// round), the mirror face is never drawn again, and the native renderer skips the HUD quad that shows it
+// (g_retrovisor_apagado, Mali mode).
+bool RetrovisorApagado() {
+  return !REXCVAR_GET(nfsmw_retrovisor_ab) && REXCVAR_GET(nfsmw_retrovisor_cada) < 0;
+}
+
+int32_t RetrovisorCada() {
+  if (REXCVAR_GET(nfsmw_retrovisor_ab)) {
+    return g_retrovisor_ab_cada2 ? 2 : 1;
+  }
+  const int32_t pedido = REXCVAR_GET(nfsmw_retrovisor_cada);
+  if (pedido > 0) {
+    return pedido;
+  }
+  return nfsmw::nativo::g_nativo_modo_mali.load(std::memory_order_relaxed) ? 2 : 1;
+}
+
+// nfsmw_retrovisor_detalle_minimo, on the pinned faces only (the mirror). Same learn-then-write rule as
+// AjustarDetalleCubo: only overwrite the game's value or ours.
+void AjustarDetalleRetrovisor(uint8_t* base, uint32_t cara, uint32_t vista);
 
 constexpr uint32_t kBaseVistas = 0x82A38070;
 constexpr uint32_t kBytesPorVista = 112;
@@ -473,6 +520,9 @@ void ContarRetrovisor(const uint8_t* base) {
                 double(ahora - g_retrovisor.desde_ms) / 1000.0, g_retrovisor.fotogramas,
                 g_retrovisor.actualizada,
                 100.0 * double(g_retrovisor.actualizada) / double(std::max<uint32_t>(g_retrovisor.fotogramas, 1)));
+    if (REXCVAR_GET(nfsmw_retrovisor_ab)) {
+      g_retrovisor_ab_cada2 = !g_retrovisor_ab_cada2;  // the next window in the other mode
+    }
     g_retrovisor = {ahora, 0, 0};
   }
 }
@@ -596,6 +646,31 @@ void AjustarDetalleCubo(uint8_t* base, uint32_t tabla, uint32_t cara, uint32_t v
                 "que rotan (el juego usa {}); las caras fijas no se tocan",
                 deseado, kDetalleMinimoJuego);
   }
+}
+
+void AjustarDetalleRetrovisor(uint8_t* base, uint32_t cara, uint32_t vista) {
+  const int32_t pedido = REXCVAR_GET(nfsmw_retrovisor_detalle_minimo);
+  if (cara >= kCaras || (pedido <= 0 && g_detalle_aplicado[cara] == 0)) {
+    return;
+  }
+  const int32_t actual = int32_t(Leer32(base, vista + kOffDetalleMinimo));
+  if (g_detalle_del_juego[cara] < 0) {
+    if (actual <= 0 || actual > 64) {
+      return;
+    }
+    g_detalle_del_juego[cara] = actual;
+  }
+  const int32_t deseado = pedido > 0 ? pedido : g_detalle_del_juego[cara];
+  if (actual == deseado || (actual != g_detalle_del_juego[cara] && actual != g_detalle_aplicado[cara])) {
+    return;
+  }
+  Escribir32(base, vista + kOffDetalleMinimo, uint32_t(deseado));
+  // The game writes its value back every frame, so this runs every frame: logged only when it changes.
+  if (g_detalle_aplicado[cara] != deseado) {
+    REXLOG_INFO("[recortes] retrovisor (cara {}): objetos de menos de {} pixeles fuera (el juego usa {})", cara,
+                deseado, g_detalle_del_juego[cara]);
+  }
+  g_detalle_aplicado[cara] = deseado;
 }
 
 // Mirror diagnostic: a single active face, changing every 'ciclo_s' seconds.
@@ -945,6 +1020,26 @@ REX_HOOK_RAW(sub_8243C6E0) {
     const uint32_t vista = Leer32(base, tabla + 4 * i);
     if (EsVista(vista)) {
       AjustarDetalleCubo(base, tabla, i, vista, siempre);
+      if (siempre & (1u << i)) {
+        AjustarDetalleRetrovisor(base, i, vista);
+      }
+    }
+  }
+  // nfsmw_retrovisor_cada: the pinned faces skip frames once all faces have been drawn once (the first
+  // round is never trimmed, see below). Independent of nfsmw_cubemap_caras_max.
+  {
+    static uint64_t fotogramas = 0;
+    const int32_t cada = RetrovisorCada();
+    const bool apagado = RetrovisorApagado();
+    nfsmw::nativo::g_retrovisor_apagado.store(apagado, std::memory_order_relaxed);
+    ++fotogramas;
+    if (g_caras_estrenadas == kTodasLasCaras && (apagado || (cada > 1 && fotogramas % uint64_t(cada) != 0))) {
+      for (uint32_t i = 0; i < kCaras; ++i) {
+        const uint32_t vista = Leer32(base, tabla + 4 * i);
+        if ((siempre & (1u << i)) && EsVista(vista)) {
+          base[vista + kOffActiva] = 0;
+        }
+      }
     }
   }
   const int32_t ciclo_s = REXCVAR_GET(nfsmw_cubemap_diag_ciclo_s);
