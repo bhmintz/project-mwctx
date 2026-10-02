@@ -9,7 +9,9 @@
 //     Mali does not have (Int64, RuntimeDescriptorArray, PhysicalStorageBufferAddresses).
 //
 // Usage (Windows, node; DXC for Linux in WSL, spirv-val from the Android NDK):
-//   node tools/biblioteca_shaders_mali.mjs <game folder> <output .nfsp>
+//   node tools/biblioteca_shaders_mali.mjs <game folder> <output .nfsp> [--fp16]
+// --fp16: RelaxedPrecision on the fragment shaders' float math, except what feeds sampling, depth output and
+// integer conversions (tools/spirv_fp16.mjs). The modules are validated again after the patch.
 // Environment: WSL_DISTRO (Ubuntu), WSL_DXC (~/dxc/bin/dxc), SPIRV_VAL (NDK shader-tools spirv-val.exe).
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,8 +19,11 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+import { relajarPrecision } from './spirv_fp16.mjs';
 
-const [game, output] = process.argv.slice(2);
+const argumentos = process.argv.slice(2);
+const fp16 = argumentos.includes('--fp16');
+const [game, output] = argumentos.filter((a) => a !== '--fp16');
 if (!output) {
   console.error('uso: node tools/biblioteca_shaders_mali.mjs <carpeta del juego> <salida .nfsp>');
   process.exit(1);
@@ -49,6 +54,7 @@ const toWsl = (p) => {
 };
 const CAP_PROHIBIDAS = { 11: 'Int64', 5302: 'RuntimeDescriptorArray', 5347: 'PhysicalStorageBufferAddresses' };
 let compilados = 0;
+const fp16Total = { modulos: 0, relajadas: 0, protegidas: 0 };
 const dxc = {
   FS: {
     mkdirTree: (p) => fs.mkdirSync(local(p), { recursive: true }),
@@ -78,7 +84,25 @@ const dxc = {
       console.error(`spirv-val rechazo ${input}:\n${e.stderr}`);
       return 4;
     }
-    const spv = fs.readFileSync(local(out));
+    let spv = fs.readFileSync(local(out));
+    if (fp16) {
+      const r = relajarPrecision(new Uint32Array(spv.buffer, spv.byteOffset, spv.length >> 2));
+      if (r.relajadas) {
+        fs.writeFileSync(local(out), Buffer.from(r.spirv.buffer, r.spirv.byteOffset, r.spirv.byteLength));
+        try {
+          execFileSync(spirvVal, ['--target-env', 'vulkan1.1spv1.4', '--scalar-block-layout', local(out)],
+            { stdio: ['ignore', 'ignore', 'pipe'] });
+        } catch (e) {
+          console.error(`spirv-val rechazo ${input} tras FP16:
+${e.stderr}`);
+          return 4;
+        }
+        spv = fs.readFileSync(local(out));
+      }
+      fp16Total.relajadas += r.relajadas;
+      fp16Total.protegidas += r.protegidas;
+      if (r.relajadas) ++fp16Total.modulos;
+    }
     const w = new Uint32Array(spv.buffer, spv.byteOffset, spv.length >> 2);
     if (w[1] > 0x00010400) {
       console.error(`${input}: SPIR-V ${(w[1] >> 16) & 0xff}.${(w[1] >> 8) & 0xff} (> 1.4)`);
@@ -187,6 +211,10 @@ try {
   const library = await buildShaderLibrary(containers, modules, new Uint8Array(comun), (t) => console.log(t),
     blur.name.slice(0, -4));
   fs.writeFileSync(output, library);
+  if (fp16) {
+    console.log(`FP16: ${fp16Total.relajadas} resultados RelaxedPrecision en ${fp16Total.modulos} pixel shaders; ` +
+      `${fp16Total.protegidas} ids protegidos (muestreo, profundidad, enteros)`);
+  }
   console.log(`biblioteca Mali: ${library.length} bytes, SHA-256 ${sha(library)} -> ${output}`);
 } finally {
   fs.rmSync(work, { recursive: true, force: true });

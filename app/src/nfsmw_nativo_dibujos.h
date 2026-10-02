@@ -135,6 +135,9 @@ class ContextoDestinos {
   }
   // Submits what was recorded and continues in the other slot, with its upload buffer empty.
   virtual bool EnviarYEsperar() = 0;
+  // nfsmw_nativo_desglose_por_fence: submits what was recorded, waits for the GPU to finish everything and
+  // adds that wall time to the category (for GPUs without timestamps, such as the Mali-G52).
+  virtual void EnviarYMedir(uint32_t categoria) { (void)categoria; }
   // Waits for the GPU to finish everything pending and starts recording again. It is expensive (a
   // one-frame stutter), so it is only used as a last resort when memory runs out: with the GPU idle,
   // textures can be released regardless of when they were last used, because none is in use.
@@ -293,6 +296,8 @@ class DibujosVulkan {
   }
   // Right before submitting: closes the pass and publishes the upload buffer.
   virtual void AntesDeEnviar() = 0;
+  // Mali-G52 sub-mode (bounded descriptors, per-draw sets): ContextoDestinos adds its transfer barriers.
+  virtual bool ModoMali() const { return false; }
   // Starts work in that work slot. Its upload buffer starts over: the GPU has finished the last work
   // submitted with it.
   virtual void UsarRanura(uint32_t ranura) = 0;

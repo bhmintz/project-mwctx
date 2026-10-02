@@ -660,6 +660,54 @@ using FnBorrarProfundidad = void(VKAPI_PTR*)(VkCommandBuffer, VkImage, VkImageLa
 using FnBlit = void(VKAPI_PTR*)(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,
                                 uint32_t, const VkImageBlit*, VkFilter);
 
+/*
+ * Transfer barriers for the Mali-G52 (validation layers, SYNC-HAZARD-*).
+ *
+ * C2's copies, blits and clears go one after another on the same images with no barrier between them
+ * (copy after copy, a clear after a blit that read the image, the readback after the copy that filled it).
+ * Desktop GPUs and Adreno happen to serialize them; the Mali overlaps transfer commands. The wrappers below
+ * stand in for vkCmdCopyImage, vkCmdBlitImage and vkCmdClearDepthStencilImage and, when
+ * g_barrera_tras_transferencia is set (Mali mode only), record a TRANSFER -> TRANSFER barrier after each
+ * one. Elsewhere they only forward the call.
+ */
+FnCopiarImagen g_copiar_real = nullptr;
+FnBlit g_blit_real = nullptr;
+FnBorrarProfundidad g_borrar_profundidad_real = nullptr;
+PFN_vkCmdPipelineBarrier g_barrera_real = nullptr;
+bool g_barrera_tras_transferencia = false;
+
+void BarreraTrasTransferencia(VkCommandBuffer comandos) {
+  if (!g_barrera_tras_transferencia || !g_barrera_real) {
+    return;
+  }
+  VkMemoryBarrier barrera{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrera.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrera.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  g_barrera_real(comandos, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrera, 0,
+                 nullptr, 0, nullptr);
+}
+
+void VKAPI_PTR CopiarImagenConBarrera(VkCommandBuffer comandos, VkImage origen, VkImageLayout layout_origen,
+                                      VkImage destino, VkImageLayout layout_destino, uint32_t n,
+                                      const VkImageCopy* regiones) {
+  g_copiar_real(comandos, origen, layout_origen, destino, layout_destino, n, regiones);
+  BarreraTrasTransferencia(comandos);
+}
+
+void VKAPI_PTR BlitConBarrera(VkCommandBuffer comandos, VkImage origen, VkImageLayout layout_origen,
+                              VkImage destino, VkImageLayout layout_destino, uint32_t n,
+                              const VkImageBlit* regiones, VkFilter filtro) {
+  g_blit_real(comandos, origen, layout_origen, destino, layout_destino, n, regiones, filtro);
+  BarreraTrasTransferencia(comandos);
+}
+
+void VKAPI_PTR BorrarProfundidadConBarrera(VkCommandBuffer comandos, VkImage imagen, VkImageLayout layout,
+                                           const VkClearDepthStencilValue* valor, uint32_t n,
+                                           const VkImageSubresourceRange* rangos) {
+  g_borrar_profundidad_real(comandos, imagen, layout, valor, n, rangos);
+  BarreraTrasTransferencia(comandos);
+}
+
 // Direct3D 11 16.8 fixed point with rounding, like ui::FloatToD3D11Fixed16p8.
 int32_t Fijo16p8(float valor) {
   if (!(std::abs(valor) >= 1.0f / 512.0f)) {
@@ -931,6 +979,18 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     blit_ = reinterpret_cast<FnBlit>(
         dispositivo_->vulkan_instance()->functions().vkGetDeviceProcAddr(device_,
                                                                           "vkCmdBlitImage"));
+    // The wrappers with the Mali transfer barrier (they only forward until Mali mode switches them on).
+    g_barrera_real = dfn_.vkCmdPipelineBarrier;
+    g_copiar_real = copiar_imagen_;
+    copiar_imagen_ = CopiarImagenConBarrera;
+    if (borrar_profundidad_) {
+      g_borrar_profundidad_real = borrar_profundidad_;
+      borrar_profundidad_ = BorrarProfundidadConBarrera;
+    }
+    if (blit_) {
+      g_blit_real = blit_;
+      blit_ = BlitConBarrera;
+    }
     // Attachment, copy and clear source and destination, and sampling of the resolved ones (shadows).
     const VkFormatFeatureFlags kUsosProfundidad =
         VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
@@ -1050,6 +1110,12 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
         }
         periodo_marca_ns_ = fisico.limits.timestampPeriod;
       }
+      REXLOG_INFO("[nativo] C2: marcas de tiempo: familia {} de {}, timestampValidBits {}, "
+                  "timestampComputeAndGraphics {}, timestampPeriod {} ns, vkCmdWriteTimestamp {}, "
+                  "vkGetQueryPoolResults {}",
+                  familia_, familias, familia_ < familias ? colas[familia_].timestampValidBits : 0u,
+                  fisico.limits.timestampComputeAndGraphics ? "si" : "no", fisico.limits.timestampPeriod,
+                  escribir_marca_ ? "si" : "no", leer_consultas_ ? "si" : "no");
       REXLOG_INFO("[nativo] C2: tiempo de GPU por Swap {}",
                   consultas_ != VK_NULL_HANDLE ? "medido con marcas de tiempo"
                                                : "no disponible (la cola no tiene marcas)");
@@ -1621,6 +1687,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
         if (!BorrarColorAreaUtil(*destino_render, color)) {
           dfn_.vkCmdClearColorImage(comandos_trabajo_, destino_render->imagen,
                                     VK_IMAGE_LAYOUT_GENERAL, &color, 1, &kRangoColor);
+          BarreraTrasTransferencia(comandos_trabajo_);
           QuitarBanda(*destino_render);
         }
         ++borrados_;
@@ -3622,6 +3689,30 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   // upload buffer (Grabar only waits if that slot's last submission is still on the GPU).
   bool EnviarYEsperar() override { return EnviarTrabajo(false) && Grabar(); }
 
+  // nfsmw_nativo_desglose_por_fence. Every pass boundary waits for the GPU, so what is pending here is only
+  // what was recorded since the previous boundary: this pass plus the copies and clears before it. Without
+  // timestamps that wall time (submission to fence) is the closest thing to its GPU time, and it goes into
+  // the same per-category totals as the timestamps, so the usual C2 report shows it.
+  void EnviarYMedir(uint32_t categoria) override {
+    if (!grabando_ || consultas_ != VK_NULL_HANDLE || categoria >= kGpuCategorias) {
+      return;  // with timestamps the usual measurement already applies
+    }
+    if (!desglose_anotado_) {
+      desglose_anotado_ = true;
+      REXLOG_INFO("[nativo] C2: desglose de GPU por fence ACTIVO (nfsmw_nativo_desglose_por_fence): cada pase se "
+                  "envia y se espera; los fps bajan");
+    }
+    const auto antes = std::chrono::steady_clock::now();
+    EsperarGpu();
+    const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - antes)
+                                     .count());
+    gpu_categorias_ns_[categoria] += ns;
+    gpu_ns_ += ns;
+    ++gpu_trabajos_;
+    Grabar();
+  }
+
   // The function above submits and continues; this one waits. Same order as every other place that must
   // destroy something the GPU might still be reading (see the resolved texture that changes size).
   bool EsperarGpuDelTodo() override {
@@ -4768,6 +4859,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       const VkClearColorValue cero{};
       dfn_.vkCmdClearColorImage(comandos, imagen.imagen, VK_IMAGE_LAYOUT_GENERAL, &cero,
                                 1, &kRangoColor);
+      BarreraTrasTransferencia(comandos);
     }
     imagen.preparada = true;
     if (dibujos_) {
@@ -4807,6 +4899,20 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     inicio.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (dfn_.vkBeginCommandBuffer(comandos_trabajo_, &inicio) != VK_SUCCESS) {
       return false;
+    }
+    // Mali mode: the transfer barriers on, and a full barrier against what earlier submissions left (a
+    // submission does not wait for the previous one: a blit here could read an image a clear there was still
+    // writing). Once per command buffer.
+    if (dibujos_ && dibujos_->ModoMali()) {
+      if (!g_barrera_tras_transferencia) {
+        g_barrera_tras_transferencia = true;
+        REXLOG_INFO("[nativo] C2 modo Mali: barreras entre transferencias y al empezar cada trabajo");
+      }
+      VkMemoryBarrier barrera{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      barrera.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+      barrera.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+      dfn_.vkCmdPipelineBarrier(comandos_trabajo_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrera, 0, nullptr, 0, nullptr);
     }
     ranura.categorias.clear();
     if (consultas_ != VK_NULL_HANDLE) {
@@ -5481,6 +5587,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     copia.imageExtent = {ancho, alto, 1};
     dfn_.vkCmdCopyImageToBuffer(comandos_trabajo_, resuelta.imagen.imagen, VK_IMAGE_LAYOUT_GENERAL,
                                 lectura.bufer, 1, &copia);
+    BarreraTrasTransferencia(comandos_trabajo_);
     lecturas_pendientes_.push_back({&lectura, reg.rb_copy_dest_base, x0, y0, ancho, alto,
                                     reg.rb_copy_dest_pitch & 0x3FFF,
                                     (reg.rb_copy_dest_pitch >> 16) & 0x3FFF, reg.rb_copy_dest_info});
@@ -5805,6 +5912,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   uint32_t salida_actual_ = 0;
   bool salida_sin_espera_ = false;
   bool marcas_precisas_ = false;
+  bool desglose_anotado_ = false;  // nfsmw_nativo_desglose_por_fence, logged once
   int32_t alternar_marcas_s_ = 0;
   std::chrono::steady_clock::time_point inicio_marcas_{};
   bool invalidar_cada_copia_ = false;

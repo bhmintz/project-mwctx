@@ -741,6 +741,10 @@ REXCVAR_DEFINE_INT32(nfsmw_nativo_diag_mip_minimo, 0, "NFSMW",
  * follows the measurement: what helps ships enabled and what makes things worse ships disabled. The setting
  * stays so the test can be repeated.
  */
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_desglose_por_fence, false, "NFSMW",
+                    "Diagnostico para GPUs sin marcas de tiempo (Mali-G52): al cerrar cada pase se envia lo grabado "
+                    "y se espera a la GPU; ese tiempo va a la categoria del pase en el informe C2 (GPU por Swap). "
+                    "Serializa CPU y GPU: los fps bajan, solo para medir");
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_enviar_tras_sombras, false, "NFSMW",
                     "Renderizador nativo (20/09): enviar el trabajo a la GPU en cuanto se cierra el pase de "
                     "sombras, en vez de todo junto al final del fotograma. La GPU deja de estar parada "
@@ -2208,17 +2212,24 @@ void DecodificarCanalBc4(const uint8_t* b, uint8_t salida[16]) {
 
 // Decodes all levels, layer after layer, from the BC layout ReadLevel leaves (tight blocks per level) to
 // tight texels; rewrites desplazamiento_nivel for the new layout.
+// Bytes of a BC texture once decoded (all its levels and slices): what DecodificarBc writes, what the upload
+// buffer has to hold and what the image really takes. Up to 8 times the compressed size (BC1 -> RGBA8).
+size_t TamanoBcDecodificado(VkFormat formato, uint32_t ancho, uint32_t alto, uint32_t rebanadas, uint32_t niveles) {
+  const uint32_t bpp = BytesTexelBcDecodificado(formato);
+  size_t total = 0;
+  for (uint32_t n = 0; n < niveles; ++n) {
+    total += size_t(std::max(ancho >> n, 1u)) * std::max(alto >> n, 1u) * bpp * rebanadas;
+  }
+  return total;
+}
+
 void DecodificarBc(VkFormat formato, uint32_t ancho, uint32_t alto, uint32_t rebanadas, uint32_t niveles,
                    const std::vector<uint8_t>& origen, std::array<uint32_t, 16>& desplazamientos,
                    std::vector<uint8_t>& destino) {
   const uint32_t bytes_bloque =
       formato == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || formato == VK_FORMAT_BC4_UNORM_BLOCK ? 8 : 16;
   const uint32_t bpp = BytesTexelBcDecodificado(formato);
-  size_t total = 0;
-  for (uint32_t n = 0; n < niveles; ++n) {
-    total += size_t(std::max(ancho >> n, 1u)) * std::max(alto >> n, 1u) * bpp * rebanadas;
-  }
-  destino.assign(total, 0);
+  destino.assign(TamanoBcDecodificado(formato, ancho, alto, rebanadas, niveles), 0);
   size_t escrito = 0;
   for (uint32_t n = 0; n < niveles; ++n) {
     const uint32_t w = std::max(ancho >> n, 1u), h = std::max(alto >> n, 1u);
@@ -5109,8 +5120,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         ++envios_tras_sombras_;
         contexto_->EnviarYEsperar();
       }
+      if (contexto_ && REXCVAR_GET(nfsmw_nativo_desglose_por_fence)) {
+        contexto_->EnviarYMedir(categoria_cerrada);
+      }
     }
   }
+
+  bool ModoMali() const override { return modo_mali_; }
 
   void AntesDeEnviar() override {
     EsperarSubidas();  // deferred vertex copies, before flushing the mapping and submitting
@@ -9293,10 +9309,16 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         textura.direccion = base;
         textura.contenido_por_medir = true;
       }
-      for (uint32_t n = 0; n < niveles; ++n) {
-        textura.bytes += uint64_t((std::max(ancho_host >> n, 1u) + tf.bloque - 1) / tf.bloque) *
-                         ((std::max(alto_host >> n, 1u) + tf.bloque - 1) / tf.bloque) * tf.bytes * capas *
-                         (fondo ? fondo : 1);
+      if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED) {
+        // Mali mode: the image holds the decoded texels, and that is what the cache limit has to count.
+        textura.bytes = TamanoBcDecodificado(textura.bc_en_cpu, ancho_host, alto_host, capas * (fondo ? fondo : 1),
+                                             niveles);
+      } else {
+        for (uint32_t n = 0; n < niveles; ++n) {
+          textura.bytes += uint64_t((std::max(ancho_host >> n, 1u) + tf.bloque - 1) / tf.bloque) *
+                           ((std::max(alto_host >> n, 1u) + tf.bloque - 1) / tf.bloque) * tf.bytes * capas *
+                           (fondo ? fondo : 1);
+        }
       }
       bytes_texturas_ += textura.bytes;
       // Diagnostic: why the cache grows on the console. A new texture at an address that already had another
@@ -9745,7 +9767,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     texturas_a_subir_.push_back(&textura);
     nfsmw::esperas::g_texturas_subidas.fetch_add(1, std::memory_order_relaxed);
     nfsmw::esperas::g_bytes_subidos.fetch_add(textura.datos.size(), std::memory_order_relaxed);
-    bytes_subida += (textura.datos.size() + 3) & ~size_t(3);
+    // Mali mode: SubirTextura decodes the BC data before copying it, so the space asked for is the decoded
+    // size. With the compressed one (up to 8 times less) Reservar ran out of room when many textures loaded at
+    // once (the start of a race), and the copy landed at offset 0 over the frame's vertices and indices.
+    const size_t bytes_a_subir =
+        textura.bc_en_cpu != VK_FORMAT_UNDEFINED
+            ? TamanoBcDecodificado(textura.bc_en_cpu, textura.imagen.ancho, textura.imagen.alto,
+                                   textura.capas * (textura.fondo ? textura.fondo : 1), textura.niveles)
+            : textura.datos.size();
+    bytes_subida += (bytes_a_subir + 3) & ~size_t(3);
   }
 
   // --- Measurement only: new textures with the content of another (nfsmw_nativo_diag_reutilizar) ---------------
@@ -10292,7 +10322,22 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       Reservar(bytes, 16, offset);  // BC: offset multiple of the block
       PublicarHuella(textura, subida_datos_ + offset, bytes);
     } else {
-      Reservar(textura.datos.size(), 16, offset);  // BC: offset multiple of the block
+      if (!Reservar(textura.datos.size(), 16, offset)) {
+        // No room: copying at offset 0 would overwrite this frame's vertices and indices (a GPU fault). The
+        // texture stays as it is and is uploaded again on its next use.
+        // A new image still gets its barrier (GENERAL), so this frame's draws sample it without its contents
+        // instead of in an undefined layout.
+        Avisar(41, "textura sin sitio en el bufer de subida: se sube en otro momento");
+        if (!textura.en_vuelo && textura.imagen.imagen != VK_NULL_HANDLE && !textura.imagen.preparada) {
+          Barrera(subida, textura.imagen.imagen, textura.capas);
+          textura.imagen.preparada = true;
+        }
+        textura.subir = false;
+        textura.siguiente = fotograma_;
+        textura.huella = 0;
+        std::vector<uint8_t>().swap(textura.datos);
+        return true;
+      }
       std::memcpy(subida_datos_ + offset, textura.datos.data(), textura.datos.size());
     }
     /*
