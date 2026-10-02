@@ -347,6 +347,9 @@ class DibujosVulkan {
   virtual EstadisticasDibujos Estadisticas() const = 0;
   // Draws recorded since start-up; C2 counts those that fall between two copies.
   virtual uint64_t Dibujados() const = 0;
+  // Draws recorded on the shadow map (a depth target 1600 or more wide), skipped ones not counted. C2 uses it
+  // to know the shadow map holds only its clear (nfsmw_nativo_mali_sombra_sin_copia).
+  virtual uint64_t DibujosSombras() const { return 0; }
   // Waits for the copy thread to finish the pending vertex copies (nfsmw_nativo_subidas_hilo).
   virtual void EsperarSubidas() = 0;
   // Vertex copies queued and not done yet (only to measure the fences).

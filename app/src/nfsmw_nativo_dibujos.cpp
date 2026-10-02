@@ -53,6 +53,15 @@
 static const uint32_t kSpirvResplandorEnergia[1] = {0};
 static const uint32_t kSpirvResplandorSuave[1] = {0};
 #endif
+#if __has_include("nfsmw_nativo_resplandor_bloom4_spirv.h")
+// The bloom downsample variants (nfsmw_bloom), derived from a game shader and not distributed either. Without
+// them the setting keeps the game's shader.
+#include "nfsmw_nativo_resplandor_bloom4_spirv.h"
+#define NFSMW_VARIANTES_BLOOM 1
+#else
+static const uint32_t kSpirvBloom4[1] = {0};
+static const uint32_t kSpirvBloomCero[1] = {0};
+#endif
 #include "nfsmw_nativo_shaders.h"
 #include "nfsmw_nativo_ganchos.h"  // nfsmw_d3d_vegetacion_juego
 #include "nfsmw_reflejo_demanda.h"  // nfsmw_reflejo_visibilidad
@@ -827,10 +836,22 @@ REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_subida_mb, 32, "NFSMW",
 REXCVAR_DEFINE_STRING(nfsmw_nativo_mali_ab_omitir_ps, "", "NFSMW",
                       "Modo Mali, diagnostico: huella del pixel shader (16 hex, la del informe por pase) cuyos dibujos "
                       "se saltan 10 s si y 10 s no, anotando los fps de cada tramo (C6 A/B omitir PS). Vacio = nada");
+// The bloom downsample (p_000091): one draw that reads the whole scene with 16 taps on a 4x4 grid to write
+// 256x144. Measured A/B on the Mali-G52 in a race: 2.3 ms per frame (30.6 FPS with it, 32.9 without).
+// optimizado: 4 bilinear taps, each at the center of its 2x2 group (a slightly coarser glow); desactivado: the
+// shader writes zero (no glow).
+REXCVAR_DEFINE_STRING(nfsmw_bloom, "nativo", "Graficos",
+                      "Resplandor de las luces (bloom). nativo: como el juego (16 muestreos por pixel). optimizado: 4 "
+                      "muestreos, casi igual y mas barato. desactivado: sin resplandor, lo mas rapido")
+    .allowed({"nativo", "optimizado", "desactivado"});
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sin_sombras, true, "NFSMW",
                     "Modo Mali: no se graba el mapa de sombras (como nfsmw_nativo_omitir_sombras, solo en Mali) "
                     "mientras nfsmw_sombras_cada sea 0 (automatico); la opcion de la app manda");
 REXCVAR_DECLARE(int32_t, nfsmw_sombras_cada);
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sets_persistentes, true, "NFSMW",
+                    "Modo Mali: los sets de texturas por dibujo se guardan entre fotogramas y solo se descartan "
+                    "cuando se retira una vista que usan (si no, cada ranura de trabajo los rehace)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_texturas_mb_max, 256, "NFSMW",
                      "Modo Mali: tope de la cache de texturas en MB (el menor entre este y "
                      "nfsmw_nativo_texturas_mb_max). 0 = usar solo nfsmw_nativo_texturas_mb_max")
@@ -1328,7 +1349,19 @@ struct SetsMaliRanura {
   uint64_t generacion = UINT64_MAX;                      // generacion_texturas_ of the cache
   std::vector<VkImageView> vistas_retiradas;
   std::vector<ImagenNativa> imagenes_retiradas;  // after the views (RetirarTexturaEtc2)
+  // Persistent sets dropped while this slot was recording (their view was retired): a set already recorded
+  // may still use them, so they are freed when the slot comes round, like the views.
+  std::vector<std::pair<VkDescriptorPool, VkDescriptorSet>> sets_retirados;
 };
+// The persistent Mali sets (nfsmw_nativo_mali_sets_persistentes): one cache for every frame, keyed by the
+// set's content. A set lives until one of its views is retired (RetirarVista) or the cache hits its cap.
+struct SetsMaliPersistentes {
+  std::vector<VkDescriptorPool> pools;  // with FREE_DESCRIPTOR_SET
+  size_t pool_actual = 0;
+  std::unordered_map<uint64_t, std::pair<VkDescriptorPool, VkDescriptorSet>> sets;
+  std::unordered_map<VkImageView, std::vector<uint64_t>> por_vista;  // keys may be stale: harmless
+};
+constexpr size_t kMaliSetsPersistentesMax = 12288;
 // Work slots. The ones actually used are chosen by nfsmw_nativo_ranuras_trabajo; this is the room reserved
 // for them, and it has to match the array in nfsmw_nativo_destinos.cpp.
 constexpr size_t kRanurasDeTrabajo = 3;
@@ -1393,6 +1426,10 @@ constexpr uint32_t kSpecZTemprana = uint32_t(1) << 20;
 // nfsmw_nativo_sombra_minimo. SPEC_CONSTANT_SOMBRA_MINIMO from shader_common.h: tfetch2DSombraMin takes the
 // minimum of the shadow map and its pair, which goes in the 3D index word of that register.
 constexpr uint32_t kSpecSombraMinimo = uint32_t(1) << 23;
+// Internal bits of the pipeline key that no shader reads: the bloom downsample module is a variant
+// (nfsmw_bloom): 4 taps, or zero.
+constexpr uint32_t kSpecBloom4 = uint32_t(1) << 21;
+constexpr uint32_t kSpecBloomCero = uint32_t(1) << 22;
 constexpr uint64_t kHuellaComposicion = 0x19C0C358044A29BFull;  // p_000139, the race VisualTreatment
 // nfsmw_tratamiento_visual. The final composite (kHuellaComposicion, p_000139) tints each channel with a polynomial
 // curve (Coeffs0..3 = c6..c9, evaluated at MISCMAP1.w), mixes in a desaturated part with its x component and adds a
@@ -1446,6 +1483,7 @@ REXCVAR_DEFINE_BOOL(nfsmw_nativo_pase_area_util, true, "NFSMW",
                     "asi que la escena abre 1280x1280 para dibujar 1280x720 y el cubo 320x720 para dibujar "
                     "320x256. La imagen es identica: Vulkan solo carga y guarda el renderArea");
 constexpr uint64_t kHuellaBrightPass = 0xE849A9F6D3323B87ull;
+constexpr uint64_t kHuellaBloomReduccion = 0x7E1C6EED1AC24341ull;  // p_000091 (nfsmw_bloom)
 /*
  * The pixel shader of the sky dome (nfsmw_nativo_cielo_aplazado).
  *
@@ -2647,6 +2685,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       for (VkImageView vista : s.vistas_retiradas) dfn_.vkDestroyImageView(device_, vista, nullptr);
       for (VkDescriptorPool pool : s.pools) dfn_.vkDestroyDescriptorPool(device_, pool, nullptr);
     }
+    for (VkDescriptorPool pool : sets_persistentes_.pools) dfn_.vkDestroyDescriptorPool(device_, pool, nullptr);
     if (pool_ubo_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorPool(device_, pool_ubo_, nullptr);
     if (layout_ubo_ != VK_NULL_HANDLE) dfn_.vkDestroyDescriptorSetLayout(device_, layout_ubo_, nullptr);
     for (VkDescriptorSetLayout layout : layouts_) {
@@ -3102,6 +3141,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       if (omitir) {
         return true;
       }
+    }
+    if (pitch >= 1600 && claves[4]) {
+      ++dibujos_sombras_;  // also a draw rejected further down: counting too many is the safe side
     }
 
     CortarSubetapa(15, t_indices_185);  // render targets and discards
@@ -3768,6 +3810,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (ps && ps->shader && ps->shader->huella == kHuellaBrightPass) {
       const int modo = ResplandorCielo();
       especializacion |= modo == 1 ? kSpecResplandorNatural : modo == 2 ? kSpecResplandorSuave : 0;
+    }
+#endif
+#ifdef NFSMW_VARIANTES_BLOOM
+    if (ps && ps->shader && ps->shader->huella == kHuellaBloomReduccion) {
+      const std::string& bloom = REXCVAR_GET(nfsmw_bloom);  // one draw per frame
+      especializacion |= bloom == "optimizado" ? kSpecBloom4 : bloom == "desactivado" ? kSpecBloomCero : 0;
     }
 #endif
     const uint32_t control_color = r[gr::XE_GPU_REG_RB_COLORCONTROL];
@@ -5981,6 +6029,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   }
 
   uint64_t Dibujados() const override { return dibujados_; }
+  uint64_t DibujosSombras() const override { return dibujos_sombras_; }
 
   // nfsmw_nativo_texturas_mb_max: with the texture cache above the limit, evict the textures unused for
   // the longest until it drops to 75 %, at most once every 60 frames.
@@ -9272,6 +9321,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   // point to it, so it lives until its work slot comes round again (ReciclarSetsMali).
   void RetirarVista(VkImageView vista) {
     if (modo_mali_) {
+      DescartarSetsDeVista(vista);
       sets_mali_[ranura_actual_].vistas_retiradas.push_back(vista);
       return;
     }
@@ -9305,6 +9355,14 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         return false;
       }
     }
+    sets_persistentes_activos_ = REXCVAR_GET(nfsmw_nativo_mali_sets_persistentes);
+    if (sets_persistentes_activos_ &&
+        !CrearPoolMali(sets_persistentes_.pools, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT)) {
+      return false;
+    }
+    if (sets_persistentes_activos_) {
+      REXLOG_INFO("[nativo] C6 modo Mali: sets persistentes entre fotogramas (hasta {})", kMaliSetsPersistentesMax);
+    }
     REXLOG_INFO("[nativo] C6 modo Mali: un set por dibujo ({} 2D, {} 3D, {} cubo, {} samplers), pools de {} sets "
                 "por ranura de trabajo; montones en tablas de CPU ({} 2D, {} 3D, {} cubo, {} samplers)",
                 kMaliLocal2D, kMaliLocal3D, kMaliLocalCubo, kMaliLocalSamplers, kMaliSetsPorPool,
@@ -9312,12 +9370,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     return true;
   }
 
-  bool CrearPoolMali(SetsMaliRanura& s) {
+  bool CrearPoolMali(SetsMaliRanura& s) { return CrearPoolMali(s.pools, 0); }
+
+  bool CrearPoolMali(std::vector<VkDescriptorPool>& pools, VkDescriptorPoolCreateFlags flags) {
     const VkDescriptorPoolSize tamanos[2] = {
         {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, (kMaliLocal2D + kMaliLocal3D + kMaliLocalCubo) * kMaliSetsPorPool},
         {VK_DESCRIPTOR_TYPE_SAMPLER, kMaliLocalSamplers * kMaliSetsPorPool}};
     VkDescriptorPoolCreateInfo info{};
     info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    info.flags = flags;
     info.maxSets = kMaliSetsPorPool;
     info.poolSizeCount = 2;
     info.pPoolSizes = tamanos;
@@ -9325,8 +9386,64 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (dfn_.vkCreateDescriptorPool(device_, &info, nullptr, &pool) != VK_SUCCESS) {
       return false;
     }
-    s.pools.push_back(pool);
+    pools.push_back(pool);
     return true;
+  }
+
+  // Persistent sets: the ones that use a view being retired leave the cache now and are freed when the
+  // current work slot comes round (what is already recorded may still use them).
+  void DescartarSetsDeVista(VkImageView vista) {
+    const auto indice = sets_persistentes_.por_vista.find(vista);
+    if (indice == sets_persistentes_.por_vista.end()) {
+      return;
+    }
+    SetsMaliRanura& s = sets_mali_[ranura_actual_];
+    for (uint64_t clave : indice->second) {
+      const auto it = sets_persistentes_.sets.find(clave);
+      if (it != sets_persistentes_.sets.end()) {
+        s.sets_retirados.push_back(it->second);
+        sets_persistentes_.sets.erase(it);
+        ++sets_mali_descartados_;
+      }
+    }
+    sets_persistentes_.por_vista.erase(indice);
+  }
+
+  // Persistent sets: the cache is full, so all of it goes as in DescartarSetsDeVista.
+  void VaciarSetsPersistentes() {
+    SetsMaliRanura& s = sets_mali_[ranura_actual_];
+    for (const auto& par : sets_persistentes_.sets) s.sets_retirados.push_back(par.second);
+    sets_mali_descartados_ += sets_persistentes_.sets.size();
+    sets_persistentes_.sets.clear();
+    sets_persistentes_.por_vista.clear();
+    ++sets_mali_vaciados_;
+  }
+
+  // A set from the persistent pools; a new pool when all are full.
+  VkDescriptorPool ReservarSetPersistente(VkDescriptorSet& set) {
+    VkDescriptorSetAllocateInfo reserva{};
+    reserva.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    reserva.descriptorSetCount = 1;
+    reserva.pSetLayouts = &layouts_[0];
+    SetsMaliPersistentes& c = sets_persistentes_;
+    for (size_t intento = 0; intento < c.pools.size(); ++intento) {
+      const size_t i = (c.pool_actual + intento) % c.pools.size();
+      reserva.descriptorPool = c.pools[i];
+      if (dfn_.vkAllocateDescriptorSets(device_, &reserva, &set) == VK_SUCCESS) {
+        c.pool_actual = i;
+        return c.pools[i];
+      }
+    }
+    if (!CrearPoolMali(c.pools, VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT)) {
+      return VK_NULL_HANDLE;
+    }
+    REXLOG_INFO("[nativo] C6 modo Mali: los sets persistentes pasan a {} pools", c.pools.size());
+    c.pool_actual = c.pools.size() - 1;
+    reserva.descriptorPool = c.pools.back();
+    if (dfn_.vkAllocateDescriptorSets(device_, &reserva, &set) != VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    return c.pools.back();
   }
 
   // Mali mode, from UsarRanura: the GPU is done with this slot, so its sets and the views retired while it
@@ -9341,6 +9458,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       DestruirImagen(imagen);
     }
     s.imagenes_retiradas.clear();
+    for (const auto& [pool, set] : s.sets_retirados) {
+      dfn_.vkFreeDescriptorSets(device_, pool, 1, &set);
+    }
+    s.sets_retirados.clear();
     for (VkDescriptorPool pool : s.pools) {
       dfn_.vkResetDescriptorPool(device_, pool, 0);
     }
@@ -9391,20 +9512,51 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       compartidas[48 + r] = r;
     }
+    uint64_t clave = XXH3_64bits(v2d.data(), sizeof(v2d));
+    clave = XXH3_64bits_withSeed(v3d.data(), sizeof(v3d), clave);
+    clave = XXH3_64bits_withSeed(vcubo.data(), sizeof(vcubo), clave);
+    clave = XXH3_64bits_withSeed(samplers.data(), sizeof(samplers), clave);
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (sets_persistentes_activos_) {
+      // The key is the content (view and sampler handles), and a view is never destroyed while a set that
+      // holds it is still in the cache (RetirarVista), so a hit is always valid, whatever the frame.
+      if (const auto it = sets_persistentes_.sets.find(clave); it != sets_persistentes_.sets.end()) {
+        ++sets_mali_reusados_;
+        return it->second.second;
+      }
+      if (sets_persistentes_.sets.size() >= kMaliSetsPersistentesMax) {
+        VaciarSetsPersistentes();
+      }
+      const VkDescriptorPool pool = ReservarSetPersistente(set);
+      if (pool == VK_NULL_HANDLE) {
+        Avisar(40, "modo Mali: no se pudo crear otro pool de descriptores");
+        return VK_NULL_HANDLE;
+      }
+      EscribirSetMali(set, v2d, v3d, vcubo, samplers);
+      sets_persistentes_.sets.emplace(clave, std::make_pair(pool, set));
+      // Index by view, each one once (the empty ones never go).
+      std::array<VkImageView, kMaliLocal2D + kMaliLocal3D + kMaliLocalCubo> vistas;
+      size_t n = 0;
+      const auto anotar = [&](VkImageView v, VkImageView vacia) {
+        if (v == vacia || std::find(vistas.begin(), vistas.begin() + n, v) != vistas.begin() + n) return;
+        vistas[n++] = v;
+        sets_persistentes_.por_vista[v].push_back(clave);
+      };
+      for (VkImageView v : v2d) anotar(v, vacias_[0].vista);
+      for (VkImageView v : v3d) anotar(v, vacias_[1].vista);
+      for (VkImageView v : vcubo) anotar(v, vacias_[2].vista);
+      ContarSetMaliCreado();
+      return set;
+    }
     SetsMaliRanura& s = sets_mali_[ranura_actual_];
     if (s.generacion != generacion_texturas_) {
       s.cache.clear();
       s.generacion = generacion_texturas_;
     }
-    uint64_t clave = XXH3_64bits(v2d.data(), sizeof(v2d));
-    clave = XXH3_64bits_withSeed(v3d.data(), sizeof(v3d), clave);
-    clave = XXH3_64bits_withSeed(vcubo.data(), sizeof(vcubo), clave);
-    clave = XXH3_64bits_withSeed(samplers.data(), sizeof(samplers), clave);
     if (const auto it = s.cache.find(clave); it != s.cache.end()) {
       ++sets_mali_reusados_;
       return it->second;
     }
-    VkDescriptorSet set = VK_NULL_HANDLE;
     VkDescriptorSetAllocateInfo reserva{};
     reserva.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     reserva.descriptorSetCount = 1;
@@ -9424,6 +9576,27 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       ++s.pool_actual;  // full (OUT_OF_POOL_MEMORY or FRAGMENTED_POOL): the next one
     }
+    EscribirSetMali(set, v2d, v3d, vcubo, samplers);
+    s.cache.emplace(clave, set);
+    ContarSetMaliCreado();
+    return set;
+  }
+
+  void ContarSetMaliCreado() {
+    ++sets_mali_creados_;
+    if (sets_mali_creados_ >= sets_mali_informe_) {
+      sets_mali_informe_ = sets_mali_creados_ * 4;  // 1, 4, 16, 64, ...: a handful of lines per session
+      REXLOG_INFO("[nativo] C6 modo Mali: {} sets por dibujo creados, {} reutilizados, {} descartados "
+                  "({} en cache persistente, {} vaciados)",
+                  sets_mali_creados_, sets_mali_reusados_, sets_mali_descartados_, sets_persistentes_.sets.size(),
+                  sets_mali_vaciados_);
+    }
+  }
+
+  void EscribirSetMali(VkDescriptorSet set, const std::array<VkImageView, kMaliLocal2D>& v2d,
+                       const std::array<VkImageView, kMaliLocal3D>& v3d,
+                       const std::array<VkImageView, kMaliLocalCubo>& vcubo,
+                       const std::array<VkSampler, kMaliLocalSamplers>& samplers) {
     std::array<VkDescriptorImageInfo, kMaliLocal2D + kMaliLocalSamplers + kMaliLocal3D + kMaliLocalCubo> infos{};
     VkDescriptorImageInfo* p = infos.data();
     std::array<VkWriteDescriptorSet, 4> escrituras{};
@@ -9446,14 +9619,6 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     for (uint32_t i = 0; i < kMaliLocalCubo; ++i) p[i] = {VK_NULL_HANDLE, vcubo[i], VK_IMAGE_LAYOUT_GENERAL};
     escritura(3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaliLocalCubo);
     dfn_.vkUpdateDescriptorSets(device_, uint32_t(escrituras.size()), escrituras.data(), 0, nullptr);
-    s.cache.emplace(clave, set);
-    ++sets_mali_creados_;
-    if (sets_mali_creados_ >= sets_mali_informe_) {
-      sets_mali_informe_ = sets_mali_creados_ * 4;  // 1, 4, 16, 64, ...: a handful of lines per session
-      REXLOG_INFO("[nativo] C6 modo Mali: {} sets por dibujo creados, {} reutilizados", sets_mali_creados_,
-                  sets_mali_reusados_);
-    }
-    return set;
   }
 
   uint32_t ReservarRanura(uint32_t monton) {
@@ -13104,6 +13269,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       ps = ModuloVariante(1, kSpirvResplandorEnergia, sizeof(kSpirvResplandorEnergia));
     } else if (clave.ps && (clave.especializacion & kSpecResplandorSuave)) {
       ps = ModuloVariante(2, kSpirvResplandorSuave, sizeof(kSpirvResplandorSuave));
+    } else if (clave.ps && (clave.especializacion & kSpecBloom4)) {
+      ps = ModuloVariante(3, kSpirvBloom4, sizeof(kSpirvBloom4));
+    } else if (clave.ps && (clave.especializacion & kSpecBloomCero)) {
+      ps = ModuloVariante(4, kSpirvBloomCero, sizeof(kSpirvBloomCero));
     } else if (clave.ps && (clave.especializacion & kSpecSoloAlfa)) {
       ps = ModuloSoloAlfa(*p.ps);
     } else if (clave.ps && (clave.especializacion & kSpecZTemprana)) {
@@ -13483,11 +13652,23 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       const uint32_t spec = clave.especializacion;
       const uint32_t variante = (spec & kSpecResplandorNatural) ? 1
                                 : (spec & kSpecResplandorSuave) ? 2
+                                : (spec & kSpecBloom4)          ? 5
+                                : (spec & kSpecBloomCero)       ? 6
                                 : (spec & kSpecSoloAlfa)        ? 3
                                 : (spec & kSpecZTemprana)       ? 4
                                                                 : 0;
       if (variante == 0) {
         return normal(e);
+      }
+      if (variante >= 5) {  // nfsmw_bloom: fixed modules, like the bright pass ones
+        auto it_bloom = modulos.find(uint64_t(variante) << 32 | 0xFFFFFFFFull);
+        if (it_bloom == modulos.end()) {
+          it_bloom = modulos.emplace(uint64_t(variante) << 32 | 0xFFFFFFFFull,
+                                     variante == 5 ? crear(kSpirvBloom4, sizeof(kSpirvBloom4))
+                                                   : crear(kSpirvBloomCero, sizeof(kSpirvBloomCero)))
+                         .first;
+        }
+        return it_bloom->second;
       }
       const uint64_t clave_modulo = (uint64_t(variante) << 32) | (variante <= 2 ? 0xFFFFFFFFull : uint64_t(e.numero));
       auto it = modulos.find(clave_modulo);
@@ -13844,8 +14025,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   bool vacias_preparadas_ = false;
 
   std::unordered_map<const EntradaShader*, VkShaderModule> modulos_;
-  std::array<VkShaderModule, 3> modulos_variantes_{};  // 1 natural, 2 soft
-  std::array<bool, 3> modulos_variantes_creados_{};
+  std::array<VkShaderModule, 5> modulos_variantes_{};  // 1 natural, 2 soft, 3 bloom 4 taps, 4 bloom zero
+  std::array<bool, 5> modulos_variantes_creados_{};
   int resplandor_anotado_ = 0;
   std::unordered_map<uint64_t, std::pair<ClavePipeline, VkPipeline>> pipelines_;
   // One-entry shortcut for PipelineDe (see the comment there).
@@ -14290,6 +14471,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   uint64_t sets_mali_creados_ = 0;
   uint64_t sets_mali_reusados_ = 0;
   uint64_t sets_mali_informe_ = 0;
+  uint64_t sets_mali_descartados_ = 0;
+  uint64_t sets_mali_vaciados_ = 0;
+  SetsMaliPersistentes sets_persistentes_;
+  bool sets_persistentes_activos_ = false;
 
   uint32_t diagnosticos_ = 0;
   std::unordered_set<uint32_t> avisados_vs_;
@@ -14297,6 +14482,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   uint32_t avisos_swizzle_ = 0;
   std::unordered_set<uint64_t> diagnosticados_;
   uint64_t dibujados_ = 0;
+  uint64_t dibujos_sombras_ = 0;
   uint64_t dibujados_cronometrados_ = 0;  // of those, with the stage stopwatch
   uint32_t cronometro_contador_ = 0;
   bool cronometrar_ = false;  // the current draw carries the stage stopwatch

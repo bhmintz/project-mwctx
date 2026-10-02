@@ -119,6 +119,14 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, REX_VULKAN_ALLOW_UNSYNCED
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+// The swapchain no taller than this, keeping the window's aspect ratio; 0 = the window's size. On Android the
+// window is scaled to the screen by the compositor/display hardware (SCALE_TO_WINDOW), so painting the guest
+// output into a smaller swapchain saves GPU fill and bandwidth (the Mali-G52 painted 2400x1080 per frame for a
+// 1024x576 game). The launcher sets it for weak GPUs.
+REXCVAR_DEFINE_INT32(vulkan_swapchain_alto_max, 0, "UI/Vulkan",
+                     "Alto maximo del swapchain (se escala a la pantalla por hardware); 0 = el de la ventana")
+    .range(0, 4320);
+
 #if REX_PLATFORM_SWITCH
 #define REX_PRESENT_PERFIL_PINTADO_DEFAULT true
 #else
@@ -1558,6 +1566,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // create until the surface becomes smaller).
   VkExtent2D max_framebuffer_extent = util::GetMax2DFramebufferExtent(vulkan_device->properties());
   VkExtent2D image_extent;
+  // vulkan_swapchain_alto_max: a smaller swapchain, scaled to the window outside the GPU.
+  if (const int32_t alto_max = REXCVAR_GET(vulkan_swapchain_alto_max);
+      alto_max > 0 && height > uint32_t(alto_max) && width && height) {
+    width = std::max(uint32_t(1), uint32_t((uint64_t(width) * uint32_t(alto_max) + height / 2) / height));
+    height = uint32_t(alto_max);
+  }
 #if REX_PLATFORM_SWITCH
   // The VI surface reports the NWindow's current dimensions as both the
   // minimum and the maximum, so clamping would pin a resize to the old size.
@@ -2780,8 +2794,13 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   present_info.pResults = nullptr;
   VkResult present_result;
   {
-    const VulkanDevice::Queue::Acquisition queue_acquisition =
-        vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+    // vulkan_cola_presentar_propia: its own queue, so the wait for the GPU inside vkQueuePresentKHR (Mali)
+    // does not hold the lock of the queue the work goes to. The present semaphore orders it after the paint.
+    const VulkanDevice::Queue::Acquisition queue_acquisition = vulkan_device_->AcquireQueue(
+        paint_context_.present_queue_family,
+        paint_context_.present_queue_family == vulkan_device_->queue_family_graphics_compute()
+            ? vulkan_device_->present_queue_index()
+            : 0);
     perfil = PintadoTramo(kTrozoCandadoPresentar, perfil);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
     perfil = PintadoTramo(kTrozoPresentar, perfil);

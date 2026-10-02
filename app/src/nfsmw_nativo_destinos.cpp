@@ -409,6 +409,17 @@ REXCVAR_DEFINE_INT32(nfsmw_nativo_sombra_minimo_alternar_s, 0, "NFSMW",
  * What the pass does not cover (the rows below its renderArea) is left as a band, cleared before any use
  * that reaches it, like nfsmw_nativo_borrar_area_util. Mali mode only.
  */
+// With the shadows off (Mali), the game still clears the shadow map and resolves it twice per frame: a depth
+// copy of ~0.4 Mpixels each that always gives the same cleared texture. If nothing was drawn on it since its
+// clear, the clear value is the same and the previous copy went to the same image, the texture already holds
+// exactly that: the copy is skipped.
+// See AntesDeEscribirProfundidad: the scene depth copy deferred for the composite without blur.
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_perezosa_sin_lectura, true, "NFSMW",
+                    "Modo Mali: la copia aplazada de la profundidad de la escena se tira al reescribir el origen si "
+                    "nadie la leyo de verdad (la guarda de lecturas tardias la vuelve a activar si hiciera falta)");
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sombra_sin_copia, true, "NFSMW",
+                    "Modo Mali: no repetir la copia del mapa de sombras si solo tiene su borrado (sin dibujos) y "
+                    "la textura ya tiene ese mismo contenido");
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_borrado_en_pase, true, "NFSMW",
                     "Modo Mali: el borrado de un destino se hace al abrir el pase siguiente sobre el (loadOp = "
                     "CLEAR) en vez de con un comando aparte que escribe la imagen entera. false = como antes");
@@ -869,6 +880,16 @@ struct EstadoDestino {
   uint64_t valor_borrado = 0;     // color empaquetado, o profundidad+stencil
   uint64_t dibujos_al_borrar = 0; // global draw counter at that moment
   uint32_t alto_usado = 0;        // the largest y1 the game has resolved from this render target
+  // nfsmw_nativo_mali_sombra_sin_copia: the last depth clear and the shadow draw count at that moment.
+  uint64_t valor_borrado_profundidad = 0;
+  uint64_t sombras_al_borrar = UINT64_MAX;
+};
+// nfsmw_nativo_mali_sombra_sin_copia: the last copy of a shadow map that only had its clear.
+struct CopiaSombraLimpia {
+  VkImage origen = VK_NULL_HANDLE;
+  VkImage destino = VK_NULL_HANDLE;
+  VkImageCopy copia{};
+  uint64_t valor = 0;
 };
 
 // Readback of a small resolved texture (nfsmw_nativo_leer_resueltas_texels):
@@ -1783,6 +1804,11 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     AntesDeEscribirProfundidad(*profundidad);  // nfsmw_nativo_profundidad_perezosa
     SombraMinimoAntesDeBorrar(*profundidad);   // nfsmw_nativo_sombra_minimo
     profundidad->contenido_invalido = false;  // The clear gives it contents
+    {
+      EstadoDestino& e = estado_destino_[profundidad];  // nfsmw_nativo_mali_sombra_sin_copia
+      e.valor_borrado_profundidad = uint64_t(reg.rb_depth_clear);
+      e.sombras_al_borrar = dibujos_ ? dibujos_->DibujosSombras() : UINT64_MAX;
+    }
     const VkClearDepthStencilValue valor{float(reg.rb_depth_clear >> 8) / 16777215.0f,
                                          reg.rb_depth_clear & 0xFF};
     // If it is already cleared with this same value and nobody has drawn anything since then, the clear does
@@ -1908,6 +1934,17 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
         dy >= resuelta->imagen.alto) {
       return;
     }
+    // nfsmw_nativo_mali_sombra_sin_copia: the shadow map holds only its clear (no shadow draw since then).
+    bool sombra_limpia = false;
+    uint64_t valor_sombra = 0;
+    if (escalado && dibujos_ && dibujos_->ModoMali() && !profundidad->contenido_invalido &&
+        REXCVAR_GET(nfsmw_nativo_mali_sombra_sin_copia)) {
+      const auto e = estado_destino_.find(profundidad);
+      if (e != estado_destino_.end() && e->second.sombras_al_borrar == dibujos_->DibujosSombras()) {
+        sombra_limpia = true;
+        valor_sombra = e->second.valor_borrado_profundidad;
+      }
+    }
     // nfsmw_nativo_resolver_contenido_valido. If the content of this render target went away in an earlier
     // swap and nobody brought it back, it is in another texture: it is brought back before reading it (the
     // menu flicker).
@@ -1942,12 +1979,30 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       copia.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
       copia.dstOffset = {aX(int32_t(dx)), aY(int32_t(dy)), 0};
       copia.extent = {ancho_img, alto_img, 1};
+      const uint32_t base_sombra = base & 0x1FFFFFFF;
+      if (sombra_limpia) {
+        const auto previa = copias_sombra_limpias_.find(base_sombra);
+        if (previa != copias_sombra_limpias_.end() && previa->second.origen == profundidad->imagen &&
+            previa->second.destino == resuelta->imagen.imagen && previa->second.valor == valor_sombra &&
+            std::memcmp(&previa->second.copia, &copia, sizeof(copia)) == 0) {
+          if (++copias_sombra_saltadas_ == 1) {
+            REXLOG_INFO("[nativo] C2 modo Mali: copia del mapa de sombras sin dibujos saltada ({}x{}; la textura "
+                        "ya tiene ese borrado) (nfsmw_nativo_mali_sombra_sin_copia)",
+                        ancho_img, alto_img);
+          }
+          return;
+        }
+      }
       copiar_imagen_(comandos_trabajo_, profundidad->imagen, VK_IMAGE_LAYOUT_GENERAL,
                      resuelta->imagen.imagen, VK_IMAGE_LAYOUT_GENERAL, 1, &copia);
       ++copias_;
       ++sombras_subidas_;
       AnotarCopia(ancho_img, alto_img);
-      ResueltaEscrita(base & 0x1FFFFFFF, uint64_t(ancho_img) * alto_img);
+      ResueltaEscrita(base_sombra, uint64_t(ancho_img) * alto_img);  // forgets copias_sombra_limpias_[base]
+      if (sombra_limpia) {
+        copias_sombra_limpias_[base_sombra] =
+            CopiaSombraLimpia{profundidad->imagen, resuelta->imagen.imagen, copia, valor_sombra};
+      }
       return;
     }
     // If the whole render target is resolved to a texture of the same size, the images are swapped and
@@ -3746,7 +3801,12 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
       // Dropped even within the same frame if the composite without blur already requested it (leida_muerta).
       // Keeping same-frame copies saved nothing: the game always rewrites the source within the same frame,
       // and the reader watch saw 0 reads after the rewrite. The guard catches a late read.
-      if (!it->second.leida_muerta) {
+      // Mali (nfsmw_nativo_mali_perezosa_sin_lectura): the composite reads the depth texture before the game
+      // resolves it again, so leida_muerta never arrives in time and every copy was recorded here. A live read
+      // records the copy on the spot (AnotarLecturaProfundidad), so one still pending now was never needed.
+      const bool tirar = it->second.leida_muerta ||
+                         (dibujos_ && dibujos_->ModoMali() && REXCVAR_GET(nfsmw_nativo_mali_perezosa_sin_lectura));
+      if (!tirar) {
         ++it;  // GrabarCopiaPendiente erases that entry: the iterator is already on the next one
         GrabarCopiaPendiente(direccion);
         ++perezosa_copiadas_escritura_;
@@ -5059,6 +5119,9 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   // (the normal case) touches nothing. `pixeles` = the pixels actually copied (0 if the resolve swapped
   // images), so that the per-target inventory shows where the traffic goes.
   void ResueltaEscrita(uint32_t base, uint64_t pixeles = 0) {
+    if (!copias_sombra_limpias_.empty()) {
+      copias_sombra_limpias_.erase(base);  // something else wrote it (nfsmw_nativo_mali_sombra_sin_copia)
+    }
     SombraMinimoResueltaEscrita(base);  // nfsmw_nativo_sombra_minimo
     if (!prestadas_.empty()) {
       prestadas_.erase(base);
@@ -6546,6 +6609,8 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   uint64_t intercambios_color_ = 0;  // color targets resolved without a copy
   // Copies and clears removed, and what they cost.
   std::unordered_map<const Imagen*, EstadoDestino> estado_destino_;
+  std::unordered_map<uint32_t, CopiaSombraLimpia> copias_sombra_limpias_;
+  uint64_t copias_sombra_saltadas_ = 0;
   uint64_t borrados_saltados_ = 0;             // de color
   uint64_t borrados_saltados_profundidad_ = 0;
   uint64_t pixeles_borrados_saltados_ = 0;

@@ -256,7 +256,34 @@ public final class GameActivity extends SDLActivity
             args.add("--present_safe_area_x=100");
             args.add("--present_safe_area_y=100");
         }
+        args.addAll(extraArguments());
         return args.toArray(new String[0]);
+    }
+
+    /**
+     * Developer cvars for measurements: nfsmw_args.txt in the game folder, one "--cvar=value" per line (# starts a
+     * comment). They go last, so they win over the launcher's options. Without the file nothing changes; it lets a
+     * release APK take diagnostic cvars, which otherwise live in a nfsmw.toml only a debuggable APK can reach.
+     */
+    private List<String> extraArguments() {
+        List<String> extra = new ArrayList<>();
+        File file = new File(gameRoot, "nfsmw_args.txt");
+        if (!file.isFile()) {
+            return extra;
+        }
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(file))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.startsWith("--")) {
+                    extra.add(line);
+                }
+            }
+            Log.i(TAG, "nfsmw_args.txt: " + extra);
+        } catch (java.io.IOException e) {
+            Log.w(TAG, "nfsmw_args.txt: " + e);
+        }
+        return extra;
     }
 
     // ---- Physical gamepads ---------------------------------------------------------------------------------

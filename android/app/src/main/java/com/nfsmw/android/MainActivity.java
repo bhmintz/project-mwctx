@@ -313,7 +313,12 @@ public final class MainActivity extends Activity {
         optionsList.removeAllViews();
         for (GameOptions.Option option : GameOptions.ALL) {
             String value = GameOptions.get(this, option.key);
-            optionsList.addView(optionRow(option.title, option.label(value), () -> chooseOption(option)));
+            // The row shows only the short name ("720p", "Optimizado"); the part after " · " describes the
+            // choice and stays in the list the row opens, so long labels do not stretch the row.
+            String shown = option.label(value);
+            int note = shown.indexOf(" · ");
+            if (note > 0) shown = shown.substring(0, note);
+            optionsList.addView(optionRow(option.title, shown, () -> chooseOption(option)));
         }
         SharedPreferences controls = getSharedPreferences("nfsmw_controls", MODE_PRIVATE);
         boolean stretch = controls.getBoolean("stretch", true);
@@ -356,6 +361,9 @@ public final class MainActivity extends Activity {
                 new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
         TextView current = label(value + "  ›", 13, ACCENT, true);
         current.setGravity(Gravity.END);
+        current.setMaxLines(1);
+        current.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        current.setPadding(dp(8), 0, 0, 0);
         row.addView(current);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);

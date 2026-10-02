@@ -10,6 +10,10 @@
 //     priority one from elsewhere) can no longer take four fifths of the core from it.
 //   - nfsmw_android_hilos_tiron: a 100 ms sampler of /proc/self/task. When the ring reports a stutter, the
 //     threads that used CPU in that window are logged with their milliseconds and the core they last ran on.
+//   - nfsmw_android_adpf: an ADPF performance hint session (Android 13+) for the ring thread. Sampled during
+//     a race, the A75s sometimes sat at 1.3-1.4 GHz with a 1.71 GHz cap: the frequency governor lowered the
+//     clock in the middle of the ring's work. Each Swap reports how long the ring's frame took against the
+//     target (nfsmw_android_adpf_objetivo_us), and the system keeps the clock up for it.
 
 #include "nfsmw_hilos_android.h"
 
@@ -22,10 +26,19 @@ REXCVAR_DEFINE_INT32(nfsmw_android_nice_anillo, -10, "NFSMW",
     .range(-20, 0);
 REXCVAR_DEFINE_BOOL(nfsmw_android_hilos_tiron, true, "NFSMW",
                     "Android: en cada tiron, anota que hilos del proceso usaron CPU en esa ventana y en que nucleo");
+REXCVAR_DEFINE_BOOL(nfsmw_android_adpf, true, "NFSMW",
+                    "Android 13+, modo Mali: sesion ADPF (performance hint) del hilo del anillo, que informa la "
+                    "duracion de cada fotograma para que el sistema no le baje el reloj")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(nfsmw_android_adpf_objetivo_us, 16666, "NFSMW",
+                     "Duracion objetivo del fotograma del anillo que se le pide a ADPF, en microsegundos")
+    .range(1000, 100000)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 #if defined(__ANDROID__)
 
 #include <dirent.h>
+#include <dlfcn.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -180,14 +193,63 @@ void Muestreador() {
   }
 }
 
+// ADPF, loaded from libandroid.so by name: the APK still runs on Android 8 (minSdk 26), where it does not exist.
+struct Adpf {
+  using FnManager = void* (*)();
+  using FnCrear = void* (*)(void*, const int32_t*, size_t, int64_t);
+  using FnInformar = int (*)(void*, int64_t);
+  FnInformar informar = nullptr;
+  void* sesion = nullptr;
+  Reloj::time_point anterior{};
+  uint64_t informes = 0;
+
+  void Crear() {
+    void* lib = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) {
+      return;
+    }
+    const auto manager = reinterpret_cast<FnManager>(dlsym(lib, "APerformanceHint_getManager"));
+    const auto crear = reinterpret_cast<FnCrear>(dlsym(lib, "APerformanceHint_createSession"));
+    informar = reinterpret_cast<FnInformar>(dlsym(lib, "APerformanceHint_reportActualWorkDuration"));
+    void* m = manager ? manager() : nullptr;
+    if (!m || !crear || !informar) {
+      REXLOG_INFO("[hilos] ADPF no disponible en este Android");
+      return;
+    }
+    const int32_t tid = int32_t(gettid());
+    const int64_t objetivo = int64_t(REXCVAR_GET(nfsmw_android_adpf_objetivo_us)) * 1000;
+    sesion = crear(m, &tid, 1, objetivo);
+    REXLOG_INFO("[hilos] ADPF: sesion del hilo del anillo (tid {}), objetivo {:.2f} ms: {}", tid,
+                double(objetivo) / 1e6, sesion ? "ok" : "rechazada");
+  }
+
+  // Once per Swap: the ring's frame, from the previous Swap to this one.
+  void Informar() {
+    const auto ahora = Reloj::now();
+    if (sesion && anterior.time_since_epoch().count() != 0) {
+      const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ahora - anterior).count();
+      if (ns > 0 && ns < 1000000000) {  // a load or a pause is not a frame
+        informar(sesion, ns);
+        ++informes;
+      }
+    }
+    anterior = ahora;
+  }
+};
+
 }  // namespace
 
 void AlPresentar() {
   static thread_local bool hecho = false;
+  static thread_local Adpf adpf;
   if (hecho) {
+    adpf.Informar();
     return;
   }
   hecho = true;
+  if (REXCVAR_GET(nfsmw_android_adpf) && nfsmw::nativo::g_nativo_modo_mali.load(std::memory_order_relaxed)) {
+    adpf.Crear();
+  }
   const int32_t nice = REXCVAR_GET(nfsmw_android_nice_anillo);
   if (nice < 0 && nfsmw::nativo::g_nativo_modo_mali.load(std::memory_order_relaxed)) {
     const int r = setpriority(PRIO_PROCESS, 0, nice);  // 0 = the calling thread on Linux

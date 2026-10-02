@@ -45,6 +45,16 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/V
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+// vkQueuePresentKHR on its own queue (the second one of the graphics family, when the GPU has it). On the Mali
+// the present waits for the GPU inside the call; with a single queue it holds the queue's lock all that time
+// and the native renderer's ring waits 5-9 ms per frame to submit its work. Off: measured on the Mali-G52
+// (driver r26p0) in the same race, the lock wait went to 0 but the ring's fence waits went from 0.04 to
+// 14-18 ms per frame and the race from ~36 to ~30 fps; the driver syncs the two queues badly.
+REXCVAR_DEFINE_BOOL(vulkan_cola_presentar_propia, false, "UI/Vulkan",
+                    "Presentar por una cola propia (la segunda de la familia de graficos, si la GPU la tiene), "
+                    "para que vkQueuePresentKHR no retenga la cola en la que se envia el trabajo")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -500,6 +510,16 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   device->queue_families_[device->queue_family_graphics_compute_].queues.resize(std::max(
       size_t(1), device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
+  // vulkan_cola_presentar_propia: a second queue of the graphics family for vkQueuePresentKHR.
+  if (REXCVAR_GET(vulkan_cola_presentar_propia) &&
+      queue_families[device->queue_family_graphics_compute_].queueCount >= 2 &&
+      device->queue_families_[device->queue_family_graphics_compute_].may_support_presentation) {
+    device->queue_families_[device->queue_family_graphics_compute_].queues.resize(
+        std::max(size_t(2), device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
+    device->present_queue_index_ = 1;
+    REXLOG_INFO("Vulkan: vkQueuePresentKHR por una cola propia (cola 1 de la familia {})",
+                device->queue_family_graphics_compute_);
+  }
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));
