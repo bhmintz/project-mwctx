@@ -120,6 +120,8 @@ class VulkanDevice {
     // Features enabled for native shaders, if requested at initialization.
     bool shaderInt64 = false;
     bool shaderSampledImageArrayDynamicIndexing = false;
+    // ETC2/EAC sampling (phones): the native renderer's Mali mode stores its BC textures transcoded to it.
+    bool textureCompressionETC2 = false;
     bool bufferDeviceAddress = false;
     bool runtimeDescriptorArray = false;
     bool descriptorBindingPartiallyBound = false;

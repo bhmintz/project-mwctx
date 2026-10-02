@@ -83,6 +83,8 @@ public final class MainActivity extends Activity {
     private ProgressBar shaderProgress;
     private TextView shaderText;
     private ShaderBuilder shaderBuilder;
+    private Button prepareTextures;
+    private TexturePrep texturePrep;
 
     private View buildScreen() {
         FrameLayout screen = new FrameLayout(this);
@@ -155,6 +157,15 @@ public final class MainActivity extends Activity {
         folderParams.topMargin = dp(10);
         left.addView(selectFolder, folderParams);
 
+        // Mali only: the GPUs that cannot sample the game's BC textures and use the ETC2 cache.
+        prepareTextures = actionButton("Preparar texturas", false);
+        prepareTextures.setVisibility(View.GONE);
+        prepareTextures.setOnClickListener(view -> toggleTexturePrep());
+        LinearLayout.LayoutParams prepParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(46));
+        prepParams.topMargin = dp(10);
+        left.addView(prepareTextures, prepParams);
+
         // Right: graphics options.
         LinearLayout right = card();
         LinearLayout.LayoutParams rightParams = new LinearLayout.LayoutParams(
@@ -222,6 +233,54 @@ public final class MainActivity extends Activity {
             }
         });
         shaderBuilder.start();
+    }
+
+    /**
+     * "Preparar texturas" (TexturePrep): the ETC2 cache filled from the game files, with the same progress panel
+     * as the shaders. Pressing it again while it runs cancels it; what was done stays.
+     */
+    private void toggleTexturePrep() {
+        if (texturePrep != null) {
+            texturePrep.cancel();
+            prepareTextures.setEnabled(false);
+            return;
+        }
+        if (shaderBuilder != null) {
+            return;
+        }
+        texturePrep = TexturePrep.start(sharedGameRoot(), getFilesDir(), new TexturePrep.Listener() {
+            @Override
+            public void onProgress(float fraction, String text) {
+                shaderProgress.setProgress(Math.round(fraction * 1000));
+                shaderText.setText(text);
+            }
+
+            @Override
+            public void onDone(String summary, boolean ok) {
+                texturePrep = null;
+                getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                launchGame.setEnabled(true);
+                launchGame.setAlpha(1f);
+                selectFolder.setEnabled(true);
+                prepareTextures.setEnabled(true);
+                prepareTextures.setText("Preparar texturas");
+                shaderProgress.setProgress(ok ? 1000 : shaderProgress.getProgress());
+                shaderText.setText(summary);
+            }
+        });
+        if (texturePrep == null) {
+            shaderPanel.setVisibility(View.VISIBLE);
+            shaderText.setText("No se pudo iniciar la preparación de texturas.");
+            return;
+        }
+        launchGame.setEnabled(false);
+        launchGame.setAlpha(.5f);
+        selectFolder.setEnabled(false);
+        prepareTextures.setText("Cancelar");
+        shaderPanel.setVisibility(View.VISIBLE);
+        shaderProgress.setProgress(0);
+        shaderText.setText("Leyendo los archivos del juego…");
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
     private void shadersFinished() {
@@ -626,6 +685,9 @@ public final class MainActivity extends Activity {
             setImportStatus((notice == null ? "" : notice + "\n") + "Memoria interna/" + GAME_FOLDER_NAME);
             launchGame.setVisibility(View.VISIBLE);
             selectFolder.setText("Cambiar carpeta del juego");
+            if (GpuInfo.renderer(this).toLowerCase(java.util.Locale.ROOT).contains("mali")) {
+                prepareTextures.setVisibility(View.VISIBLE);
+            }
         } else {
             setImportStatus("Elige la carpeta extraída del juego (con default.xex, NFS y Movies). Se copiará a " +
                     "Memoria interna/" + GAME_FOLDER_NAME + ".");

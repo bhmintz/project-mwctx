@@ -348,6 +348,48 @@ REXCVAR_DEFINE_INT32(nfsmw_cubemap_detalle_minimo, 8, "NFSMW",
                      "se aplica a las caras que rotan, nunca a las fijas. 0 = dejar el valor del juego")
     .range(0, 64);
 
+/*
+ * What the car reflections show.
+ * 1, sky only: the same PixelMinSize threshold, raised past the size of the face itself (256x256).
+ * Buildings, trees and traffic no longer enter the rotating faces, and what is left is what covers the whole
+ * face (the sky, and the background the face is cleared to). The body still reflects a moving sky instead of
+ * a frozen picture, at the cost of a handful of draws per face. Checked on the A32 (sky visible, race at
+ * 33-42 fps with the mirror off).
+ * 2, off: nothing passes the threshold, and once the six faces have been drawn once (so the body never
+ * reflects black) they are never drawn again: no cubemap cost at all, whatever nfsmw_cubemap_caras_max says.
+ * 3, own (static) reflection, the idea of Source's env_cubemap: the faces are drawn with everything (the
+ * game's own detail), one per frame for one round of six, and then left frozen until the next round, every
+ * nfsmw_cubemap_propio_cada_s seconds. The body reflects the real surroundings of where the car was a moment
+ * ago instead of only the sky, and between rounds the cubemap costs nothing.
+ * 4, fixed reflection, like a Source env_cubemap texture: the rotating faces are never drawn, not even the
+ * first round, and the native renderer hands the car a fixed cubemap built from the game's own panorama of
+ * Rockport (reflejo_fijo.bin, written by the launcher's "Preparar texturas"; see CuboFijo in
+ * nfsmw_nativo_dibujos.cpp). Without that file it behaves like 2.
+ */
+REXCVAR_DEFINE_INT32(nfsmw_cubemap_contenido, 0, "NFSMW",
+                     "Contenido de los reflejos del coche: 0 = completo; 1 = solo el cielo (sin objetos de menos de "
+                     "nfsmw_cubemap_solo_cielo_px pixeles); 2 = desactivados (sin objetos y sin renovarse); 3 = "
+                     "propio (completo, una ronda de seis caras cada nfsmw_cubemap_propio_cada_s y congelado entre "
+                     "rondas); 4 = fijo (un cubemap hecho con el panorama de la ciudad del juego, sin dibujar caras)")
+    .range(0, 4);
+REXCVAR_DEFINE_INT32(nfsmw_cubemap_propio_cada_s, 3, "NFSMW",
+                     "Segundos entre rondas del reflejo propio (nfsmw_cubemap_contenido = 3)")
+    .range(1, 60);
+REXCVAR_DEFINE_INT32(nfsmw_cubemap_solo_cielo_px, 1024, "NFSMW",
+                     "Umbral de nfsmw_cubemap_contenido = 1 (eView::PixelMinSize de las caras que rotan)")
+    .range(65, 1000000);
+
+/*
+ * Diagnostic for the per-zone reflection cubemaps: where the car is. From the decompilation, eView keeps a
+ * Camera* right after its ViewDirection (around +0x38) and the Camera starts with its matrix and position.
+ * Every 2 s in a race this logs, for the scene view and the cubemap's first face, the words at +0x30..+0x44 of
+ * the view and, if +0x38 looks like a pointer, the first 0x60 bytes of what it points to as floats. The face
+ * camera sits on the car, so its position must move with it and match on all six faces.
+ */
+REXCVAR_DEFINE_BOOL(nfsmw_cubemap_diag_posicion, false, "NFSMW",
+                    "Diagnostico: anota cada 2 s en carrera los campos de camara de la vista de la escena y de la "
+                    "primera cara del cubemap (para ubicar la posicion del coche)");
+
 REXCVAR_DEFINE_INT32(nfsmw_cubemap_diag_ciclo_s, 0, "NFSMW",
                      "Diagnostico: con N > 0, en carrera solo se actualiza una cara del mapa de entorno "
                      "y cambia de cara cada N segundos (anota cada cambio), para ver cual usa el "
@@ -357,6 +399,7 @@ REXCVAR_DEFINE_INT32(nfsmw_cubemap_diag_ciclo_s, 0, "NFSMW",
 namespace nfsmw::nativo {
 extern std::atomic<bool> g_nativo_modo_mali;
 extern std::atomic<bool> g_retrovisor_apagado;
+extern std::atomic<bool> g_reflejo_fijo;
 }
 
 namespace nfsmw::recortes_carrera {
@@ -469,6 +512,7 @@ std::atomic<uint32_t> g_rotacion{0};
 constexpr uint32_t kTodasLasCaras = (1u << kCaras) - 1u;
 uint32_t g_caras_estrenadas = 0;
 std::atomic<bool> g_aviso_estreno{false};
+std::atomic<bool> g_aviso_fijo{false};
 std::atomic<bool> g_aviso_estreno_falta{false};
 std::atomic<bool> g_aviso_retrovisor{false};
 std::atomic<int> g_cara_diag{-1};
@@ -626,7 +670,10 @@ void AjustarDetalleCubo(uint8_t* base, uint32_t tabla, uint32_t cara, uint32_t v
     }
     g_detalle_del_juego[cara] = actual;
   }
-  const int32_t pedido = REXCVAR_GET(nfsmw_cubemap_detalle_minimo);
+  const int32_t contenido = REXCVAR_GET(nfsmw_cubemap_contenido);
+  const int32_t pedido = contenido == 2   ? 0x3FFFFFFF
+                         : contenido == 1 ? REXCVAR_GET(nfsmw_cubemap_solo_cielo_px)
+                                          : REXCVAR_GET(nfsmw_cubemap_detalle_minimo);
   const int32_t deseado = pedido > 0 ? pedido : g_detalle_del_juego[cara];
   if (actual == deseado) {
     return;
@@ -643,8 +690,9 @@ void AjustarDetalleCubo(uint8_t* base, uint32_t tabla, uint32_t cara, uint32_t v
   g_detalle_aplicado[cara] = deseado;
   if (!g_aviso_detalle.exchange(true)) {
     REXLOG_INFO("[recortes] cubo: los objetos de menos de {} pixeles dejan de dibujarse en las caras "
-                "que rotan (el juego usa {}); las caras fijas no se tocan",
-                deseado, kDetalleMinimoJuego);
+                "que rotan (el juego usa {}){}; las caras fijas no se tocan",
+                deseado, kDetalleMinimoJuego,
+                contenido == 2 ? ", reflejos desactivados" : contenido == 1 ? ", reflejos solo con el cielo" : "");
   }
 }
 
@@ -671,6 +719,39 @@ void AjustarDetalleRetrovisor(uint8_t* base, uint32_t cara, uint32_t vista) {
                 deseado, g_detalle_del_juego[cara]);
   }
   g_detalle_aplicado[cara] = deseado;
+}
+
+// nfsmw_cubemap_diag_posicion.
+void DiagnosticoPosicion(uint8_t* base, uint32_t tabla) {
+  using namespace std::chrono;
+  static steady_clock::time_point ultimo{};
+  const auto ahora = steady_clock::now();
+  if (ahora - ultimo < seconds(2)) {
+    return;
+  }
+  ultimo = ahora;
+  const uint32_t vistas[3] = {DireccionVista(kVistaEscena), Leer32(base, tabla), Leer32(base, tabla + 12)};
+  for (int k = 0; k < 3; ++k) {
+    const uint32_t v = vistas[k];
+    if (!EsVista(v)) {
+      continue;
+    }
+    std::string linea = fmt::format("[diag posicion] vista {} (+30..+44):", NumeroDeVista(v));
+    for (uint32_t o = 0x30; o <= 0x44; o += 4) {
+      linea += fmt::format(" {:08X}", Leer32(base, v + o));
+    }
+    // +0x38 read 0 on the A32; the pointers are at +0x40 and +0x44.
+    for (uint32_t campo : {0x40u, 0x44u}) {
+      const uint32_t camara = Leer32(base, v + campo);
+      if (camara >= 0x40000000u && camara < 0xA0000000u) {
+        linea += fmt::format(" | +{:X} -> {:08X}:", campo, camara);
+        for (uint32_t o = 0; o < 0x80; o += 4) {
+          linea += fmt::format(" {:.1f}", LeerFlotante(base, camara + o));
+        }
+      }
+    }
+    REXLOG_INFO("{}", linea);
+  }
 }
 
 // Mirror diagnostic: a single active face, changing every 'ciclo_s' seconds.
@@ -996,6 +1077,7 @@ REX_HOOK_RAW(sub_8243C6E0) {
     // The cubemap contents belong to the scenery and are no good for another one.
     g_caras_estrenadas = 0;
     g_aviso_estreno.store(false, std::memory_order_relaxed);
+    nfsmw::nativo::g_reflejo_fijo.store(false, std::memory_order_relaxed);  // menus and garage: the real one
     g_aviso_estreno_falta.store(false, std::memory_order_relaxed);
     return;
   }
@@ -1010,6 +1092,9 @@ REX_HOOK_RAW(sub_8243C6E0) {
   // 0,0,0. It now retries until it matches.
   if (!g_aviso_caras_nombradas.load(std::memory_order_relaxed)) {
     DiagnosticoCarasDelCubo(base, tabla);
+  }
+  if (REXCVAR_GET(nfsmw_cubemap_diag_posicion)) {
+    DiagnosticoPosicion(base, tabla);
   }
   const uint32_t siempre = uint32_t(REXCVAR_GET(nfsmw_cubemap_caras_siempre));
   /*
@@ -1047,7 +1132,24 @@ REX_HOOK_RAW(sub_8243C6E0) {
     DiagnosticoUnaCara(base, tabla, ciclo_s);
     return;
   }
-  const int32_t maximo = REXCVAR_GET(nfsmw_cubemap_caras_max);
+  // nfsmw_cubemap_contenido = 2: after the first round, no rotating face again. 3: one face per frame during a
+  // round (as many frames as rotating faces), none between rounds.
+  const int32_t contenido = REXCVAR_GET(nfsmw_cubemap_contenido);
+  int32_t maximo = contenido == 2 || contenido == 4 ? 0 : REXCVAR_GET(nfsmw_cubemap_caras_max);
+  if (contenido == 3) {
+    using namespace std::chrono;
+    static steady_clock::time_point inicio_ronda{};
+    static uint32_t ronda_restante = 0;
+    const auto ahora = steady_clock::now();
+    if (ronda_restante == 0 && ahora - inicio_ronda >= seconds(REXCVAR_GET(nfsmw_cubemap_propio_cada_s))) {
+      inicio_ronda = ahora;
+      ronda_restante = kCaras;
+    }
+    maximo = ronda_restante > 0 ? 1 : 0;
+    if (ronda_restante > 0) {
+      --ronda_restante;
+    }
+  }
   if (maximo < 0) {
     return;
   }
@@ -1081,6 +1183,18 @@ REX_HOOK_RAW(sub_8243C6E0) {
       continue;
     }
     activas[n++] = vista;
+  }
+  // nfsmw_cubemap_contenido = 4: the renderer reflects its fixed cubemap; no rotating face is ever drawn.
+  const bool fijo = REXCVAR_GET(nfsmw_cubemap_contenido) == 4;
+  nfsmw::nativo::g_reflejo_fijo.store(fijo, std::memory_order_relaxed);
+  if (fijo) {
+    for (uint32_t k = 0; k < n; ++k) {
+      base[activas[k] + kOffActiva] = 0;
+    }
+    if (!g_aviso_fijo.exchange(true)) {
+      REXLOG_INFO("[recortes] carrera: reflejo fijo, {} caras del cubemap apagadas desde el principio", n);
+    }
+    return;
   }
   /*
    * The first full round is never trimmed.

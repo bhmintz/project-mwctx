@@ -66,6 +66,8 @@ set(NFSMW_SOURCES
     # The game's D3D waits without spinning: sleeps until the PM4 ring thread advances
     # (cvar nfsmw_espera_anillo_bloqueante).
     src/nfsmw_espera_anillo.cpp
+    # Mali mode: BC textures transcoded to ETC2/EAC and kept on disk (stubs outside Android).
+    src/nfsmw_cache_etc2.cpp
     # Android: the ring thread's priority and which threads take its core in a stutter.
     src/nfsmw_hilos_android.cpp
     # Frame handoff between the game's two threads without a Sleep(0) loop
@@ -130,6 +132,29 @@ if(ANDROID)
     # SDLActivity resolves SDL_main from libmain.so.
     add_library(nfsmw SHARED ${NFSMW_SOURCES})
     set_target_properties(nfsmw PROPERTIES OUTPUT_NAME main)
+    # etcpak (BSD-3), the ETC2/EAC encoder of nfsmw_cache_etc2.cpp. Only its encoder sources are vendored.
+    set(NFSMW_ETCPAK_SOURCES
+        "${REXSDK_DIR}/thirdparty/etcpak/ProcessRGB.cpp"
+        "${REXSDK_DIR}/thirdparty/etcpak/Tables.cpp"
+        "${REXSDK_DIR}/thirdparty/etcpak/Dither.cpp")
+    target_sources(nfsmw PRIVATE src/nfsmw_etc2_codificar.cpp ${NFSMW_ETCPAK_SOURCES})
+
+    # libnfsmw_precarga.so: fills the ETC2 cache from the game files before playing (the launcher's "Preparar
+    # texturas"). Loaded by MainActivity without the engine: only the pack reader (with EA's HUFF decoder,
+    # GPL-3, sdk/thirdparty/eac_huff), the key arithmetic and the transcoder.
+    add_library(nfsmw_precarga SHARED
+        src/nfsmw_tpk.cpp
+        src/nfsmw_precarga_etc2.cpp
+        src/nfsmw_etc2_codificar.cpp
+        src/nfsmw_precarga_jni.cpp
+        ${NFSMW_ETCPAK_SOURCES})
+    target_compile_features(nfsmw_precarga PRIVATE cxx_std_20)
+    target_include_directories(nfsmw_precarga PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${REXSDK_DIR}/thirdparty/xxHash"
+        "${REXSDK_DIR}/thirdparty/eac_huff")
+    target_link_libraries(nfsmw_precarga PRIVATE log)
+    target_link_options(nfsmw_precarga PRIVATE "-Wl,-z,max-page-size=16384")
 elseif(WIN32)
     add_executable(nfsmw WIN32 ${NFSMW_SOURCES})
     # PC build: masks again the floating-point exceptions that

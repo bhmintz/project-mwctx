@@ -109,6 +109,9 @@ static const uint32_t kSpirvResplandorSuave[1] = {0};
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+#include "nfsmw_cache_etc2.h"  // Mali mode: BC textures transcoded to ETC2/EAC, kept on disk
+#include "nfsmw_xenos_texturas.h"  // Xenos texture layout (shared with the ETC2 prefill)
+
 #if REX_PLATFORM_SWITCH
 // Only for RexSwitchSetCurrentThreadPriorityOk (texture bind thread). That header deliberately does not
 // include switch.h (same as in nfsmw_nativo_sistema.cpp).
@@ -396,6 +399,48 @@ REXCVAR_DEFINE_BOOL(nfsmw_nativo_cache_texturas_entre_fotogramas, true, "NFSMW",
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_mipmaps, true, "NFSMW",
                     "Renderizador nativo: sube los niveles de mip que trae el juego (como en la Xbox 360). false: solo "
                     "el nivel base, como antes de la build 136")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+/*
+ * The fixed reflection (nfsmw_cubemap_contenido = 4), the idea of a Source env_cubemap: instead of the
+ * cubemap the game draws around the car, the car reflects a fixed one, built here once from the game's own
+ * panorama of Rockport (the one it puts in building windows; the launcher's "Preparar texturas" saves it as
+ * cache/etc2/reflejo_fijo.bin). The panorama goes around the horizon, mirrored every half turn so it has no
+ * seam; above it fades into the sky's colour and below into a darker ground. Which world axis is up depends
+ * on how the game builds the reflection vector, hence nfsmw_cubemap_fijo_arriba.
+ */
+REXCVAR_DEFINE_INT32(nfsmw_cubemap_fijo_arriba, 0, "NFSMW",
+                     "Reflejo fijo: eje del mundo que va hacia arriba en el cubemap. 0 = +Z (el del mundo de NFS); "
+                     "1 = +Y; 2 = -Y")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// The car's shader brightens what it reflects a lot (the game's own cube comes out much darker than the
+// panorama), so at 100 % the car looks painted with the panorama.
+REXCVAR_DEFINE_INT32(nfsmw_cubemap_fijo_brillo, 25, "NFSMW",
+                     "Reflejo fijo: brillo del panorama en porcentaje (100 = tal cual)")
+    .range(0, 200)
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+/*
+ * Diagnostic for filling the ETC2 cache from the game files (phase 2): one line per new BC texture with its
+ * whole fetch constant, the extents the content hash covers, the hash of its first 4 KB (to find it in the
+ * texture packs without knowing its shape) and its cache key. An offline tool computes the same from the
+ * packs; where both agree, the keys can be computed without running the game.
+ */
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_diag_claves_etc2, false, "NFSMW",
+                    "Diagnostico: anota la constante de fetch, las extensiones y la clave ETC2 de cada textura BC nueva "
+                    "(las primeras 4000)");
+/*
+ * Mali mode: texture quality. With N > 0, the BC textures of the world (the keys the launcher's prefill wrote
+ * to mundo.bin; cars, vinyls, logos, menus and the HUD are never lowered) are created without their N largest
+ * mip levels: the image is half (or a quarter) the size and holds levels N and up.
+ * Everything else still sees the full texture: its size, its levels, the cache key and the data read from
+ * the guest; only the image and the copy into it skip those levels. One level less is about 4 times less
+ * texture memory and bandwidth; textures whose short side would drop below 16 texels keep their levels.
+ */
+REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_calidad_texturas, 0, "NFSMW",
+                     "Modo Mali: niveles de mip mas grandes que se omiten en las texturas BC. 0 = calidad completa; "
+                     "1 = media (mitad de resolucion, ~4 veces menos memoria); 2 = baja (un cuarto)")
+    .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // A mip level read from the wrong place (packed tail offset, row or slice alignment) causes no Vulkan
 // errors, only smudges in the distance. The game's mips are reductions of the base level, so their
@@ -1153,6 +1198,8 @@ std::atomic<bool> g_nativo_modo_mali{false};
 // nfsmw_retrovisor_cada = -1 (set by nfsmw_recortes_carrera.cpp while in the game world): the mirror face is
 // no longer drawn, and in Mali mode the HUD quad that shows it is skipped too (OmitirCuadroRetrovisor).
 std::atomic<bool> g_retrovisor_apagado{false};
+// nfsmw_cubemap_contenido = 4 in a race (set by nfsmw_recortes_carrera.cpp): the car reflects CuboFijo.
+std::atomic<bool> g_reflejo_fijo{false};
 namespace {
 
 /*
@@ -1252,6 +1299,7 @@ class MarcaSonda {
   bool activa_;
 };
 
+using namespace nfsmw::xenos_tex;
 namespace gr = rex::graphics;
 namespace xenos = rex::graphics::xenos;
 using rex::ui::vulkan::VulkanDevice;
@@ -1279,6 +1327,7 @@ struct SetsMaliRanura {
   std::unordered_map<uint64_t, VkDescriptorSet> cache;  // same views and samplers, same set
   uint64_t generacion = UINT64_MAX;                      // generacion_texturas_ of the cache
   std::vector<VkImageView> vistas_retiradas;
+  std::vector<ImagenNativa> imagenes_retiradas;  // after the views (RetirarTexturaEtc2)
 };
 // Work slots. The ones actually used are chosen by nfsmw_nativo_ranuras_trabajo; this is the room reserved
 // for them, and it has to match the array in nfsmw_nativo_destinos.cpp.
@@ -1526,14 +1575,104 @@ float Flotante(uint32_t valor) {
   return std::bit_cast<float>(valor);
 }
 
-// Arithmetic of the Xenos mip level layout (pipeline/texture/util.cpp: GetPackedMipLevel,
-// GetPackedMipOffset and GetGuestTextureLayout).
-uint32_t Log2Techo(uint32_t v) {
-  return v <= 1 ? 0 : 32 - uint32_t(std::countl_zero(v - 1));
-}
-
-uint32_t Log2Suelo(uint32_t v) {
-  return v ? 31 - uint32_t(std::countl_zero(v)) : 0;
+// The six RGBA8 faces (Vulkan order +X -X +Y -Y +Z -Z, `lado` texels each) of the fixed reflection, from
+// the panorama file (see nfsmw_cubemap_fijo_arriba). False if the file is missing or not a panorama.
+bool ArmarCuboFijo(const std::filesystem::path& ruta, uint32_t lado, int arriba, float brillo,
+                   std::vector<uint8_t>& salida) {
+  FILE* f = std::fopen(ruta.string().c_str(), "rb");
+  if (!f) {
+    return false;
+  }
+  char magia[8] = {};
+  uint32_t w = 0, h = 0;
+  std::vector<uint8_t> pano;
+  bool ok = std::fread(magia, 1, 8, f) == 8 && std::memcmp(magia, "NFSPANO1", 8) == 0 && std::fread(&w, 4, 1, f) == 1 &&
+            std::fread(&h, 4, 1, f) == 1 && w >= 4 && h >= 4 && w <= 4096 && h <= 4096;
+  if (ok) {
+    pano.resize(size_t(w) * h * 4);
+    ok = std::fread(pano.data(), 1, pano.size(), f) == pano.size();
+  }
+  std::fclose(f);
+  if (!ok) {
+    return false;
+  }
+  // Sky and ground colours: the average of the top and bottom rows.
+  float cielo[3] = {}, suelo[3] = {};
+  const uint32_t filas = std::max(1u, h / 16);
+  for (uint32_t y = 0; y < filas; ++y) {
+    for (uint32_t x = 0; x < w; ++x) {
+      for (int k = 0; k < 3; ++k) {
+        cielo[k] += pano[(size_t(y) * w + x) * 4 + k];
+        suelo[k] += pano[(size_t(h - 1 - y) * w + x) * 4 + k];
+      }
+    }
+  }
+  for (int k = 0; k < 3; ++k) {
+    cielo[k] /= float(filas * w);
+    suelo[k] = suelo[k] / float(filas * w) * 0.5f;
+  }
+  const auto muestra = [&](float u, float v, float* rgb) {  // bilinear, u and v in [0, 1]
+    const float fx = std::clamp(u, 0.0f, 1.0f) * float(w - 1);
+    const float fy = std::clamp(v, 0.0f, 1.0f) * float(h - 1);
+    const uint32_t x0 = uint32_t(fx), y0 = uint32_t(fy);
+    const uint32_t x1 = std::min(x0 + 1, w - 1), y1 = std::min(y0 + 1, h - 1);
+    const float ax = fx - float(x0), ay = fy - float(y0);
+    for (int k = 0; k < 3; ++k) {
+      const float a = pano[(size_t(y0) * w + x0) * 4 + k] * (1 - ax) + pano[(size_t(y0) * w + x1) * 4 + k] * ax;
+      const float b = pano[(size_t(y1) * w + x0) * 4 + k] * (1 - ax) + pano[(size_t(y1) * w + x1) * 4 + k] * ax;
+      rgb[k] = a * (1 - ay) + b * ay;
+    }
+  };
+  constexpr float kPi = 3.14159265f;
+  constexpr float kArriba = 35.0f * kPi / 180.0f;  // elevation of the panorama's top row
+  constexpr float kAbajo = -25.0f * kPi / 180.0f;  // and of its bottom row
+  constexpr float kFundido = 12.0f * kPi / 180.0f;
+  salida.assign(size_t(lado) * lado * 4 * 6, 255);
+  for (uint32_t cara = 0; cara < 6; ++cara) {
+    for (uint32_t j = 0; j < lado; ++j) {
+      for (uint32_t i = 0; i < lado; ++i) {
+        const float sc = 2.0f * (float(i) + 0.5f) / float(lado) - 1.0f;
+        const float tc = 2.0f * (float(j) + 0.5f) / float(lado) - 1.0f;
+        float d[3];
+        switch (cara) {
+          case 0: d[0] = 1; d[1] = -tc; d[2] = -sc; break;
+          case 1: d[0] = -1; d[1] = -tc; d[2] = sc; break;
+          case 2: d[0] = sc; d[1] = 1; d[2] = tc; break;
+          case 3: d[0] = sc; d[1] = -1; d[2] = -tc; break;
+          case 4: d[0] = sc; d[1] = -tc; d[2] = 1; break;
+          default: d[0] = -sc; d[1] = -tc; d[2] = -1; break;
+        }
+        const float largo = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        float alto_dir, h1, h2;
+        if (arriba == 0) {
+          alto_dir = d[2]; h1 = d[0]; h2 = d[1];
+        } else if (arriba == 1) {
+          alto_dir = d[1]; h1 = d[0]; h2 = d[2];
+        } else {
+          alto_dir = -d[1]; h1 = d[0]; h2 = d[2];
+        }
+        const float elevacion = std::asin(std::clamp(alto_dir / largo, -1.0f, 1.0f));
+        const float azimut = std::atan2(h2, h1);
+        const float t = (azimut / kPi + 1.0f) * 0.5f;  // 0..1 around
+        const float u = 1.0f - std::fabs(2.0f * t - 1.0f);  // mirrored every half turn: no seam
+        const float v = (kArriba - elevacion) / (kArriba - kAbajo);
+        float rgb[3];
+        muestra(u, v, rgb);
+        if (elevacion > kArriba - kFundido) {
+          const float a = std::clamp((elevacion - (kArriba - kFundido)) / kFundido, 0.0f, 1.0f);
+          for (int k = 0; k < 3; ++k) rgb[k] = rgb[k] * (1 - a) + cielo[k] * a;
+        } else if (elevacion < kAbajo + kFundido) {
+          const float a = std::clamp(((kAbajo + kFundido) - elevacion) / kFundido, 0.0f, 1.0f);
+          for (int k = 0; k < 3; ++k) rgb[k] = rgb[k] * (1 - a) + suelo[k] * a;
+        }
+        uint8_t* px = &salida[((size_t(cara) * lado + j) * lado + i) * 4];
+        for (int k = 0; k < 3; ++k) {
+          px[k] = uint8_t(std::clamp(rgb[k] * brillo, 0.0f, 255.0f));
+        }
+      }
+    }
+  }
+  return true;
 }
 
 /*
@@ -1570,131 +1709,6 @@ inline uint64_t HuellaMuestra(const uint8_t* datos, uint64_t bytes, uint64_t sem
   return XXH3_64bits_withSeed(datos + ultimo * kBloqueMuestra, size_t(bytes - ultimo * kBloqueMuestra), huella);
 }
 
-// First level of the packed tail: once the short side is 16 texels or less.
-uint32_t NivelEmpaquetado(uint32_t ancho, uint32_t alto) {
-  const uint32_t l = Log2Techo(std::min(ancho, alto));
-  return l > 4 ? l - 4 : 0;
-}
-
-// Blocks from the start of the packed tail to a level of a 2D texture; 0 if the level is not packed.
-void DesplazamientoEmpaquetado(uint32_t ancho, uint32_t alto, uint32_t bloque, uint32_t nivel, uint32_t& x,
-                               uint32_t& y) {
-  const uint32_t l2_ancho = Log2Techo(ancho);
-  const uint32_t l2_alto = Log2Techo(alto);
-  const uint32_t l2 = std::min(l2_ancho, l2_alto);
-  x = 0;
-  y = 0;
-  if (l2 > 4 + nivel) {
-    return;
-  }
-  const uint32_t base = l2 > 4 ? l2 - 4 : 0;
-  const uint32_t m = nivel - base;
-  if (m < 3) {
-    if (l2_ancho > l2_alto) {
-      y = 16u >> m;  // wider than tall: levels are stacked vertically
-    } else {
-      x = 16u >> m;
-    }
-  } else if (l2_ancho > l2_alto) {
-    x = (1u << (l2_ancho - base)) >> (m - 2);
-  } else {
-    y = (1u << (l2_alto - base)) >> (m - 2);
-  }
-  x /= bloque;
-  y /= bloque;
-}
-
-// Address of a block in a texture tiled in 32x32 blocks, copied from GetTiledOffset2D
-// (graphics/pipeline/texture/util.cpp). pitch in blocks.
-int32_t DesplazamientoMosaico2D(int32_t x, int32_t y, uint32_t pitch, uint32_t log2_bytes) {
-  pitch = (pitch + 31) & ~uint32_t(31);
-  const int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5)) << (log2_bytes + 7);
-  const int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << log2_bytes;
-  const int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
-  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
-         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
-}
-
-// Fast untiling. During race stutters the ring spent ~30 ms preparing 5 MB of new textures (about 6 ms
-// per MB): LeerNivel called DesplazamientoMosaico2D and a variable-size memcpy per block. Here, with the
-// block size fixed at compile time:
-//   - what depends on the row (y) is computed once per row;
-//   - within a 16-byte group of the tiling the blocks are contiguous in the source (only the 4 low bits
-//     of micro change), so 16 bytes are copied at once (8 for textures with 1 byte per block).
-// It gives exactly the same addresses as DesplazamientoMosaico2D (checked block by block on PC).
-template <uint32_t kLog2>
-void DesenmosaicarNivel(const uint8_t* origen, uint32_t pitch, uint32_t ox, uint32_t oy, uint32_t bx, uint32_t by,
-                        uint32_t bx_host, uint8_t* destino) {
-  constexpr uint32_t kBytes = 1u << kLog2;
-  constexpr uint32_t kGrupo = (16u >> kLog2) < 8u ? (16u >> kLog2) : 8u;  // blocks contiguous in the source
-  const int32_t macros_fila = int32_t(((pitch + 31) & ~uint32_t(31)) >> 5);
-  for (uint32_t fila = 0; fila < by; ++fila) {
-    const int32_t y = int32_t(oy + fila);
-    const int32_t macro_y = (y >> 5) * macros_fila;
-    const int32_t micro_y = (y & 0xE) << 2;
-    const int32_t y1 = (y & 1) << 4;
-    const int32_t y16 = (y & 16) << 7;
-    const int32_t y8 = (y & 8) >> 2;
-    uint8_t* salida = destino + size_t(fila) * bx_host * kBytes;
-    uint32_t columna = 0;
-    while (columna < bx) {
-      const int32_t x = int32_t(ox + columna);
-      const int32_t macro = ((x >> 5) + macro_y) << (kLog2 + 7);
-      const int32_t micro = ((x & 7) + micro_y) << kLog2;
-      const int32_t offset = macro + ((micro & ~0xF) << 1) + (micro & 0xF) + y1;
-      const int32_t desplazamiento = ((offset & ~0x1FF) << 3) + y16 + ((offset & 0x1C0) << 2) +
-                                     (((y8 + (x >> 3)) & 3) << 6) + (offset & 0x3F);
-      if (kGrupo > 1 && (uint32_t(x) % kGrupo) == 0 && columna + kGrupo <= bx) {
-        std::memcpy(salida + size_t(columna) * kBytes, origen + desplazamiento, kGrupo * kBytes);
-        columna += kGrupo;
-      } else {
-        std::memcpy(salida + size_t(columna) * kBytes, origen + desplazamiento, kBytes);
-        ++columna;
-      }
-    }
-  }
-}
-
-// Byte swap of a whole texture in one go (instead of GpuSwap word by word, with the switch on the order
-// inside the loop). Same result as GpuSwap: for 16-bit units only k8in16 changes anything; for 32-bit
-// units, k8in16, k8in32 and k16in32. It only touches complete units, like the plain loop.
-inline void CambiarOrdenBytes(uint8_t* datos, size_t bytes, uint32_t unidad, uint32_t orden) {
-  constexpr uint32_t k8in16 = 1, k8in32 = 2, k16in32 = 3;  // xenos::Endian
-  size_t n = unidad == 2 ? bytes & ~size_t(1) : bytes & ~size_t(3);
-  if ((unidad == 2 && orden != k8in16) || (unidad != 2 && unidad != 4) || orden == 0) {
-    return;
-  }
-  size_t i = 0;
-#if defined(__aarch64__)
-  for (; i + 16 <= n; i += 16) {
-    const uint8x16_t v = vld1q_u8(datos + i);
-    uint8x16_t r;
-    if (unidad == 2 || orden == k8in16) {
-      r = vrev16q_u8(v);
-    } else if (orden == k8in32) {
-      r = vrev32q_u8(v);
-    } else {
-      r = vreinterpretq_u8_u16(vrev32q_u16(vreinterpretq_u16_u8(v)));
-    }
-    vst1q_u8(datos + i, r);
-  }
-#endif
-  if (unidad == 2 || orden == k8in16) {
-    for (; i + 2 <= n; i += 2) {
-      std::swap(datos[i], datos[i + 1]);
-    }
-  } else if (orden == k8in32) {
-    for (; i + 4 <= n; i += 4) {
-      std::swap(datos[i], datos[i + 3]);
-      std::swap(datos[i + 1], datos[i + 2]);
-    }
-  } else if (orden == k16in32) {
-    for (; i + 4 <= n; i += 4) {
-      std::swap(datos[i], datos[i + 2]);
-      std::swap(datos[i + 1], datos[i + 3]);
-    }
-  }
-}
 
 // The same for a 3D texture tiled in 32x32x4 blocks, copied from GetTiledOffset3D
 // (graphics/pipeline/texture/util.cpp:438-459). pitch and height in blocks.
@@ -2505,6 +2519,12 @@ struct Textura {
   // Mali mode without BC sampling: the guest's BC format; the image is its decoded format and SubirTextura
   // decodes on the CPU. VK_FORMAT_UNDEFINED for the rest.
   VkFormat bc_en_cpu = VK_FORMAT_UNDEFINED;
+  // Mali mode, ETC2 cache (nfsmw_cache_etc2.cpp): the ETC2/EAC format the image was created with because its
+  // content was in the cache (VK_FORMAT_UNDEFINED = not from the cache); the cache key of the content it was
+  // created for; and, for a decoded BC texture, whether its BC data still has to be handed to the encoder.
+  VkFormat etc2 = VK_FORMAT_UNDEFINED;
+  uint64_t clave_etc2 = 0;
+  bool etc2_pendiente = false;
   uint32_t capas = 1;  // 6 for cubemaps
   uint32_t fondo = 0;  // slices of 3D textures; 0 for the rest
   uint64_t huella = 0;
@@ -2521,6 +2541,10 @@ struct Textura {
   bool subir = false;
   std::vector<uint8_t> datos;  // levels already laid out for the host: level after level and, in each, layer after layer
   uint32_t niveles = 1;        // mip levels of the host image
+  // nfsmw_nativo_mali_calidad_texturas: the largest levels the image does not hold. imagen.ancho/alto and
+  // niveles stay the full texture's (what the shader, the data layout and the ETC2 key use); the VkImage is
+  // (ancho >> omitidos) x (alto >> omitidos) with niveles - omitidos levels.
+  uint32_t omitidos = 0;
   std::array<uint32_t, 16> desplazamiento_nivel{};  // data bytes up to each level
   uint64_t bytes = 0;          // what it counts in bytes_texturas_ (for eviction)
   // 1 + its index in en_vuelo_ while the bind thread runs its vkBindImageMemory; 0 = no. While set, the
@@ -2608,6 +2632,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     for (ImagenNativa& vacia : vacias_) {
       DestruirImagen(vacia);
     }
+    for (SetsMaliRanura& s : sets_mali_) {
+      for (ImagenNativa& imagen : s.imagenes_retiradas) DestruirImagen(imagen);
+      s.imagenes_retiradas.clear();
+    }
     // The pool's slabs are released after destroying every image that lives in them. The other way round
     // would free memory that the VkImages still have bound.
     pool_texturas_.Terminar();
@@ -2683,6 +2711,21 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       REXLOG_INFO("[nativo] C3 modo Mali: texturas BC (DXT) {}", bc_en_cpu_ ? "NO soportadas: se descomprimen en la CPU"
                                                                              : "soportadas por la GPU");
+      // ETC2 cache: only if the device samples (and filters) all four target formats.
+      if (bc_en_cpu_ && propiedades.textureCompressionETC2) {
+        bool soporta = true;
+        for (VkFormat f : {VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK, VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK,
+                           VK_FORMAT_EAC_R11_UNORM_BLOCK, VK_FORMAT_EAC_R11G11_UNORM_BLOCK}) {
+          VkFormatProperties fp{};
+          dispositivo_->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
+              dispositivo_->physical_device(), f, &fp);
+          soporta = soporta && (fp.optimalTilingFeatures & kNecesarias) == kNecesarias;
+        }
+        cache_etc2_ = soporta && etc2::Iniciar(rex::filesystem::GetExecutableFolder() / kCarpetaCache / "etc2");
+        if (!soporta) {
+          REXLOG_INFO("[nativo] C3 modo Mali: sin cache ETC2 (el dispositivo no filtra ETC2/EAC)");
+        }
+      }
     }
     // El indexado dinamico de arrays de imagenes es la unica feature que el camino acotado (modo Mali) SI
     // necesita del hardware; el resto (Int64, bufferDeviceAddress, runtimeDescriptorArray, el stack de
@@ -5718,6 +5761,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     desglose_fotograma_ = REXCVAR_GET(nfsmw_nativo_desglose_por_fence);
     ElegirSinBurbuja();
     ElegirAbOmitirPs();
+    if (cache_etc2_) {
+      etc2::Informe(etc2_aciertos_, etc2_fallos_);  // running totals
+    }
     omitir_retrovisor_ = modo_mali_ && g_retrovisor_apagado.load(std::memory_order_relaxed);
     // The cheap PCF bit also changes the pipeline: once per frame.
     {
@@ -6105,6 +6151,34 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     soltando_por_falta_de_memoria_ = false;
     return algo;
+  }
+
+  // One ETC2 texture whose new content is not in the cache (see PrepararTextura): like SoltarImagenes, but
+  // the image may still be in use by work in flight, so it is destroyed when its work slot comes round.
+  void RetirarTexturaEtc2(uint64_t clave) {
+    auto it_t = texturas_.find(clave);
+    if (it_t == texturas_.end()) {
+      return;
+    }
+    const VkImage imagen = it_t->second.imagen.imagen;
+    ++generacion_texturas_;
+    for (auto it = vistas_.begin(); it != vistas_.end();) {
+      if (it->second.imagen != imagen) {
+        ++it;
+        continue;
+      }
+      EscribirImagen(it->second.monton, it->second.ranura, vacias_[it->second.monton].vista);
+      montones_[it->second.monton].libres.push_back(it->second.ranura);
+      RetirarVista(it->second.vista);
+      it = vistas_.erase(it);
+    }
+    vistas_por_imagen_.erase(imagen);
+    bytes_texturas_ -= std::min(bytes_texturas_, it_t->second.bytes);
+    QuitarContenidoTextura(it_t->second, it_t->first);
+    sets_mali_[ranura_actual_].imagenes_retiradas.push_back(it_t->second.imagen);
+    it_t->second.imagen = ImagenNativa{};
+    texturas_.erase(it_t);
+    ++etc2_retiradas_;
   }
 
   // Actually retires a group of images. First the views and their slots (pointed at the empty texture),
@@ -8931,6 +9005,12 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                 cache_entre_fotogramas_ ? "SI" : "no");
     mipmaps_ = REXCVAR_GET(nfsmw_nativo_mipmaps);
     REXLOG_INFO("[nativo] C3: niveles de mip de las texturas (nfsmw_nativo_mipmaps) = {}", mipmaps_ ? "SI" : "no");
+    calidad_omitir_ = modo_mali_ ? uint32_t(std::clamp(REXCVAR_GET(nfsmw_nativo_mali_calidad_texturas), 0, 2)) : 0;
+    if (calidad_omitir_) {
+      REXLOG_INFO("[nativo] C3: calidad de texturas (nfsmw_nativo_mali_calidad_texturas) = {}: las texturas BC se "
+                  "crean sin sus {} niveles de mip mas grandes",
+                  calidad_omitir_ == 1 ? "media" : "baja", calidad_omitir_);
+    }
     texturas_mb_max_ = REXCVAR_GET(nfsmw_nativo_texturas_mb_max);
     if (modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_texturas_mb_max) > 0 &&
         (texturas_mb_max_ <= 0 || texturas_mb_max_ > REXCVAR_GET(nfsmw_nativo_mali_texturas_mb_max))) {
@@ -9257,6 +9337,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       dfn_.vkDestroyImageView(device_, vista, nullptr);
     }
     s.vistas_retiradas.clear();
+    for (ImagenNativa& imagen : s.imagenes_retiradas) {
+      DestruirImagen(imagen);
+    }
+    s.imagenes_retiradas.clear();
     for (VkDescriptorPool pool : s.pools) {
       dfn_.vkResetDescriptorPool(device_, pool, 0);
     }
@@ -9558,6 +9642,53 @@ class DibujosVulkanImpl final : public DibujosVulkan {
 
   // Texture of a fetch constant: heap slot and, if it has to be uploaded, it is left in texturas_a_subir_
   // with its data already prepared. Base level of 2D textures and cubemaps.
+  /*
+   * The data of a texture created as ETC2 (Mali mode, ETC2 cache). Its content key is the one of the bytes just
+   * hashed: if it is the one the image was created for, or another one that is also stored, the data is read
+   * from the cache and queued for upload as is (same layout as the BC data: same bytes per block). Returns
+   * true when it queued an upload.
+   * If the game rewrote the texture with content the cache does not have, there is nothing to upload: the
+   * image cannot take decoded texels. It keeps its previous content, the texture is rechecked in a few
+   * frames, and the next time the image is created (eviction or a new zone) it goes through the decode path.
+   * Counted in the report; with the game's static BC textures it should stay at 0.
+   */
+  bool CargarEtc2(Textura& textura, uint64_t clave_contenido, const FormatoTextura& tf, VkDeviceSize& bytes_subida,
+                  uint64_t& valido_hasta) {
+    VkFormat formato = VK_FORMAT_UNDEFINED;
+    uint32_t bytes = 0;
+    if (!etc2::Buscar(clave_contenido, formato, bytes) || formato != textura.etc2 ||
+        !etc2::Leer(clave_contenido, temporal_)) {
+      ++etc2_sin_contenido_;
+      textura.intervalo = 8;
+      textura.siguiente = fotograma_ + textura.intervalo;
+      valido_hasta = textura.siguiente - 1;
+      return false;
+    }
+    // Level offsets: the BC layout (tight 4x4 blocks, tf.bytes each).
+    size_t total = 0;
+    for (uint32_t n = 0; n < textura.niveles; ++n) {
+      textura.desplazamiento_nivel[n] = uint32_t(total);
+      total += size_t((std::max(textura.imagen.ancho >> n, 1u) + 3) / 4) *
+               ((std::max(textura.imagen.alto >> n, 1u) + 3) / 4) * tf.bytes * textura.capas;
+    }
+    if (total != temporal_.size()) {
+      ++etc2_sin_contenido_;
+      return false;
+    }
+    textura.clave_etc2 = clave_contenido;
+    textura.intervalo = 1;
+    textura.siguiente = fotograma_ + 1;
+    textura.huella = 0;
+    textura.datos.swap(temporal_);
+    textura.subir = true;
+    texturas_a_subir_.push_back(&textura);
+    nfsmw::esperas::g_texturas_subidas.fetch_add(1, std::memory_order_relaxed);
+    nfsmw::esperas::g_bytes_subidos.fetch_add(textura.datos.size(), std::memory_order_relaxed);
+    bytes_subida += (textura.datos.size() + 3) & ~size_t(3);
+    ++etc2_cargadas_;
+    return true;
+  }
+
   void PrepararTextura(const uint32_t* f, uint32_t& ranura, uint32_t& monton,
                        VkDeviceSize& bytes_subida, bool& muestreo_puntual, uint64_t& valido_hasta,
                        uint32_t& ancho_host_out, uint32_t& alto_host_out) {
@@ -9713,6 +9844,57 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       DesplazamientoEmpaquetado(ancho, alto, tf.bloque, 0, base_ox, base_oy);
     }
 
+    // nfsmw_cubemap_contenido = 4: the dynamic cubemap is replaced by the fixed one. It goes through the usual
+    // upload path, like a texture from the ETC2 cache. With every face off from the start none is ever
+    // resolved, so it is also recognised by its shape: the game's is 8888 without mips (fetch 82002402
+    // xxxxx086 141FE0FF ... 00000601, 256x256, at an address that changes), while the cubemaps of the game
+    // files are BC with mips.
+    if (cubo && g_reflejo_fijo.load(std::memory_order_relaxed) &&
+        (uint32_t(base) == dir_cubo_dinamico_ || contexto_->TexturaResuelta(uint32_t(base) & 0x1FFFFFFF) ||
+         (formato == 6 && dir_mips == 0))) {
+      if (estado_cubo_fijo_ == 0) {
+        const auto ruta = rex::filesystem::GetExecutableFolder() / kCarpetaCache / "etc2" / "reflejo_fijo.bin";
+        estado_cubo_fijo_ =
+            ArmarCuboFijo(ruta, kLadoCuboFijo, REXCVAR_GET(nfsmw_cubemap_fijo_arriba),
+                          float(REXCVAR_GET(nfsmw_cubemap_fijo_brillo)) / 100.0f, cubo_fijo_datos_) ? 1 : -1;
+        REXLOG_INFO("[nativo] C3 reflejo fijo: {}", estado_cubo_fijo_ > 0
+                                                       ? fmt::format("cubemap de {}x{} armado con el panorama de la "
+                                                                     "ciudad (arriba = {})",
+                                                                     kLadoCuboFijo, kLadoCuboFijo,
+                                                                     REXCVAR_GET(nfsmw_cubemap_fijo_arriba))
+                                                       : std::string("falta reflejo_fijo.bin (Preparar texturas): se "
+                                                                     "queda el reflejo del juego"));
+      }
+      if (estado_cubo_fijo_ > 0) {
+        constexpr uint64_t kClaveCuboFijo = 0xF1C0B0F1C0B0F1C1ull;
+        Textura& textura = texturas_[kClaveCuboFijo];
+        bool lista = true;
+        if (textura.imagen.imagen == VK_NULL_HANDLE) {
+          lista = CrearTextura(textura.imagen, VK_FORMAT_R8G8B8A8_UNORM, kLadoCuboFijo, kLadoCuboFijo, 6);
+          if (lista) {
+            textura.capas = 6;
+            textura.niveles = 1;
+            textura.desplazamiento_nivel = {};
+            textura.bytes = cubo_fijo_datos_.size();
+            bytes_texturas_ += textura.bytes;
+            textura.datos = cubo_fijo_datos_;
+            textura.subir = true;
+            texturas_a_subir_.push_back(&textura);
+            bytes_subida += (textura.datos.size() + 3) & ~size_t(3);
+          } else {
+            texturas_.erase(kClaveCuboFijo);
+          }
+        }
+        if (lista) {
+          textura.fotograma = fotograma_;
+          ranura = RanuraVista(textura.imagen.imagen, VK_FORMAT_R8G8B8A8_UNORM, swizzle, kSwizzleRGBA, monton);
+          ancho_host_out = kLadoCuboFijo;
+          alto_host_out = kLadoCuboFijo;
+          return;
+        }
+      }
+    }
+
     if (cubo && copiar_imagen_) {
       // The game's dynamic cubemap: C2 resolves its faces one by one to those same addresses. They are
       // copied to the cubemap's layers in the upload command buffer, which runs before the work one, so they
@@ -9726,6 +9908,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                     caras[c]->ancho >= ancho && caras[c]->alto >= alto;
       }
       if (resueltas) {
+        dir_cubo_dinamico_ = uint32_t(base);  // the fixed reflection replaces it even when its faces stop being drawn
         const uint64_t clave_resuelto = clave ^ 0x9E3779B97F4A7C15ull;
         Textura& textura = texturas_[clave_resuelto];
         if (textura.imagen.imagen == VK_NULL_HANDLE) {
@@ -9782,6 +9965,48 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
     }
 
+    // Extent of the guest bytes of the base level (all layers) that huella_cruda covers. Computed here
+    // because the ETC2 cache needs the content hash before creating the image.
+    const uint32_t log2_bloque = tf.bytes >= 16 ? 4 : tf.bytes >= 8 ? 3 : tf.bytes >= 4 ? 2 : tf.bytes >= 2 ? 1 : 0;
+    const uint64_t inicio_crudo = uint64_t(base) & 0x1FFFFFFF;
+    uint64_t extension = 0;
+    {
+      // Extent of a layer: tiled, GetTiledAddressUpperBound2D (pipeline/texture/util.cpp:461-486); linear,
+      // up to the last block. Includes the packed base offset (base_ox, base_oy; 0 for the rest).
+      const uint32_t bloques_x_leidos = bloques_x + base_ox;
+      const uint32_t bloques_y_leidos = bloques_y + base_oy;
+      const uint64_t extension_capa =
+          ((f[0] >> 31) & 0x1)
+              ? uint64_t(std::max<int64_t>(
+                    DesplazamientoMosaico2D(int32_t((bloques_x_leidos - 1) & ~31u),
+                                            int32_t((bloques_y_leidos - 1) & ~31u), pitch_bloques,
+                                            log2_bloque),
+                    0)) +
+                    (log2_bloque == 0   ? 0xA00u
+                     : log2_bloque == 1 ? 0xC00u
+                                        : (0x400u << log2_bloque))
+              : uint64_t(std::max(pitch_bloques, bloques_x_leidos)) * tf.bytes * (bloques_y_leidos - 1) +
+                    uint64_t(bloques_x_leidos) * tf.bytes;
+      extension = (capas - 1) * zancada_cara + extension_capa;
+    }
+    // The ETC2 cache key of a content: the raw hash seeded with the shape (the key words without the
+    // addresses and without bit 11 of f[1], plus the host size, levels and layers). See nfsmw_cache_etc2.cpp.
+    const auto clave_etc2_de = [&](uint64_t huella, const Textura& t) {
+      const uint32_t forma[10] = {claves[0], f[1] & 0x7FF, claves[2], claves[3], (f[5] >> 9) & 0x7,
+                                  t.imagen.ancho, t.imagen.alto, t.niveles, t.capas, 0xE7C20001u};
+      return XXH3_64bits_withSeed(forma, sizeof(forma), huella) | 1;
+    };
+    const auto huella_cruda_de = [&]() {
+      uint64_t h = XXH3_64bits(memoria_->TranslatePhysical(uint32_t(inicio_crudo)), size_t(extension));
+      if (extension_mips) {
+        h = XXH3_64bits_withSeed(memoria_->TranslatePhysical(uint32_t(dir_mips)), size_t(extension_mips), h);
+      }
+      return h;
+    };
+    // Only what can be stored whole: 2D or cube BC, every level read, inside memory.
+    bool candidata_etc2 = cache_etc2_ && EsFormatoBc(tf.formato) && !volumen && leer_base &&
+                                inicio_crudo + extension <= kMemoriaFisica;
+
     Textura& textura = texturas_[clave];
     if (textura.imagen.imagen == VK_NULL_HANDLE) {
       // BC in Vulkan: the size is in whole blocks.
@@ -9799,10 +10024,68 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       midiendo_creacion_ = true;
       // Mali mode without BC sampling: the image takes the decoded format (SubirTextura decodes).
       textura.bc_en_cpu = bc_en_cpu_ && EsFormatoBc(tf.formato) ? tf.formato : VK_FORMAT_UNDEFINED;
+      textura.etc2 = VK_FORMAT_UNDEFINED;
+      textura.clave_etc2 = 0;
+      textura.etc2_pendiente = false;
+      if (candidata_etc2) {
+        // The image's shape is needed for the key: set it as CrearTextura will.
+        textura.imagen.ancho = ancho_host;
+        textura.imagen.alto = alto_host;
+        textura.niveles = niveles;
+        textura.capas = capas;
+        textura.clave_etc2 = clave_etc2_de(huella_cruda_de(), textura);
+        if (etc2::SinEtc2(textura.clave_etc2)) {
+          candidata_etc2 = false;  // the map (sin_etc2.bin): decoded every time, never ETC2
+        }
+        if (REXCVAR_GET(nfsmw_nativo_diag_claves_etc2) && diag_claves_etc2_ < 4000) {
+          ++diag_claves_etc2_;
+          const uint8_t* crudo = memoria_->TranslatePhysical(uint32_t(inicio_crudo));
+          REXLOG_INFO("[diag etc2] f {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} | {}x{} niveles {} capas {} | base "
+                      "{:08X} ext {:X} mips {:08X} extm {:X} | pref {:016X} | huella {:016X} clave {:016X}",
+                      f[0], f[1], f[2], f[3], f[4], f[5], ancho_host, alto_host, niveles, capas, uint32_t(inicio_crudo),
+                      extension, uint32_t(dir_mips), extension_mips,
+                      XXH3_64bits(crudo, size_t(std::min<uint64_t>(extension, 4096))), huella_cruda_de(),
+                      textura.clave_etc2);
+        }
+        VkFormat formato_cache = VK_FORMAT_UNDEFINED;
+        uint32_t bytes_cache = 0;
+        if (!candidata_etc2) {
+          // sin_etc2.bin: as without the cache
+        } else if (etc2::Buscar(textura.clave_etc2, formato_cache, bytes_cache) &&
+            formato_cache == etc2::FormatoEtc2De(tf.formato)) {
+          textura.etc2 = formato_cache;  // created as ETC2; its data comes from the cache
+          textura.bc_en_cpu = VK_FORMAT_UNDEFINED;
+          ++etc2_aciertos_;
+        } else {
+          textura.etc2_pendiente = true;  // decoded as before; SubirTextura hands its BC data to the encoder
+          ++etc2_fallos_;
+        }
+      }
       const VkFormat formato_imagen =
-          textura.bc_en_cpu != VK_FORMAT_UNDEFINED ? FormatoBcDecodificado(tf.formato) : tf.formato;
-      const bool creada = CrearTexturaEnHilo(textura, formato_imagen, ancho_host, alto_host, capas, fondo, niveles) ||
-                          CrearTextura(textura.imagen, formato_imagen, ancho_host, alto_host, capas, fondo, niveles);
+          textura.etc2 != VK_FORMAT_UNDEFINED     ? textura.etc2
+          : textura.bc_en_cpu != VK_FORMAT_UNDEFINED ? FormatoBcDecodificado(tf.formato)
+                                                    : tf.formato;
+      // nfsmw_nativo_mali_calidad_texturas: only BC textures of the world (mundo.bin, from the launcher's
+      // prefill: cars, vinyls, logos, menus and the HUD keep full detail), never the hash thread's path, keeping
+      // at least one level and a short side of 16 texels.
+      uint32_t omitidos = 0;
+      if (calidad_omitir_ && !volumen && textura.clave_etc2 && etc2::EsDelMundo(textura.clave_etc2) &&
+          (textura.etc2 != VK_FORMAT_UNDEFINED || textura.bc_en_cpu != VK_FORMAT_UNDEFINED)) {
+        while (omitidos < calidad_omitir_ && omitidos + 1 < niveles &&
+               (std::min(ancho_host, alto_host) >> (omitidos + 1)) >= 16) {
+          ++omitidos;
+        }
+      }
+      textura.omitidos = omitidos;
+      const bool creada =
+          omitidos ? CrearTextura(textura.imagen, formato_imagen, ancho_host >> omitidos, alto_host >> omitidos, capas,
+                                  fondo, niveles - omitidos)
+                   : CrearTexturaEnHilo(textura, formato_imagen, ancho_host, alto_host, capas, fondo, niveles) ||
+                         CrearTextura(textura.imagen, formato_imagen, ancho_host, alto_host, capas, fondo, niveles);
+      if (creada && omitidos) {
+        textura.imagen.ancho = ancho_host;  // the full texture's (see Textura::omitidos)
+        textura.imagen.alto = alto_host;
+      }
       midiendo_creacion_ = false;
       {
         const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -9834,10 +10117,18 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         textura.direccion = base;
         textura.contenido_por_medir = true;
       }
-      if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED) {
+      if (textura.etc2 != VK_FORMAT_UNDEFINED) {
+        // ETC2/EAC: the same bytes per block as the BC it replaces, so the BC formula below applies; kept apart
+        // only to say so.
+        for (uint32_t n = textura.omitidos; n < niveles; ++n) {
+          textura.bytes += uint64_t((std::max(ancho_host >> n, 1u) + 3) / 4) *
+                           ((std::max(alto_host >> n, 1u) + 3) / 4) * tf.bytes * capas;
+        }
+      } else if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED) {
         // Mali mode: the image holds the decoded texels, and that is what the cache limit has to count.
-        textura.bytes = TamanoBcDecodificado(textura.bc_en_cpu, ancho_host, alto_host, capas * (fondo ? fondo : 1),
-                                             niveles);
+        textura.bytes = TamanoBcDecodificado(textura.bc_en_cpu, ancho_host >> textura.omitidos,
+                                             alto_host >> textura.omitidos, capas * (fondo ? fondo : 1),
+                                             niveles - textura.omitidos);
       } else {
         for (uint32_t n = 0; n < niveles; ++n) {
           textura.bytes += uint64_t((std::max(ancho_host >> n, 1u) + tf.bloque - 1) / tf.bloque) *
@@ -9916,7 +10207,9 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
     }
     ranura = RanuraVista(textura.imagen.imagen,
-                         textura.bc_en_cpu != VK_FORMAT_UNDEFINED ? FormatoBcDecodificado(tf.formato) : tf.formato,
+                         textura.etc2 != VK_FORMAT_UNDEFINED        ? textura.etc2
+                         : textura.bc_en_cpu != VK_FORMAT_UNDEFINED ? FormatoBcDecodificado(tf.formato)
+                                                                    : tf.formato,
                          swizzle, tf.swizzle_host, monton);
     ancho_host_out = textura.imagen.ancho;  // the host's, which is what the shader sees
     alto_host_out = textura.imagen.alto;
@@ -9951,26 +10244,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     // 2D and cubemaps: before untiling, XXH3 of the guest bytes. If they have not changed there is nothing
     // to do (untiling and comparing every texture every frame took 62 of the 66 us of each menu draw).
     if (!volumen) {
-      const uint32_t log2_bloque = tf.bytes >= 16 ? 4 : tf.bytes >= 8 ? 3 : tf.bytes >= 4 ? 2
-                                                                : tf.bytes >= 2 ? 1 : 0;
-      // Extent of a layer: tiled, GetTiledAddressUpperBound2D (pipeline/texture/util.cpp:461-486); linear,
-      // up to the last block. Includes the packed base offset (base_ox, base_oy; 0 for the rest).
-      const uint32_t bloques_x_leidos = bloques_x + base_ox;
-      const uint32_t bloques_y_leidos = bloques_y + base_oy;
-      const uint64_t extension_capa =
-          ((f[0] >> 31) & 0x1)
-              ? uint64_t(std::max<int64_t>(
-                    DesplazamientoMosaico2D(int32_t((bloques_x_leidos - 1) & ~31u),
-                                            int32_t((bloques_y_leidos - 1) & ~31u), pitch_bloques,
-                                            log2_bloque),
-                    0)) +
-                    (log2_bloque == 0   ? 0xA00u
-                     : log2_bloque == 1 ? 0xC00u
-                                        : (0x400u << log2_bloque))
-              : uint64_t(std::max(pitch_bloques, bloques_x_leidos)) * tf.bytes * (bloques_y_leidos - 1) +
-                    uint64_t(bloques_x_leidos) * tf.bytes;
-      const uint64_t inicio_crudo = uint64_t(base) & 0x1FFFFFFF;
-      const uint64_t extension = (capas - 1) * zancada_cara + extension_capa;
+      // inicio_crudo and extension: computed before creating the image (the ETC2 cache needs them there).
       if (inicio_crudo + extension <= kMemoriaFisica) {
         /*
          * Per-frame check budget.
@@ -10118,7 +10392,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                                              mips_en_copia);
             }
           }
-          if (plan_ok && textura.bc_en_cpu == VK_FORMAT_UNDEFINED && PlanearHuella(textura, clave, n_lecturas, crudo_base, extension, crudo_mips, extension_mips,
+          if (plan_ok && textura.bc_en_cpu == VK_FORMAT_UNDEFINED && textura.etc2 == VK_FORMAT_UNDEFINED &&
+              PlanearHuella(textura, clave, n_lecturas, crudo_base, extension, crudo_mips, extension_mips,
                                        tf, (f[1] >> 6) & 0x3, bytes_plan, desplazamientos, base, ancho, alto,
                                        formato, bytes_subida)) {
             return;  // applying phase: the thread prepares it; the tail of this function is already done
@@ -10169,6 +10444,22 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         textura.huella_cruda = huella_cruda;
         AnotarContenidoTextura(textura, clave);  // measurement only: nfsmw_nativo_diag_reutilizar
       }
+    }
+    if (textura.etc2 != VK_FORMAT_UNDEFINED && !CargarEtc2(textura, clave_etc2_de(textura.huella_cruda, textura), tf,
+                                                            bytes_subida, valido_hasta)) {
+      /*
+       * Content the cache does not have in an ETC2 image (the minimap rewrites its tiles in place): the image
+       * would keep the old tile, or nothing. It is retired (destroyed when its work slot comes round, like the
+       * views) and the next use recreates it through the decode path with the right content.
+       */
+      if (modo_mali_ && !textura.subir && !textura.en_vuelo && !textura.huella_trabajo) {
+        RetirarTexturaEtc2(clave);
+        valido_hasta = fotograma_;
+      }
+      return;  // nothing to upload this time (see CargarEtc2)
+    }
+    if (textura.etc2 != VK_FORMAT_UNDEFINED) {
+      return;  // uploaded from the cache
     }
     // Base level of each layer, untiled and in host byte order.
     const uint32_t bloques_x_host = (textura.imagen.ancho + tf.bloque - 1) / tf.bloque;
@@ -10834,6 +11125,20 @@ class DibujosVulkanImpl final : public DibujosVulkan {
      * and the copy are recorded below as usual: the GPU does not read the upload buffer until
      * vkQueueSubmit.
      */
+    if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED && textura.etc2_pendiente) {
+      // ETC2 cache: a copy of its BC data (a quarter or less of the decoded size) for the encoder thread.
+      textura.etc2_pendiente = false;
+      etc2::Trabajo trabajo;
+      trabajo.clave = textura.clave_etc2;
+      trabajo.bc = textura.bc_en_cpu;
+      trabajo.ancho = textura.imagen.ancho;
+      trabajo.alto = textura.imagen.alto;
+      trabajo.rebanadas = textura.capas * (textura.fondo ? textura.fondo : 1);
+      trabajo.niveles = textura.niveles;
+      trabajo.desplazamientos = textura.desplazamiento_nivel;
+      trabajo.datos = textura.datos;
+      etc2::Encolar(std::move(trabajo));
+    }
     if (textura.bc_en_cpu != VK_FORMAT_UNDEFINED) {
       // Mali mode without BC sampling: the image is the decoded format (never the hash thread's path).
       // Into bc_decodificado_, which keeps its capacity: a new vector per texture was fresh pages every time
@@ -10843,12 +11148,16 @@ class DibujosVulkanImpl final : public DibujosVulkan {
                     textura.desplazamiento_nivel, bc_decodificado_);
       textura.datos.swap(bc_decodificado_);
     }
+    // nfsmw_nativo_mali_calidad_texturas: the levels the image does not hold are not uploaded.
+    const size_t desde = textura.omitidos ? std::min<size_t>(textura.desplazamiento_nivel[textura.omitidos],
+                                                             textura.datos.size())
+                                          : 0;
     if (textura.huella_trabajo && textura.huella_trabajo != kTrabajoHuellaPublicado) {
       const size_t bytes = BytesHuellaPlaneada(textura);
       Reservar(bytes, 16, offset);  // BC: offset multiple of the block
       PublicarHuella(textura, subida_datos_ + offset, bytes);
     } else {
-      if (!Reservar(textura.datos.size(), 16, offset)) {
+      if (!Reservar(textura.datos.size() - desde, 16, offset)) {
         // No room: copying at offset 0 would overwrite this frame's vertices and indices (a GPU fault). The
         // texture stays as it is and is uploaded again on its next use.
         // A new image still gets its barrier (GENERAL), so this frame's draws sample it without its contents
@@ -10864,7 +11173,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         std::vector<uint8_t>().swap(textura.datos);
         return true;
       }
-      std::memcpy(subida_datos_ + offset, textura.datos.data(), textura.datos.size());
+      std::memcpy(subida_datos_ + offset, textura.datos.data() + desde, textura.datos.size() - desde);
     }
     /*
      * If its vkBindImageMemory is still on the bind thread, neither the barrier nor the copy can be
@@ -10908,17 +11217,20 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   // One range per mip level (with all its layers). Factored out for SubirTextura and for the deferred
   // copies of RecogerEnlaces.
   void GrabarCopiaTextura(VkCommandBuffer subida, const Textura& textura, VkDeviceSize offset) {
+    // With Textura::omitidos, the buffer starts at the first level the image holds, which is its level 0.
     std::array<VkBufferImageCopy, 16> copias{};
-    for (uint32_t n = 0; n < textura.niveles; ++n) {
-      VkBufferImageCopy& copia = copias[n];
-      copia.bufferOffset = offset + textura.desplazamiento_nivel[n];
-      copia.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, n, 0, textura.capas};
+    const uint32_t omitidos = std::min(textura.omitidos, textura.niveles - 1);
+    const uint32_t desde = textura.desplazamiento_nivel[omitidos];
+    for (uint32_t n = omitidos; n < textura.niveles; ++n) {
+      VkBufferImageCopy& copia = copias[n - omitidos];
+      copia.bufferOffset = offset + textura.desplazamiento_nivel[n] - desde;
+      copia.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, n - omitidos, 0, textura.capas};
       copia.imageExtent = {std::max(textura.imagen.ancho >> n, 1u), std::max(textura.imagen.alto >> n, 1u),
                            textura.fondo ? textura.fondo : 1};
     }
     ++g_diag_transferencias[kTrSubidas];
     dfn_.vkCmdCopyBufferToImage(subida, subida_, textura.imagen.imagen, VK_IMAGE_LAYOUT_GENERAL,
-                                textura.niveles, copias.data());
+                                textura.niveles - omitidos, copias.data());
   }
 
   // A texture's view, the same for RanuraVista and for the deferred views of RecogerEnlaces.
@@ -13374,6 +13686,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   // el forzado de las constantes por UBO y que no se use la direccion de buffer de 64 bits.
   bool modo_mali_ = false;
   bool bc_en_cpu_ = false;  // Mali mode and the device cannot sample BC1: decode BC on the CPU
+  // ETC2 cache (nfsmw_cache_etc2.cpp): on, and textures created from it / decoded and queued since the last
+  // report, uploads from it and contents it did not have for an ETC2 image.
+  bool cache_etc2_ = false;
+  uint64_t etc2_aciertos_ = 0, etc2_fallos_ = 0, etc2_cargadas_ = 0, etc2_sin_contenido_ = 0, etc2_retiradas_ = 0;
 
   VkBuffer subida_ = VK_NULL_HANDLE;
   VkDeviceMemory subida_memoria_ = VK_NULL_HANDLE;
@@ -14297,6 +14613,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   };
   bool cache_entre_fotogramas_ = true;  // nfsmw_nativo_cache_texturas_entre_fotogramas
   bool mipmaps_ = true;                 // nfsmw_nativo_mipmaps
+  uint32_t calidad_omitir_ = 0;         // nfsmw_nativo_mali_calidad_texturas (Mali mode only)
+  uint32_t diag_claves_etc2_ = 0;       // lines written by nfsmw_nativo_diag_claves_etc2
+  // The fixed reflection (nfsmw_cubemap_contenido = 4): 0 = not built yet, 1 = ready, -1 = no panorama.
+  static constexpr uint32_t kLadoCuboFijo = 128;
+  int estado_cubo_fijo_ = 0;
+  std::vector<uint8_t> cubo_fijo_datos_;
+  uint32_t dir_cubo_dinamico_ = 0xFFFFFFFFu;  // guest address of the game's dynamic cubemap, once seen
   bool diag_mips_ = false;              // nfsmw_nativo_diag_mips
   uint64_t mips_revisadas_ = 0;
   uint64_t mips_raras_ = 0;

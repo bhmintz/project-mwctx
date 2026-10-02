@@ -675,6 +675,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // Fragments and vertices shaded per pass (pipeline statistics for the native
     // renderer). Without the feature the query pool cannot be created.
     XE_UI_VULKAN_FEATURE(pipelineStatisticsQuery)
+    // ETC2/EAC textures (the Mali mode's transcoded BC cache, nfsmw_nativo_mali_cache_etc2). Desktop GPUs do
+    // not report it, so there it stays false.
+    XE_UI_VULKAN_FEATURE(textureCompressionETC2)
     if (!with_gpu_emulation) {
       XE_UI_VULKAN_FEATURE(independentBlend)
       XE_UI_VULKAN_FEATURE(samplerAnisotropy)

@@ -40,6 +40,13 @@ Libraries used by the SDK, the NRO and the code generator, fetched from the subm
 | AES-128 by LuoPeng (`thirdparty/aes_128`) | MIT |
 | [libnx](https://github.com/switchbrew/libnx) and the devkitA64 runtime (newlib, libstdc++) | ISC; newlib and GCC runtime licenses |
 
+Added by this port (Android, the ETC2 texture cache), kept in `sdk/thirdparty` unmodified:
+
+| Library | Used for | License |
+|---|---|---|
+| [etcpak](https://github.com/wolfpld/etcpak) by Bartosz Taudul, at `84801078dbf8` (`sdk/thirdparty/etcpak`) | Encoding the game's BC textures to ETC2/EAC for Mali GPUs | BSD-3-Clause (`LICENSE.txt`) |
+| The HUFF (0x30FB) decoder of Command & Conquer Generals Zero Hour by Electronic Arts, from [electronicarts/CnC_Generals_Zero_Hour](https://github.com/electronicarts/CnC_Generals_Zero_Hour) at `0a05454d8574` (`sdk/thirdparty/eac_huff`) | Reading the compressed texture packs of the game files in "Preparar texturas" | GPL-3.0 with EA's additional terms (`LICENSE.md`) |
+
 ### FFmpeg and libmspack (LGPL)
 
 This port modifies these files of the SDK's third-party tree; the modified copies are in `sdk/thirdparty`:
