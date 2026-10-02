@@ -776,6 +776,12 @@ REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_subida_mb, 32, "NFSMW",
                      "Modo Mali: MB de cada bufer de subida (hay uno por fotograma en vuelo). 64 = como en el resto")
     .range(16, 64)
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// The fence breakdown serializes CPU and GPU and can blame a pass for time that is not its own (the bloom
+// downsample measured ~6 ms while drawing 256x144). This measures the real thing: the whole frame with and
+// without those draws, alternating every 10 s.
+REXCVAR_DEFINE_STRING(nfsmw_nativo_mali_ab_omitir_ps, "", "NFSMW",
+                      "Modo Mali, diagnostico: huella del pixel shader (16 hex, la del informe por pase) cuyos dibujos "
+                      "se saltan 10 s si y 10 s no, anotando los fps de cada tramo (C6 A/B omitir PS). Vacio = nada");
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sin_sombras, true, "NFSMW",
                     "Modo Mali: no se graba el mapa de sombras (como nfsmw_nativo_omitir_sombras, solo en Mali)");
 REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_texturas_mb_max, 256, "NFSMW",
@@ -2638,6 +2644,11 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   bool Inicializar() {
     const auto& propiedades = dispositivo_->properties();
     modo_mali_ = DecidirModoMali(propiedades);
+    cache_fetch_mascara_ = modo_mali_ ? cache_fetch_.size() - 1 : 4095;
+    if (modo_mali_ && !REXCVAR_GET(nfsmw_nativo_mali_ab_omitir_ps).empty()) {
+      ab_ps_ = std::strtoull(REXCVAR_GET(nfsmw_nativo_mali_ab_omitir_ps).c_str(), nullptr, 16);
+      REXLOG_INFO("[nativo] C6 A/B omitir PS {:016X} cada 10 s", ab_ps_);
+    }
     if (modo_mali_) {
       tamano_subida_ = VkDeviceSize(REXCVAR_GET(nfsmw_nativo_mali_subida_mb)) << 20;
     }
@@ -3255,6 +3266,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     CortarSubetapa(18, t_indices_185);  // vertices and diagnostics
     Etapa(1, marca);
     // --- Textures and samplers ----------------------------------------------------
+    if (ab_ps_omitir_ && ps && ps->shader && ps->shader->huella == ab_ps_) {
+      ++ab_ps_saltados_;
+      return true;  // nfsmw_nativo_mali_ab_omitir_ps
+    }
     uint32_t compartidas[kPalabrasCompartidas] = {};
     VkDeviceSize bytes_texturas = 0;
     DescartarHuellasPlaneadas();  // those of the previous draw that never reached SubirTextura
@@ -3318,7 +3333,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       // changes texture between draws, but textures repeat a lot within a frame, and PrepararTextura already
       // queued their upload the first time.
       CacheSampler& por_fetch =
-          cache_fetch_[XXH3_64bits(fetch, sizeof(uint32_t) * 6) & (cache_fetch_.size() - 1)];
+          cache_fetch_[XXH3_64bits(fetch, sizeof(uint32_t) * 6) & cache_fetch_mascara_];
       uint64_t valido_hasta = fotograma_;
       if ((cache_entre_fotogramas_ ? fotograma_ <= por_fetch.valido_hasta : por_fetch.fotograma == fotograma_) &&
           por_fetch.generacion == generacion_texturas_ &&
@@ -3340,9 +3355,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
           ++fetch_fallos_caducada_;
         }
         bool muestreo_puntual = false;
+        const auto antes_preparar = std::chrono::steady_clock::now();
         PrepararTextura(fetch, ranura_textura, monton, bytes_texturas, muestreo_puntual, valido_hasta,
                         ancho_host, alto_host);
         ranura_sampler = RanuraSampler(fetch, muestreo_puntual);
+        ns_fallos_fetch_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - antes_preparar)
+                                         .count());
         por_fetch.fotograma = fotograma_;
         por_fetch.generacion = generacion_texturas_;
         std::memcpy(por_fetch.fetch.data(), fetch, sizeof(por_fetch.fetch));
@@ -3380,6 +3399,27 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     if (composicion_sin_desenfoque) {
       contexto_->LecturasDeProfundidadMuertas(false);
+    }
+    // Mali: what the bloom downsample (p_000091) samples, a few times, to see whether its 16 taps can be 4
+    // bilinear ones (texel-center offsets on a 4x4 grid and a linear filter).
+    if (modo_mali_ && ps && ps->shader && ps->shader->huella == 0x7E1C6EED1AC24341ull && diag_bloom_ < 4) {
+      ++diag_bloom_;
+      const float* c = reinterpret_cast<const float*>(r + kRegConstantesPs);
+      std::string offs;
+      for (uint32_t i = 0; i < 16; ++i) {
+        offs += fmt::format(" ({:.5f},{:.5f})", c[(1 + i) * 4], c[(1 + i) * 4 + 1]);
+      }
+      std::string fetches;
+      for (const SamplerShader& sm : ps->samplers) {
+        if (sm.registro < 16) {
+          const uint32_t* f = r + kRegFetch + uint32_t(sm.registro) * 6;
+          fetches += fmt::format(" reg {}: formato {} mag {} min {} mip {} ({}x{} host);", sm.registro, f[1] & 0x3F,
+                                 (f[3] >> 19) & 0x3, (f[3] >> 21) & 0x3, (f[3] >> 23) & 0x3, tex_ancho_pase_,
+                                 tex_alto_pase_);
+        }
+      }
+      REXLOG_INFO("[nativo] C6 diag bloom p_000091:{} offsets{} | pase {}x{}", fetches, offs, ancho_pase_diag_,
+                  alto_pase_diag_);
     }
     /*
      * nfsmw_nativo_sombra_minimo. If this draw samples the shadow map texture with cars (the game's
@@ -4146,6 +4186,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         ranura_ubo_enlazada_ = ranura_actual_;
         ubo_enlazado_ = true;
       }
+    }
+    if (modo_mali_ && ps && ps->shader && ps->shader->huella == 0x7E1C6EED1AC24341ull && diag_bloom_vp_ < 4) {
+      ++diag_bloom_vp_;
+      REXLOG_INFO("[nativo] C6 diag bloom p_000091: viewport {}x{} en ({},{}), tijera {}x{} en ({},{}), pase {}x{}",
+                  viewport.width, viewport.height, viewport.x, viewport.y, tijera_final.extent.width,
+                  tijera_final.extent.height, tijera_final.offset.x, tijera_final.offset.y, ancho_pase_diag_,
+                  alto_pase_diag_);
     }
     if (!grabado || std::memcmp(&viewport, &viewport_grabado_, sizeof(viewport)) != 0) {
       NFSMW_SUB(3, dfn_.vkCmdSetViewport(cmd, 0, 1, &viewport));
@@ -5406,6 +5453,39 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     fotograma_informe_pases_ = swaps;
   }
 
+  // nfsmw_nativo_mali_ab_omitir_ps, per frame.
+  void ElegirAbOmitirPs() {
+    if (!ab_ps_) {
+      return;
+    }
+    const auto ahora = std::chrono::steady_clock::now();
+    const uint64_t swaps = SwapsNativos();
+    if (ab_ps_inicio_ == std::chrono::steady_clock::time_point{}) {
+      ab_ps_inicio_ = ahora;
+      ab_ps_swaps_ = swaps;
+      return;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(ahora - ab_ps_inicio_).count();
+    if (ms < 10000) {
+      return;
+    }
+    const uint32_t i = ab_ps_omitir_ ? 1 : 0;
+    const uint64_t d = swaps - ab_ps_swaps_;
+    ab_ps_tramos_[i][0] += d;
+    ab_ps_tramos_[i][1] += uint64_t(ms);
+    const auto fps = [&](uint32_t k) {
+      return ab_ps_tramos_[k][1] ? double(ab_ps_tramos_[k][0]) * 1000.0 / double(ab_ps_tramos_[k][1]) : 0.0;
+    };
+    REXLOG_INFO("[nativo] C6 A/B omitir PS {:016X}: tramo {} {:.2f} fps ({} dibujos saltados); acumulado con el PS "
+                "{:.2f} fps, sin el PS {:.2f} fps",
+                ab_ps_, ab_ps_omitir_ ? "SIN" : "CON", double(d) * 1000.0 / double(ms), ab_ps_saltados_, fps(0),
+                fps(1));
+    ab_ps_saltados_ = 0;
+    ab_ps_omitir_ = !ab_ps_omitir_;
+    ab_ps_inicio_ = ahora;
+    ab_ps_swaps_ = swaps;
+  }
+
   void ElegirSinBurbuja() {
     const int32_t modo = modo_mali_ ? REXCVAR_GET(nfsmw_nativo_mali_sin_burbuja) : 0;
     if (modo != 2) {
@@ -5576,6 +5656,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     sin_desenfoque_fotograma_ = REXCVAR_GET(nfsmw_nativo_sin_desenfoque);  // once per frame
     desglose_fotograma_ = REXCVAR_GET(nfsmw_nativo_desglose_por_fence);
     ElegirSinBurbuja();
+    ElegirAbOmitirPs();
     // The cheap PCF bit also changes the pipeline: once per frame.
     {
       bool nuevo = REXCVAR_GET(nfsmw_nativo_pcf_barato);
@@ -8139,15 +8220,19 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     fetch_informe_previos_ = ahora_cifras;
     const uint64_t fallos = d[1] + d[2] + d[3] + d[4];
+    const uint64_t ns_fallos = ns_fallos_fetch_ - ns_fallos_fetch_previos_;
+    ns_fallos_fetch_previos_ = ns_fallos_fetch_;
     if (d[0] + fallos == 0) {
       return;
     }
     NFSMW_INFORME_ANILLO(
         "[nativo] C6 cache de samplers por fetch (build 192, {} casillas), ultimos 10 s: {} aciertos del registro, {} "
         "busquedas en la tabla con {} aciertos y {} fallos ({:.1f} %): {} choques con otra fetch en su casilla, {} en "
-        "casilla vacia, {} por generacion y {} caducadas (toca comprobar la textura)",
-        cache_fetch_.size(), d[5], d[0] + fallos, d[0], fallos,
-        100.0 * double(fallos) / double(std::max<uint64_t>(d[0] + fallos, 1)), d[1], d[2], d[3], d[4]);
+        "casilla vacia, {} por generacion y {} caducadas (toca comprobar la textura); los fallos costaron {:.1f} ms "
+        "({:.1f} us cada uno)",
+        cache_fetch_mascara_ + 1, d[5], d[0] + fallos, d[0], fallos,
+        100.0 * double(fallos) / double(std::max<uint64_t>(d[0] + fallos, 1)), d[1], d[2], d[3], d[4],
+        double(ns_fallos) / 1e6, fallos ? double(ns_fallos) / 1e3 / double(fallos) : 0.0);
   }
 
   void PararCopias() {
@@ -11191,6 +11276,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     pase_activo_ = true;
     ++pases_empezados_;
+    ancho_pase_diag_ = ancho;
+    alto_pase_diag_ = alto_pase;
     texels_pases_ += uint64_t(ancho) * alto_pase;  // how much tile is loaded by loadOp = LOAD
     {
       // Same criterion as the per-category GPU time: the render target's pitch decides.
@@ -14045,7 +14132,16 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   std::chrono::steady_clock::time_point ab_burbuja_inicio_{};
   uint64_t ab_burbuja_swaps_ = 0;
   uint64_t ab_burbuja_tramos_[2][2] = {};  // [sin burbuja][swaps, ms]
+  // nfsmw_nativo_mali_ab_omitir_ps
+  uint64_t ab_ps_ = 0;
+  bool ab_ps_omitir_ = false;
+  uint64_t ab_ps_saltados_ = 0;
+  std::chrono::steady_clock::time_point ab_ps_inicio_{};
+  uint64_t ab_ps_swaps_ = 0;
+  uint64_t ab_ps_tramos_[2][2] = {};
   uint64_t huella_ps_pase_ = 0;
+  uint32_t diag_bloom_ = 0, diag_bloom_vp_ = 0;
+  uint32_t ancho_pase_diag_ = 0, alto_pase_diag_ = 0;
   uint32_t tex_ancho_pase_ = 0, tex_alto_pase_ = 0;
   struct PaseMedido {
     uint32_t categoria = 0, ancho = 0, alto = 0, tex_ancho = 0, tex_alto = 0, dibujos = 0;
@@ -14142,7 +14238,11 @@ class DibujosVulkanImpl final : public DibujosVulkan {
    * that is 44 % at 1024 and 14 % at 4096. The hit conditions do not change: there is just more room. The
    * misses-by-cause report (every 10 s) says how many were collisions.
    */
-  std::array<CacheSampler, 4096> cache_fetch_{};
+  // 4096 slots outside Mali mode; 16384 in it. Measured on the A32 in a race: ~600 different fetch constants
+  // per frame made ~40 collisions per frame in 4096 direct-mapped slots, each one a trip to PrepararTextura.
+  std::array<CacheSampler, 16384> cache_fetch_{};
+  size_t cache_fetch_mascara_ = 4095;
+  uint64_t ns_fallos_fetch_ = 0, ns_fallos_fetch_previos_ = 0;
   uint64_t samplers_cache_fetch_ = 0;
   uint64_t fetch_fallos_choque_ = 0;      // The slot held another fetch constant
   uint64_t fetch_fallos_vacia_ = 0;       // casilla sin usar todavia

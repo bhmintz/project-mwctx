@@ -9,6 +9,13 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <condition_variable>
+#include <mutex>
+#include <algorithm>
+#include <chrono>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include <rex/ui/windowed_app_context_sdl.h>
 
 #include <cstdlib>
@@ -84,7 +91,34 @@ void SDLWindowedAppContext::PlatformQuitFromUIThread() {
   NotifyUILoopOfPendingFunctions();
 }
 
+#if defined(__ANDROID__)
+namespace {
+// SDL_WaitEvent spins inside SDL on Android: on the Samsung A32 SDLThread used a whole big core at 100 %
+// (simpleperf: SDL_UpdateJoysticks, SDL_GetTicks, mutexes under SDL_WaitEvent) while delivering only ~50
+// events per second, all of them our own wakeups. The loop polls instead and really sleeps until the event
+// watch reports a new event, or 4 ms at most (Java-side input that bypasses the watch is picked up there).
+std::mutex g_bucle_ui_mutex;
+std::condition_variable g_bucle_ui_cv;
+bool g_bucle_ui_pendiente = false;
+}  // namespace
+#endif
+
 int SDLWindowedAppContext::RunMainMessageLoop() {
+#if defined(__ANDROID__)
+  while (!HasQuitFromUIThread()) {
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+      ProcessEvent(event);
+      if (HasQuitFromUIThread()) {
+        return EXIT_SUCCESS;
+      }
+    }
+    std::unique_lock<std::mutex> cerrojo(g_bucle_ui_mutex);
+    g_bucle_ui_cv.wait_for(cerrojo, std::chrono::milliseconds(4), [] { return g_bucle_ui_pendiente; });
+    g_bucle_ui_pendiente = false;
+  }
+  return EXIT_SUCCESS;
+#endif
   while (!HasQuitFromUIThread()) {
     SDL_Event event;
     if (!SDL_WaitEvent(&event)) {
@@ -97,6 +131,30 @@ int SDLWindowedAppContext::RunMainMessageLoop() {
 }
 
 void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+#if defined(__ANDROID__)
+  // Diagnostic (Samsung A32): SDLThread used a whole big core. Which events keep waking the UI loop, every 10 s.
+  {
+    static std::unordered_map<uint32_t, uint64_t> por_tipo;
+    static uint64_t total = 0;
+    static auto informe = std::chrono::steady_clock::now();
+    ++por_tipo[event.type];
+    ++total;
+    const auto ahora = std::chrono::steady_clock::now();
+    if (ahora - informe >= std::chrono::seconds(10)) {
+      std::vector<std::pair<uint32_t, uint64_t>> lista(por_tipo.begin(), por_tipo.end());
+      std::sort(lista.begin(), lista.end(), [](const auto& x, const auto& y) { return x.second > y.second; });
+      std::string texto;
+      for (size_t i = 0; i < lista.size() && i < 8; ++i) {
+        texto += fmt::format(" {:#x}={}", lista[i].first, lista[i].second);
+      }
+      REXLOG_INFO("[ui sdl] eventos en 10 s: {} (wakeup {:#x}, paint {:#x}):{}", total, wakeup_event_type_,
+                  paint_event_type_, texto);
+      por_tipo.clear();
+      total = 0;
+      informe = ahora;
+    }
+  }
+#endif
   if (event.type == wakeup_event_type_) {
     ExecutePendingFunctionsFromUIThread();
     return;
@@ -182,6 +240,13 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
 
 bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event) {
   auto* context = static_cast<SDLWindowedAppContext*>(userdata);
+#if defined(__ANDROID__)
+  {
+    std::lock_guard<std::mutex> cerrojo(g_bucle_ui_mutex);
+    g_bucle_ui_pendiente = true;
+  }
+  g_bucle_ui_cv.notify_one();
+#endif
   if (event->type == SDL_EVENT_QUIT && SDL_IsMainThread() && context->IsInUIThread()) {
     // Cocoa stops making Metal drawables available as part of its termination
     // request. Handle the request synchronously while SDL is queueing it,

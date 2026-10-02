@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <chrono>
 #include <array>
 #include <filesystem>
 
@@ -754,6 +756,22 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
 }
 
 void SDLInputDriver::QueueControllerUpdate() {
+#if defined(__ANDROID__)
+  // Every XInputGetState queued a pump on the UI thread, and the game polls often enough that SDLThread never
+  // slept: a whole big core (A75) at 100 % on the Samsung A32, measured with simpleperf (SDL_UpdateJoysticks,
+  // SDL_GetTicks, mutexes), while the render thread ran on the little ones. One pump every 4 ms (250 Hz) is far
+  // below any perceptible input latency.
+  {
+    static std::atomic<int64_t> ultimo_ns{0};
+    const int64_t ahora = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+    if (ahora - ultimo_ns.load(std::memory_order_relaxed) < 4'000'000) {
+      return;
+    }
+    ultimo_ns.store(ahora, std::memory_order_relaxed);
+  }
+#endif
   // Pump SDL events to ensure controller state is up to date.
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
