@@ -15,7 +15,8 @@ set(SDL_STATIC OFF CACHE BOOL "Use SDL's shared Android library" FORCE)
 
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/../../../../../app" "nfsmw-app")
 target_sources(nfsmw PRIVATE "${CMAKE_CURRENT_LIST_DIR}/android_touch.cpp"
-                             "${CMAKE_CURRENT_LIST_DIR}/android_rendimiento.cpp")
+                             "${CMAKE_CURRENT_LIST_DIR}/android_rendimiento.cpp"
+                             "${CMAKE_CURRENT_LIST_DIR}/android_captura_mali.cpp")
 
 if(TARGET SDL3-shared)
     # SDLActivity calls System.loadLibrary("SDL3") in every build variant.
@@ -59,4 +60,21 @@ if(NFSMW_ANDROID_LTO AND CMAKE_BUILD_TYPE STREQUAL "Release")
     # Hot code together, as orden_funciones.ld does on the Switch; lld has no section ordering file for GCC,
     # but it can keep the text of each function in its own section and drop the unused ones.
     target_link_options(nfsmw PRIVATE -Wl,--gc-sections -Wl,--icf=safe)
+endif()
+
+# libadrenotools (BSD-2, github.com/bylaws/libadrenotools): opens a private copy of the system's libvulkan.so whose
+# HAL dlopen is redirected to a driver from app storage, e.g. Mesa's PanVK (vulkan_icd_android). The system loader
+# still provides the Android surface and swapchain on top of the driver's VK_ANDROID_native_buffer. Its hook
+# libraries (libhook_impl.so, libmain_hook.so) must sit extracted in nativeLibraryDir: useLegacyPackaging.
+set(NFSMW_ADRENOTOOLS_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../../out/libadrenotools" CACHE PATH "libadrenotools")
+if(EXISTS "${NFSMW_ADRENOTOOLS_DIR}/CMakeLists.txt")
+    add_subdirectory("${NFSMW_ADRENOTOOLS_DIR}" "adrenotools")
+    foreach(objetivo hook_impl main_hook file_redirect_hook gsl_alloc_hook)
+        target_link_options(${objetivo} PRIVATE "-Wl,-z,max-page-size=16384")
+    endforeach()
+    target_sources(nfsmw PRIVATE "${CMAKE_CURRENT_LIST_DIR}/android_driver_vulkan.cpp")
+    target_link_libraries(nfsmw PRIVATE adrenotools)
+    add_dependencies(nfsmw main_hook hook_impl)
+else()
+    message(STATUS "libadrenotools not found in ${NFSMW_ADRENOTOOLS_DIR}: only the system Vulkan driver")
 endif()

@@ -1,0 +1,984 @@
+diff --git a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+index 0acb2eb..c35d409 100644
+--- a/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
++++ b/src/panfrost/vulkan/jm/panvk_vX_cmd_draw.c
+@@ -10,6 +10,9 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <inttypes.h>
++
++#include "util/log.h"
+ #include "genxml/gen_macros.h"
+ 
+ #include "panvk_buffer.h"
+@@ -1407,6 +1410,15 @@ panvk_emit_tiler_dcd(struct panvk_cmd_buffer *cmdbuf,
+       cfg.textures = fs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_TEXTURE];
+       cfg.samplers = fs_desc_state->tables[PANVK_BIFROST_DESC_TABLE_SAMPLER];
+ 
++      /* nfsmw: ARM's fragment binary indexes samplers with the game's heap index plus one, and reads
++       * uniform buffers in its own layout. */
++      const struct panvk_shader_variant *fs = panvk_shader_only_variant(get_fs(cmdbuf));
++      if (fs && fs->nfsmw_arm) {
++         cfg.uniform_buffers = cmdbuf->state.gfx.fs.nfsmw_ubos;
++         if (cfg.samplers)
++            cfg.samplers -= pan_size(SAMPLER);
++      }
++
+       cfg.occlusion_query = cmdbuf->state.gfx.occlusion_query.mode;
+       cfg.occlusion = cmdbuf->state.gfx.occlusion_query.ptr;
+ #if PAN_ARCH == 9
+@@ -1776,6 +1788,73 @@ prepare_draw(struct panvk_cmd_buffer *cmdbuf, struct panvk_draw_data *draw)
+    return VK_SUCCESS;
+ }
+ 
++/* nfsmw: a fragment shader with ARM's binary (panvk_nfsmw_arm.h). Builds its uniform buffer table in ARM's
++ * layout from the bound descriptor sets and runs its pilot on the CPU, which fills the push uniforms. */
++static VkResult
++nfsmw_arm_prepare_fs(struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *fs)
++{
++   const struct nfsmw_arm *arm = fs->nfsmw_arm;
++   const struct panvk_descriptor_state *desc_state = &cmdbuf->state.gfx.desc_state;
++   static bool avisado;
++
++   struct pan_ptr ubos =
++      panvk_cmd_alloc_desc_array(cmdbuf, MAX2(arm->ubo_table_count, 1), UNIFORM_BUFFER);
++   if (!ubos.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   memset(ubos.cpu, 0, MAX2(arm->ubo_table_count, 1) * pan_size(UNIFORM_BUFFER));
++
++   struct mali_uniform_buffer_packed *table = ubos.cpu;
++   for (unsigned i = 0; i < arm->ubo_count; i++) {
++      const unsigned set_idx = arm->ubos[i].set;
++      const struct panvk_descriptor_set *set = set_idx < MAX_SETS ? desc_state->sets[set_idx] : NULL;
++      if (!set || arm->ubos[i].binding >= set->layout->binding_count ||
++          arm->ubos[i].slot >= arm->ubo_table_count)
++         continue;
++      const struct panvk_descriptor_set_binding_layout *bl =
++         &set->layout->bindings[arm->ubos[i].binding];
++      if (bl->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
++         if (!avisado)
++            mesa_loge("nfsmw: UBO de ARM en set %u binding %u no es dinamico", set_idx,
++                      arm->ubos[i].binding);
++         avisado = true;
++         continue;
++      }
++      const uint64_t addr = set->dyn_bufs[bl->desc_idx].dev_addr +
++                            desc_state->dyn_buf_offsets[set_idx][bl->desc_idx];
++      pan_pack(&table[arm->ubos[i].slot], UNIFORM_BUFFER, cfg) {
++         cfg.pointer = addr;
++         cfg.entries = DIV_ROUND_UP(set->dyn_bufs[bl->desc_idx].size, 16);
++      }
++   }
++   cmdbuf->state.gfx.fs.nfsmw_ubos = ubos.gpu;
++
++   struct pan_ptr push =
++      panvk_cmd_alloc_dev_mem(cmdbuf, desc, ALIGN_POT(arm->fau_words * 4, 8), sizeof(uint64_t));
++   if (!push.gpu)
++      return VK_ERROR_OUT_OF_DEVICE_MEMORY;
++   if (!nfsmw_arm_run_pilot(arm, ubos.gpu, ubos.cpu, push.cpu) && !avisado) {
++      mesa_loge("nfsmw: el piloto de %016" PRIx64 " no termino", arm->hash);
++      avisado = true;
++   }
++   cmdbuf->state.gfx.fs.push_uniforms = push.gpu;
++
++   /* The first blocks, to check them against what the pilot gives on the PC. */
++   static unsigned registrados;
++   if (registrados < 8) {
++      registrados++;
++      const uint32_t *w = push.cpu;
++      char texto[16 * 9 + 1] = "";
++      for (unsigned i = 0; i < MIN2(arm->fau_words, 16); i++)
++         snprintf(texto + i * 9, 10, " %08x", w[i]);
++      mesa_logi("nfsmw: piloto %016" PRIx64 " ubos %" PRIx64 ":%s", arm->hash, ubos.gpu, texto);
++      for (unsigned i = 0; i < arm->ubo_count; i++) {
++         const uint32_t *u = (const uint32_t *)&((struct mali_uniform_buffer_packed *)ubos.cpu)[arm->ubos[i].slot];
++         mesa_logi("nfsmw:   ubo ranura %u = %08x %08x", arm->ubos[i].slot, u[0], u[1]);
++      }
++   }
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
+                    struct panvk_draw_data *draw, uint32_t layer)
+@@ -1805,7 +1884,11 @@ prepare_draw_layer(struct panvk_cmd_buffer *cmdbuf,
+       return result;
+    cmdbuf->state.gfx.vs.push_uniforms = vs_push_uniforms.gpu;
+ 
+-   if (fs) {
++   if (fs && fs->nfsmw_arm) {
++      result = nfsmw_arm_prepare_fs(cmdbuf, fs);
++      if (result != VK_SUCCESS)
++         return result;
++   } else if (fs) {
+       struct pan_ptr fs_push_uniforms;
+       result = panvk_per_arch(cmd_prepare_gfx_push_uniforms)(
+          cmdbuf, fs, &fs_push_uniforms, 1);
+diff --git a/src/panfrost/vulkan/meson.build b/src/panfrost/vulkan/meson.build
+index 9c5d43b..6d28869 100644
+--- a/src/panfrost/vulkan/meson.build
++++ b/src/panfrost/vulkan/meson.build
+@@ -55,6 +55,7 @@ libpanvk_files = files(
+   'panvk_buffer.c',
+   'panvk_cmd_pool.c',
+   'panvk_device_memory.c',
++  'panvk_nfsmw_arm.c',
+   'panvk_host_copy.c',
+   'panvk_image.c',
+   'panvk_instance.c',
+diff --git a/src/panfrost/vulkan/panvk_cmd_draw.h b/src/panfrost/vulkan/panvk_cmd_draw.h
+index 875b86d..c97f20d 100644
+--- a/src/panfrost/vulkan/panvk_cmd_draw.h
++++ b/src/panfrost/vulkan/panvk_cmd_draw.h
+@@ -172,6 +172,8 @@ struct panvk_cmd_graphics_state {
+       struct panvk_shader_desc_state desc;
+       uint64_t blend_descs[MAX_RTS];
+       uint64_t push_uniforms;
++      /* nfsmw: the uniform buffer table in ARM's layout for a fragment shader with an ARM binary. */
++      uint64_t nfsmw_ubos;
+       bool required;
+ #if PAN_ARCH < 9
+       uint64_t rsd;
+diff --git a/src/panfrost/vulkan/panvk_device_memory.c b/src/panfrost/vulkan/panvk_device_memory.c
+index 5fece7e..bdc5156 100644
+--- a/src/panfrost/vulkan/panvk_device_memory.c
++++ b/src/panfrost/vulkan/panvk_device_memory.c
+@@ -10,6 +10,7 @@
+ #include "panvk_android.h"
+ #include "panvk_device.h"
+ #include "panvk_device_memory.h"
++#include "panvk_nfsmw_arm.h"
+ #include "panvk_entrypoints.h"
+ 
+ #include "pan_props.h"
+@@ -273,6 +274,7 @@ panvk_FreeMemory(VkDevice _device, VkDeviceMemory _mem,
+    }
+ 
+    if (mem->addr.host) {
++      nfsmw_arm_map_remove(mem->addr.dev);
+       ASSERTED int ret = os_munmap(mem->addr.host, pan_kmod_bo_size(mem->bo));
+       assert(!ret);
+    }
+@@ -368,6 +370,8 @@ panvk_MapMemory2KHR(VkDevice _device, const VkMemoryMapInfoKHR *pMemoryMapInfo,
+ 
+    assert(!host_addr || addr == host_addr);
+    mem->addr.host = addr;
++   /* nfsmw: so ARM pilots can read uniform buffers on the CPU (panvk_nfsmw_arm.h). */
++   nfsmw_arm_map_add(mem->addr.dev, pan_kmod_bo_size(mem->bo), addr);
+    *ppData = (char *)addr + offset;
+ 
+    return VK_SUCCESS;
+@@ -392,6 +396,7 @@ panvk_UnmapMemory2KHR(VkDevice _device,
+       assert(!ret);
+    }
+ 
++   nfsmw_arm_map_remove(mem->addr.dev);
+    mem->addr.host = NULL;
+ 
+    return VK_SUCCESS;
+diff --git a/src/panfrost/vulkan/panvk_nfsmw_arm.c b/src/panfrost/vulkan/panvk_nfsmw_arm.c
+new file mode 100644
+index 0000000..c0848b8
+--- /dev/null
++++ b/src/panfrost/vulkan/panvk_nfsmw_arm.c
+@@ -0,0 +1,527 @@
++/*
++ * nfsmw: see panvk_nfsmw_arm.h. The pilot interpreter mirrors tools/mali_arm/piloto.py in the game's repo,
++ * which was validated against the uniform blocks ARM's driver writes (docs/plan-arm-hibrido.md).
++ */
++#include "panvk_nfsmw_arm.h"
++
++#include <inttypes.h>
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "util/log.h"
++#include "util/simple_mtx.h"
++
++/* --- packages ------------------------------------------------------------------------------------ */
++
++static simple_mtx_t arm_mtx = SIMPLE_MTX_INITIALIZER;
++
++#define MAX_PACKAGES 512
++static struct {
++   uint64_t hash;
++   struct nfsmw_arm *arm; /* NULL: looked up, there is none */
++} packages[MAX_PACKAGES];
++static unsigned package_count;
++
++uint64_t
++nfsmw_arm_hash_from_label(const char *label)
++{
++   if (!label || strncmp(label, "nfsmw:", 6) != 0)
++      return 0;
++   return strtoull(label + 6, NULL, 16);
++}
++
++struct reader {
++   const uint8_t *p, *end;
++   bool bad;
++};
++
++static uint32_t
++rd32(struct reader *r)
++{
++   if (r->end - r->p < 4) {
++      r->bad = true;
++      return 0;
++   }
++   uint32_t v;
++   memcpy(&v, r->p, 4);
++   r->p += 4;
++   return v;
++}
++
++static const uint8_t *
++rd_bytes(struct reader *r, uint32_t n)
++{
++   if ((uint64_t)(r->end - r->p) < n) {
++      r->bad = true;
++      return NULL;
++   }
++   const uint8_t *v = r->p;
++   r->p += (n + 3) & ~3u;
++   if (r->p > r->end)
++      r->p = r->end;
++   return v;
++}
++
++static struct nfsmw_arm *
++load_package(uint64_t hash)
++{
++   const char *dir = getenv("NFSMW_ARM_DIR");
++   if (!dir)
++      return NULL;
++   char path[1024];
++   snprintf(path, sizeof(path), "%s/%016" PRIx64 ".arm", dir, hash);
++   FILE *f = fopen(path, "rb");
++   if (!f)
++      return NULL;
++   fseek(f, 0, SEEK_END);
++   long size = ftell(f);
++   fseek(f, 0, SEEK_SET);
++   uint8_t *data = size > 0 ? malloc(size) : NULL;
++   if (!data || fread(data, 1, size, f) != (size_t)size) {
++      fclose(f);
++      free(data);
++      return NULL;
++   }
++   fclose(f);
++
++   struct nfsmw_arm *arm = calloc(1, sizeof(*arm));
++   struct reader r = {data, data + size, false};
++   if (!arm || memcmp(data, "NFAR", 4) != 0)
++      goto fail;
++   r.p += 4;
++   if (rd32(&r) != 1)
++      goto fail;
++   arm->hash = hash;
++   arm->code_size = rd32(&r);
++   arm->code = rd_bytes(&r, arm->code_size);
++   uint32_t msg = rd32(&r);
++   arm->message_preload[0] = msg & 0xffff;
++   arm->message_preload[1] = msg >> 16;
++   arm->preload = rd32(&r);
++   arm->preload |= (uint64_t)rd32(&r) << 32;
++   arm->work_reg_count = rd32(&r);
++   arm->fau_words = rd32(&r);
++   arm->varying_count = rd32(&r);
++   if (arm->varying_count > NFSMW_ARM_MAX_VARYINGS)
++      goto fail;
++   for (unsigned i = 0; i < arm->varying_count; i++) {
++      arm->varyings[i].location = rd32(&r);
++      arm->varyings[i].ncomps = rd32(&r);
++   }
++   arm->ubo_count = rd32(&r);
++   if (arm->ubo_count > NFSMW_ARM_MAX_UBOS)
++      goto fail;
++   for (unsigned i = 0; i < arm->ubo_count; i++) {
++      arm->ubos[i].slot = rd32(&r);
++      arm->ubos[i].set = rd32(&r);
++      arm->ubos[i].binding = rd32(&r);
++   }
++   arm->ubo_table_count = rd32(&r);
++   arm->pilot_size = rd32(&r);
++   arm->pilot = rd_bytes(&r, arm->pilot_size);
++   if (r.bad || !arm->code || !arm->pilot)
++      goto fail;
++   mesa_logi("nfsmw: binario de ARM %016" PRIx64 " (%u bytes, %u uniformes, %u varyings)", hash,
++             arm->code_size, arm->fau_words, arm->varying_count);
++   return arm; /* data stays allocated: code and pilot point into it */
++
++fail:
++   mesa_loge("nfsmw: %s no es un paquete .arm valido", path);
++   free(arm);
++   free(data);
++   return NULL;
++}
++
++const struct nfsmw_arm *
++nfsmw_arm_get(uint64_t hash)
++{
++   if (!hash)
++      return NULL;
++   simple_mtx_lock(&arm_mtx);
++   struct nfsmw_arm *arm = NULL;
++   unsigned i;
++   for (i = 0; i < package_count; i++) {
++      if (packages[i].hash == hash) {
++         arm = packages[i].arm;
++         break;
++      }
++   }
++   if (i == package_count && package_count < MAX_PACKAGES) {
++      arm = load_package(hash);
++      packages[package_count].hash = hash;
++      packages[package_count].arm = arm;
++      package_count++;
++   }
++   simple_mtx_unlock(&arm_mtx);
++   return arm;
++}
++
++/* --- host mappings ------------------------------------------------------------------------------- */
++
++#define MAX_MAPS 4096
++static struct {
++   uint64_t dev, size;
++   uint8_t *host;
++} maps[MAX_MAPS];
++static unsigned map_count;
++
++void
++nfsmw_arm_map_add(uint64_t dev_addr, uint64_t size, void *host)
++{
++   simple_mtx_lock(&arm_mtx);
++   if (map_count < MAX_MAPS) {
++      maps[map_count].dev = dev_addr;
++      maps[map_count].size = size;
++      maps[map_count].host = host;
++      map_count++;
++   }
++   simple_mtx_unlock(&arm_mtx);
++}
++
++void
++nfsmw_arm_map_remove(uint64_t dev_addr)
++{
++   simple_mtx_lock(&arm_mtx);
++   for (unsigned i = 0; i < map_count; i++) {
++      if (maps[i].dev == dev_addr) {
++         maps[i] = maps[--map_count];
++         break;
++      }
++   }
++   simple_mtx_unlock(&arm_mtx);
++}
++
++/* --- pilot interpreter --------------------------------------------------------------------------- */
++
++enum {
++   OP_NOP, OP_MOV, OP_SHADDXL, OP_IADD, OP_ISUB, OP_IMUL, OP_LSHIFT_AND, OP_LSHIFT_OR, OP_LSHIFT_XOR,
++   OP_RSHIFT_AND, OP_RSHIFT_OR, OP_RSHIFT_DOUBLE, OP_SHIFT_DOUBLE, OP_CSEL, OP_MUX, OP_CMP, OP_FMA,
++   OP_FADD, OP_FMAX, OP_FMIN, OP_FRCP, OP_FRSQ, OP_U32_TO_F32, OP_U16_TO_U32, OP_U8_TO_U32, OP_LOAD,
++   OP_STORE, OP_BRANCHZ, OP_JUMP, OP_MKVEC, OP_LDEXP, OP_SWZ,
++};
++enum { SRC_REG, SRC_IMM, SRC_T, SRC_T0, SRC_T1, SRC_FAU, SRC_CLAUSE };
++enum { MOD_NEG = 1, MOD_ABS = 2, MOD_NOT = 4, MOD_H00 = 8, MOD_H11 = 16, MOD_H10 = 32 };
++enum { TYPE_U32, TYPE_S32, TYPE_F32 };
++enum { CMP_GT, CMP_GE, CMP_EQ, CMP_NE, CMP_LT, CMP_GTLT };
++
++/* A clause label as a value: CSELs of a jump table pass it along to the JUMP. */
++#define LABEL_TAG  0xc1a50000u
++#define LABEL_MASK 0xffff0000u
++
++#define CTX_ADDR   0x100000000000ull
++#define BLOCK_ADDR 0x100000010000ull
++
++struct op {
++   uint8_t code, type, cmp, flags, dest, staging, nsrc, pad;
++};
++struct src {
++   uint8_t kind, mods;
++   uint16_t pad;
++   uint32_t value;
++};
++
++struct machine {
++   uint32_t r[64];
++   uint32_t t0, t1;
++   uint64_t ubo_table_gpu;
++   const uint8_t *ubo_table_cpu;
++   uint32_t ubo_table_size;
++   uint32_t *out;
++   uint32_t out_words;
++   bool bad;
++};
++
++static float
++u2f(uint32_t u)
++{
++   float f;
++   memcpy(&f, &u, 4);
++   return f;
++}
++
++static uint32_t
++f2u(float f)
++{
++   uint32_t u;
++   memcpy(&u, &f, 4);
++   return u;
++}
++
++/* Under arm_mtx. */
++static const uint8_t *
++host_of(uint64_t va, uint32_t bytes)
++{
++   for (unsigned i = 0; i < map_count; i++) {
++      if (va >= maps[i].dev && va + bytes <= maps[i].dev + maps[i].size)
++         return maps[i].host + (va - maps[i].dev);
++   }
++   return NULL;
++}
++
++static uint32_t
++load32(struct machine *m, uint64_t va)
++{
++   if (va >= CTX_ADDR && va < CTX_ADDR + 0x200) {
++      uint32_t off = va - CTX_ADDR;
++      if (off == 0x18)
++         return (uint32_t)m->ubo_table_gpu;
++      if (off == 0x1c)
++         return m->ubo_table_gpu >> 32;
++      if (off == 0x30)
++         return (uint32_t)BLOCK_ADDR;
++      if (off == 0x34)
++         return BLOCK_ADDR >> 32;
++      return 0;
++   }
++   if (va >= m->ubo_table_gpu && va + 4 <= m->ubo_table_gpu + m->ubo_table_size) {
++      uint32_t v;
++      memcpy(&v, m->ubo_table_cpu + (va - m->ubo_table_gpu), 4);
++      return v;
++   }
++   const uint8_t *p = host_of(va, 4);
++   if (!p) {
++      m->bad = true;
++      return 0;
++   }
++   uint32_t v;
++   memcpy(&v, p, 4);
++   return v;
++}
++
++static void
++store32(struct machine *m, uint64_t va, uint32_t v)
++{
++   if (va >= BLOCK_ADDR && va < BLOCK_ADDR + 4ull * m->out_words)
++      m->out[(va - BLOCK_ADDR) / 4] = v;
++}
++
++static uint32_t
++src_value(const struct machine *m, const struct src *s, uint32_t t)
++{
++   uint32_t v = 0;
++   switch (s->kind) {
++   case SRC_REG: v = m->r[s->value & 63]; break;
++   case SRC_IMM: v = s->value; break;
++   case SRC_T: v = t; break;
++   case SRC_T0: v = m->t0; break;
++   case SRC_T1: v = m->t1; break;
++   case SRC_FAU: v = 0; break; /* pilots do not read push uniforms */
++   case SRC_CLAUSE:
++      return LABEL_TAG | (s->value & 0xffff);
++   }
++   if (s->mods & MOD_H00)
++      v = (v & 0xffff) | (v << 16);
++   if (s->mods & MOD_H11)
++      v = (v >> 16) | (v & 0xffff0000);
++   if (s->mods & MOD_H10)
++      v = (v >> 16) | (v << 16);
++   if (s->mods & MOD_ABS)
++      v &= 0x7fffffff;
++   if (s->mods & MOD_NEG)
++      v ^= 0x80000000;
++   if (s->mods & MOD_NOT)
++      v = ~v;
++   return v;
++}
++
++static bool
++compare(uint8_t type, uint8_t cmp, uint32_t a, uint32_t b)
++{
++   if (type == TYPE_F32) {
++      float x = u2f(a), y = u2f(b);
++      switch (cmp) {
++      case CMP_GT: return x > y;
++      case CMP_GE: return x >= y;
++      case CMP_EQ: return x == y;
++      case CMP_NE: return x != y;
++      case CMP_LT: return x < y;
++      default: return x != y;
++      }
++   } else if (type == TYPE_S32) {
++      int32_t x = a, y = b;
++      switch (cmp) {
++      case CMP_GT: return x > y;
++      case CMP_GE: return x >= y;
++      case CMP_EQ: return x == y;
++      case CMP_NE: return x != y;
++      case CMP_LT: return x < y;
++      default: return x != y;
++      }
++   }
++   switch (cmp) {
++   case CMP_GT: return a > b;
++   case CMP_GE: return a >= b;
++   case CMP_EQ: return a == b;
++   case CMP_NE: return a != b;
++   case CMP_LT: return a < b;
++   default: return a != b;
++   }
++}
++
++struct write {
++   uint8_t reg;
++   uint32_t value;
++};
++
++/* Executes one operation; returns its value, *jump = target clause or -1. */
++static uint32_t
++exec_op(struct machine *m, const struct op *op, const struct src *srcs, uint32_t t, struct write *w,
++        unsigned *nw, int *jump)
++{
++   uint32_t f[4] = {0};
++   for (unsigned i = 0; i < op->nsrc && i < 4; i++)
++      f[i] = src_value(m, &srcs[i], t);
++
++   uint32_t v = 0;
++   switch (op->code) {
++   case OP_NOP: return 0;
++   case OP_MOV: case OP_SWZ: v = f[0]; break;
++   case OP_SHADDXL: v = f[0] + (f[1] << op->cmp); break;
++   case OP_IADD: v = f[0] + f[1] + f[2]; break;
++   case OP_ISUB: v = f[0] - f[1] - f[2]; break;
++   case OP_IMUL: v = f[0] * f[1]; break;
++   case OP_LSHIFT_AND: v = (f[0] << (f[2] & 31)) & f[1]; break;
++   case OP_LSHIFT_OR: v = (f[0] << (f[2] & 31)) | f[1]; break;
++   case OP_LSHIFT_XOR: v = (f[0] << (f[2] & 31)) ^ f[1]; break;
++   case OP_RSHIFT_AND: v = (f[0] >> (f[2] & 31)) & f[1]; break;
++   case OP_RSHIFT_OR: v = (f[0] >> (f[2] & 31)) | f[1]; break;
++   case OP_RSHIFT_DOUBLE: v = (uint32_t)((((uint64_t)f[1] << 32) | f[0]) >> (f[2] & 63)); break;
++   case OP_SHIFT_DOUBLE: v = f[1] >> (f[2] & 31); break;
++   case OP_CSEL: v = compare(op->type, op->cmp, f[0], f[1]) ? f[2] : f[3]; break;
++   case OP_MUX:
++      switch (op->cmp) {
++      case 3: v = (f[0] & f[2]) | (f[1] & ~f[2]); break;            /* bit */
++      case 1: v = (f[2] & 0x80000000) ? f[0] : f[1]; break;         /* neg */
++      case 2: v = u2f(f[2]) == 0.0f ? f[0] : f[1]; break;           /* fp_zero */
++      default: v = f[2] == 0 ? f[0] : f[1]; break;                  /* int_zero */
++      }
++      break;
++   case OP_CMP:
++      v = compare(op->type, op->cmp, f[0], f[1]) ? ((op->flags & 2) ? 1 : 0xffffffff) : 0;
++      break;
++   case OP_FMA: v = f2u(u2f(f[0]) * u2f(f[1]) + u2f(f[2])); break;
++   case OP_FADD: v = f2u(u2f(f[0]) + u2f(f[1])); break;
++   case OP_FMAX: v = f2u(fmaxf(u2f(f[0]), u2f(f[1]))); break;
++   case OP_FMIN: v = f2u(fminf(u2f(f[0]), u2f(f[1]))); break;
++   case OP_FRCP: v = f2u(1.0f / u2f(f[0])); break;
++   case OP_FRSQ: v = f2u(1.0f / sqrtf(u2f(f[0]))); break;
++   case OP_U32_TO_F32: v = f2u((float)f[0]); break;
++   case OP_U16_TO_U32: v = f[0] & 0xffff; break;
++   case OP_U8_TO_U32: v = f[0] & 0xff; break;
++   case OP_MKVEC: v = (f[0] & 0xffff) | (f[1] << 16); break;
++   case OP_LDEXP: v = f2u(ldexpf(u2f(f[0]), (int32_t)f[1])); break;
++   case OP_LOAD: {
++      uint64_t va = f[0] | ((uint64_t)f[1] << 32);
++      for (unsigned k = 0; k < op->cmp && *nw < 16; k++)
++         w[(*nw)++] = (struct write){(op->staging + k) & 63, load32(m, va + 4 * k)};
++      return 0;
++   }
++   case OP_STORE: {
++      uint64_t va = f[0] | ((uint64_t)f[1] << 32);
++      for (unsigned k = 0; k < op->cmp; k++)
++         store32(m, va + 4 * k, m->r[(op->staging + k) & 63]);
++      return 0;
++   }
++   case OP_BRANCHZ:
++      if (op->cmp == CMP_EQ ? f[0] == 0 : f[0] != 0) {
++         if ((f[1] & LABEL_MASK) != LABEL_TAG)
++            m->bad = true;
++         *jump = f[1] & 0xffff;
++      }
++      return 0;
++   case OP_JUMP:
++      if ((f[0] & LABEL_MASK) != LABEL_TAG)
++         m->bad = true;
++      *jump = f[0] & 0xffff;
++      return 0;
++   default:
++      m->bad = true;
++      return 0;
++   }
++   if ((op->flags & 1) && op->code >= OP_FMA && op->code <= OP_FRSQ)
++      v = f2u(fminf(fmaxf(u2f(v), 0.0f), 1.0f));
++   if (op->dest != 0xff && *nw < 16)
++      w[(*nw)++] = (struct write){op->dest & 63, v};
++   return v;
++}
++
++bool
++nfsmw_arm_run_pilot(const struct nfsmw_arm *arm, uint64_t ubo_table_gpu, const void *ubo_table_cpu,
++                    uint32_t *out)
++{
++   struct machine m = {0};
++   m.ubo_table_gpu = ubo_table_gpu;
++   m.ubo_table_cpu = ubo_table_cpu;
++   m.ubo_table_size = arm->ubo_table_count * 8;
++   m.out = out;
++   m.out_words = arm->fau_words;
++   m.r[0] = (uint32_t)CTX_ADDR;
++   m.r[1] = CTX_ADDR >> 32;
++   memset(out, 0, arm->fau_words * 4);
++
++   /* Index the clauses. */
++   const uint8_t *p = arm->pilot, *end = arm->pilot + arm->pilot_size;
++   uint32_t nclauses;
++   memcpy(&nclauses, p, 4);
++   p += 4;
++   const uint8_t **clauses = malloc(sizeof(*clauses) * (nclauses + 1));
++   if (!clauses)
++      return false;
++   for (uint32_t c = 0; c < nclauses; c++) {
++      clauses[c] = p;
++      uint16_t ntuples;
++      memcpy(&ntuples, p + 2, 2);
++      p += 4;
++      for (unsigned t = 0; t < 2u * ntuples && p < end; t++) {
++         const struct op *op = (const struct op *)p;
++         p += sizeof(*op) + op->nsrc * sizeof(struct src);
++      }
++   }
++
++   simple_mtx_lock(&arm_mtx);
++   uint32_t c = 0;
++   unsigned steps = 0;
++   bool finished = false;
++   while (c < nclauses && !m.bad && steps++ < 100000) {
++      const uint8_t *q = clauses[c];
++      bool eos = q[0];
++      uint16_t ntuples;
++      memcpy(&ntuples, q + 2, 2);
++      q += 4;
++      int jump = -1;
++      for (unsigned t = 0; t < ntuples; t++) {
++         struct write w[16];
++         unsigned nw = 0;
++         const struct op *fma = (const struct op *)q;
++         const struct src *fs = (const struct src *)(q + sizeof(*fma));
++         q += sizeof(*fma) + fma->nsrc * sizeof(struct src);
++         const struct op *add = (const struct op *)q;
++         const struct src *as = (const struct src *)(q + sizeof(*add));
++         q += sizeof(*add) + add->nsrc * sizeof(struct src);
++         int j1 = -1, j2 = -1;
++         uint32_t vf = exec_op(&m, fma, fs, 0, w, &nw, &j1);
++         uint32_t va = exec_op(&m, add, as, vf, w, &nw, &j2);
++         if (j2 >= 0)
++            jump = j2;
++         else if (j1 >= 0)
++            jump = j1;
++         for (unsigned k = 0; k < nw; k++)
++            m.r[w[k].reg] = w[k].value;
++         m.t0 = vf;
++         m.t1 = va;
++      }
++      if (jump >= 0) {
++         c = jump;
++      } else if (eos) {
++         finished = true;
++         break;
++      } else {
++         c++;
++      }
++   }
++   simple_mtx_unlock(&arm_mtx);
++   free(clauses);
++   return finished && !m.bad;
++}
+diff --git a/src/panfrost/vulkan/panvk_nfsmw_arm.h b/src/panfrost/vulkan/panvk_nfsmw_arm.h
+new file mode 100644
+index 0000000..bbc01e7
+--- /dev/null
++++ b/src/panfrost/vulkan/panvk_nfsmw_arm.h
+@@ -0,0 +1,60 @@
++/*
++ * nfsmw: fragment shaders compiled by ARM's compiler (malioc) in place of Mesa's.
++ *
++ * A .arm package (tools/mali_arm/paquete_arm.py in the game's repo) carries the binary of the main shader, what
++ * its renderer state needs, and its "pilot": the program ARM's driver runs on the CPU before each draw to fill
++ * the shader's push uniforms from its uniform buffers. Packages are looked up by the hash vk_pipeline.c leaves
++ * in nir->info.label, in the folder of the NFSMW_ARM_DIR environment variable.
++ * See docs/plan-arm-hibrido.md in the game's repo.
++ */
++#ifndef PANVK_NFSMW_ARM_H
++#define PANVK_NFSMW_ARM_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define NFSMW_ARM_MAX_VARYINGS 32
++#define NFSMW_ARM_MAX_UBOS     32
++
++struct nfsmw_arm {
++   uint64_t hash;
++   const uint8_t *code;
++   uint32_t code_size;
++   uint16_t message_preload[2];
++   uint64_t preload;
++   uint32_t work_reg_count;
++   uint32_t fau_words;
++   uint32_t varying_count;
++   struct {
++      uint32_t location;
++      uint32_t ncomps;
++   } varyings[NFSMW_ARM_MAX_VARYINGS];
++   uint32_t ubo_count;
++   struct {
++      uint32_t slot;
++      uint32_t set;
++      uint32_t binding;
++   } ubos[NFSMW_ARM_MAX_UBOS];
++   uint32_t ubo_table_count;
++   const uint8_t *pilot;
++   uint32_t pilot_size;
++};
++
++/* "nfsmw:<hash>" in nir->info.label, or 0. */
++uint64_t nfsmw_arm_hash_from_label(const char *label);
++
++/* The package for this hash, loaded once and kept for the life of the process; NULL if there is none. */
++const struct nfsmw_arm *nfsmw_arm_get(uint64_t hash);
++
++/* Host mappings of device memory, so the pilot can read the uniform buffers the application wrote. */
++void nfsmw_arm_map_add(uint64_t dev_addr, uint64_t size, void *host);
++void nfsmw_arm_map_remove(uint64_t dev_addr);
++
++/* Runs the pilot. ubo_table is the ARM-layout uniform buffer table (hardware descriptors) at ubo_table_gpu,
++ * also readable at ubo_table_cpu; out receives arm->fau_words words. Returns false if the pilot read memory
++ * that is not mapped or did not finish. */
++bool nfsmw_arm_run_pilot(const struct nfsmw_arm *arm, uint64_t ubo_table_gpu,
++                         const void *ubo_table_cpu, uint32_t *out);
++
++#endif
+diff --git a/src/panfrost/vulkan/panvk_shader.h b/src/panfrost/vulkan/panvk_shader.h
+index 3052555..cfb2850 100644
+--- a/src/panfrost/vulkan/panvk_shader.h
++++ b/src/panfrost/vulkan/panvk_shader.h
+@@ -10,6 +10,7 @@
+ #error "PAN_ARCH must be defined"
+ #endif
+ 
++#include "panvk_nfsmw_arm.h"
+ #include "compiler/pan_compiler.h"
+ 
+ #include "pan_desc.h"
+@@ -461,6 +462,12 @@ struct panvk_shader_variant {
+ 
+    struct panvk_shader_fau_info fau;
+ 
++   /* nfsmw: a fragment shader whose binary is ARM's (panvk_nfsmw_arm.h); its push uniforms come from the pilot
++    * and its descriptor tables are laid out for it at draw time. */
++   const struct nfsmw_arm *nfsmw_arm;
++   /* nfsmw: the hash in the fragment shader's label, with or without an ARM package. */
++   uint64_t nfsmw_hash;
++
+    const void *bin_ptr;
+    uint32_t bin_size;
+    bool own_bin;
+diff --git a/src/panfrost/vulkan/panvk_vX_shader.c b/src/panfrost/vulkan/panvk_vX_shader.c
+index 55beb6b..66f8792 100644
+--- a/src/panfrost/vulkan/panvk_vX_shader.c
++++ b/src/panfrost/vulkan/panvk_vX_shader.c
+@@ -46,6 +46,11 @@
+ #include "pan_shader.h"
+ 
+ #include "vk_log.h"
++
++#include <inttypes.h>
++#include <stdlib.h>
++
++#include "util/log.h"
+ #include "vk_pipeline.h"
+ #include "vk_pipeline_layout.h"
+ #include "vk_shader.h"
+@@ -1015,6 +1020,80 @@ panvk_lower_nir_io(nir_shader *nir)
+    pan_nir_lower_mediump_io(nir);
+ }
+ 
++#if PAN_ARCH < 9
++/* nfsmw: replace a fragment shader's binary with ARM's (panvk_nfsmw_arm.h). Mesa's compile of the same shader
++ * stays for everything ARM's package does not describe (blend, early-ZS, discard); this swaps the code and what
++ * the renderer state and the varying table take from it. */
++static void
++nfsmw_arm_message(uint16_t v, struct bifrost_message_preload *msg)
++{
++   /* Message Preload in genxml v7: type (0-3), then LD_VAR or VAR_TEX fields. */
++   const unsigned type = v & 0xf;
++   *msg = (struct bifrost_message_preload){0};
++   msg->enabled = type != 0;
++   msg->texture = type == 2;
++   msg->fp16 = ((v >> 9) & 3) == 1;
++   if (msg->texture) {
++      msg->varying_index = (v >> 4) & 0x7;
++      msg->texture_index = (v >> 7) & 0x3;
++      msg->skip = (v >> 14) & 1;
++      msg->zero_lod = (v >> 15) & 1;
++   } else {
++      msg->varying_index = (v >> 4) & 0x1f;
++      msg->num_components = ((v >> 11) & 3) + 1;
++   }
++}
++
++static void
++nfsmw_arm_apply(struct panvk_shader_variant *shader, const struct nfsmw_arm *arm)
++{
++   struct pan_shader_info *info = &shader->info;
++
++   shader->nfsmw_arm = arm;
++   info->work_reg_count = arm->work_reg_count;
++   info->preload = arm->preload;
++   /* ARM's clauses wait on slots 6 and 7 before ATEST and BLEND, so the renderer state must say so. */
++   info->bifrost.wait_6 = true;
++   info->bifrost.wait_7 = true;
++   nfsmw_arm_message(arm->message_preload[0], &info->bifrost.messages[0]);
++   nfsmw_arm_message(arm->message_preload[1], &info->bifrost.messages[1]);
++   /* The renderer state preloads info->fau.count words: all of what the pilot writes, which carries the
++    * texture operation descriptors ARM's TEXC reads. */
++   info->fau.count = arm->fau_words;
++   shader->fau.total_count = DIV_ROUND_UP(arm->fau_words, 2);
++   info->ubo_count = arm->ubo_table_count;
++   /* The draw points the sampler table one entry early: ARM's sampler indices are the game's heap index plus
++    * one (its TEXC takes them from staging registers, sampler then texture); texture indices are the heap's. */
++   info->sampler_count += 1;
++
++   /* The fragment inputs in ARM's order: LD_VAR's index is the slot. */
++   const struct pan_varying_layout old = info->varyings.formats;
++   struct pan_varying_layout *l = &info->varyings.formats;
++   l->count = arm->varying_count;
++   for (unsigned i = 0; i < arm->varying_count; i++) {
++      const struct pan_varying_slot *slot =
++         pan_varying_layout_find_slot(&old, arm->varyings[i].location);
++      if (slot) {
++         l->slots[i] = *slot;
++      } else {
++         l->slots[i] = (struct pan_varying_slot){0};
++         l->slots[i].location = arm->varyings[i].location;
++         l->slots[i].alu_type = nir_type_float32;
++         l->slots[i].ncomps = arm->varyings[i].ncomps;
++         l->slots[i].section = PAN_VARYING_SECTION_GENERIC;
++         l->slots[i].offset = -1;
++      }
++   }
++
++   free((void *)shader->bin_ptr);
++   /* Zeros after the last clause, as Mesa's compiler leaves them: the shader core prefetches 128 bytes. */
++   void *code = calloc(1, arm->code_size + 128);
++   memcpy(code, arm->code, arm->code_size);
++   shader->bin_ptr = code;
++   shader->bin_size = arm->code_size + 128;
++}
++#endif
++
+ static VkResult
+ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+                   VkShaderCreateFlagsEXT shader_flags,
+@@ -1079,6 +1158,20 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
+    }
+    util_dynarray_fini(&binary);
+ 
++#if PAN_ARCH < 9
++   shader->nfsmw_arm = NULL;
++   shader->nfsmw_hash = 0;
++   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
++      const uint64_t hash = nfsmw_arm_hash_from_label(nir->info.label);
++      shader->nfsmw_hash = hash;
++      const struct nfsmw_arm *arm = nfsmw_arm_get(hash);
++      if (arm)
++         nfsmw_arm_apply(shader, arm);
++      else if (hash && getenv("NFSMW_ARM_DIR"))
++         mesa_logi("nfsmw: fragmento %016" PRIx64 " sin binario de ARM", hash);
++   }
++#endif
++
+    if (dump_asm) {
+       shader->nir_str = nir_shader_as_str(nir, NULL);
+ 
+@@ -2355,6 +2448,15 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
+          return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
++   /* Built with ARM's package and it is gone, or built with Mesa's code and there is one now: compile again. */
++   shader->nfsmw_hash = blob_read_uint64(blob);
++   const bool arm_applied = blob_read_uint8(blob);
++   if (blob->overrun)
++      return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
++   shader->nfsmw_arm = shader->nfsmw_hash ? nfsmw_arm_get(shader->nfsmw_hash) : NULL;
++   if (arm_applied != (shader->nfsmw_arm != NULL))
++      return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
++
+    result = panvk_shader_upload(device, shader, pAllocator);
+ 
+    if (result != VK_SUCCESS)
+@@ -2483,6 +2585,10 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
+    blob_write_bytes(blob, shader->nir_str, nir_str_size);
+    blob_write_bytes(blob, shader->asm_str, asm_str_size);
+ 
++   /* nfsmw: the ARM package the variant was built from (its code and info are already in the blob). */
++   blob_write_uint64(blob, shader->nfsmw_hash);
++   blob_write_uint8(blob, shader->nfsmw_arm != NULL);
++
+    return !blob->out_of_memory;
+ }
+ 
+diff --git a/src/vulkan/runtime/vk_pipeline.c b/src/vulkan/runtime/vk_pipeline.c
+index 4edc0fa..8efb87f 100644
+--- a/src/vulkan/runtime/vk_pipeline.c
++++ b/src/vulkan/runtime/vk_pipeline.c
+@@ -47,6 +47,8 @@
+ 
+ #include "util/mesa-blake3.h"
+ 
++#include <inttypes.h>
++
+ struct vk_pipeline_binary {
+    struct vk_object_base base;
+ 
+@@ -217,6 +219,22 @@ vk_pipeline_shader_stage_to_nir(struct vk_device *device,
+    if (nir == NULL)
+       return vk_errorf(device, VK_ERROR_UNKNOWN, "spirv_to_nir failed");
+ 
++   /* nfsmw: identify the shader (SPIR-V + specialization data) for drivers that can replace it with a
++    * precompiled binary (PanVK with ARM's binaries, see the game's docs/plan-arm-hibrido.md). FNV-1a 64
++    * over the SPIR-V bytes, then the specialization data bytes; tools/mali_arm computes the same. */
++   {
++      uint64_t h = 0xcbf29ce484222325ull;
++      const uint8_t *b = (const uint8_t *)spirv_data;
++      for (uint32_t i = 0; i < spirv_size; i++)
++         h = (h ^ b[i]) * 0x100000001b3ull;
++      if (info->pSpecializationInfo && info->pSpecializationInfo->pData) {
++         b = info->pSpecializationInfo->pData;
++         for (size_t i = 0; i < info->pSpecializationInfo->dataSize; i++)
++            h = (h ^ b[i]) * 0x100000001b3ull;
++      }
++      nir->info.label = ralloc_asprintf(nir, "nfsmw:%016" PRIx64, h);
++   }
++
+    vk_set_subgroup_size(
+       nir, properties->subgroupSize, properties->minSubgroupSize,
+       properties->maxSubgroupSize, vk_spirv_version(spirv_data, spirv_size),

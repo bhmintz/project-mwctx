@@ -30,6 +30,7 @@
 #include "nfsmw_hilos_android.h"  // ring priority and who takes its core in a stutter (Android)
 #include "nfsmw_nativo_shaders.h"  // Samplers of the PS (nfsmw_nativo_diag_lectores_s)
 #include "nfsmw_nativo_sincronizacion.h"
+#include "vk13/nfsmw_vk13_pases.h"
 #include "nfsmw_reflejo_demanda.h"  // road reflection only when it is read
 
 #include "nfsmw_ajustes_graficos.h"
@@ -1435,6 +1436,23 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
                 rampa_gamma_ ? "SI" : "no");
     // Parts C3-C6: without the required capabilities only copies and presentation remain.
     dibujos_ = DibujosVulkan::Crear(dispositivo_, memoria_, this);
+    // Mali mode on 1.3 (nfsmw_nativo_mali_vk13): the output pass also opens with dynamic rendering. Its
+    // pipelines were created above against the render pass, before the draws decided the mode: made again.
+    if (dibujos_ && dibujos_->ModoMaliVk13() &&
+        vk13_fn_.Cargar(dispositivo_->vulkan_instance()->functions().vkGetDeviceProcAddr, device_)) {
+      dfn_.vkDestroyPipeline(device_, pipeline_, nullptr);
+      for (VkPipeline& p : pipelines_rampa_) {
+        if (p != VK_NULL_HANDLE) dfn_.vkDestroyPipeline(device_, p, nullptr);
+        p = VK_NULL_HANDLE;
+      }
+      vk13_ = true;
+      pipeline_ = CrearPipelineSalida(fs_, nullptr);
+      if (pipeline_ == VK_NULL_HANDLE ||
+          (rampa_gamma_ && (PipelineRampa(0) == VK_NULL_HANDLE || PipelineRampa(1) == VK_NULL_HANDLE))) {
+        return false;
+      }
+      REXLOG_INFO("[nativo] C2 modo Mali 1.3: la salida tambien con renderizado dinamico, sin framebuffers");
+    }
     return true;
   }
 
@@ -1494,6 +1512,15 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     info_pipeline.layout = layout_pipeline_;
     info_pipeline.renderPass = render_pass_salida_;
     info_pipeline.basePipelineIndex = -1;
+    const VkFormat formato_salida = VulkanPresenter::kGuestOutputFormat;
+    VkPipelineRenderingCreateInfo renderizado{};
+    if (vk13_) {
+      renderizado.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+      renderizado.colorAttachmentCount = 1;
+      renderizado.pColorAttachmentFormats = &formato_salida;
+      info_pipeline.pNext = &renderizado;
+      info_pipeline.renderPass = VK_NULL_HANDLE;
+    }
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (dfn_.vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info_pipeline, nullptr, &pipeline) !=
         VK_SUCCESS) {
@@ -4912,11 +4939,17 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     barrera.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dfn_.vkCmdPipelineBarrier(comandos_trabajo_, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                              VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-                              0, 1, &barrera, 0, nullptr, 0, nullptr);
+    VkPipelineStageFlags hacia = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    if (vk13_ && dibujos_->SinBurbuja()) {
+      // 1.3 with no bubble: as the passes, the copy does not hold the geometry of what follows.
+      nfsmw::vk13::Barrera(vk13_fn_, comandos_trabajo_, VK_PIPELINE_STAGE_2_TRANSFER_BIT, barrera.srcAccessMask,
+                           hacia & ~VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, barrera.dstAccessMask);
+    } else {
+      dfn_.vkCmdPipelineBarrier(comandos_trabajo_, VK_PIPELINE_STAGE_TRANSFER_BIT, hacia, 0, 1, &barrera, 0, nullptr,
+                                0, nullptr);
+    }
     ++restauraciones_para_resolver_;
     pixeles_restaurados_ += uint64_t(destino.ancho) * destino.alto;
     AnotarCopia(destino.ancho, destino.alto);
@@ -5394,11 +5427,25 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
         g_barrera_tras_transferencia = true;
         REXLOG_INFO("[nativo] C2 modo Mali: barreras entre transferencias y al empezar cada trabajo");
       }
-      VkMemoryBarrier barrera{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-      barrera.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-      barrera.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-      dfn_.vkCmdPipelineBarrier(comandos_trabajo_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrera, 0, nullptr, 0, nullptr);
+      if (vk13_) {
+        // On 1.3 the same barrier with what earlier submissions can actually leave written (images: the GPU
+        // writes no buffer, vertex and index data come from the host and are visible at submission) and, with
+        // no bubble, without stopping this work's geometry: on a tiler a dependency that ends in the vertex
+        // stage holds the binning of the first pass until the previous work has finished shading.
+        using namespace nfsmw::nativo;
+        const VkPipelineStageFlags2 destino =
+            dibujos_->SinBurbuja() ? kEtapasImagenes & ~VK_PIPELINE_STAGE_VERTEX_SHADER_BIT : kEtapasImagenes;
+        nfsmw::vk13::Barrera(vk13_fn_, comandos_trabajo_, kEtapasImagenes,
+                             VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                             destino, kAccesosImagenes);
+      } else {
+        VkMemoryBarrier barrera{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrera.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrera.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        dfn_.vkCmdPipelineBarrier(comandos_trabajo_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrera, 0, nullptr, 0, nullptr);
+      }
     }
     ranura.categorias.clear();
     if (consultas_ != VK_NULL_HANDLE) {
@@ -6233,7 +6280,7 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
         framebuffer = f.framebuffer;
       }
     }
-    if (framebuffer == VK_NULL_HANDLE) {
+    if (framebuffer == VK_NULL_HANDLE && !vk13_) {
       auto& f = framebuffers_[siguiente_framebuffer_];
       siguiente_framebuffer_ = (siguiente_framebuffer_ + 1) % framebuffers_.size();
       if (f.framebuffer != VK_NULL_HANDLE) {
@@ -6282,7 +6329,46 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     pase.renderPass = render_pass_salida_;
     pase.framebuffer = framebuffer;
     pase.renderArea.extent = {ancho, alto};
-    if (desde_destino) {
+    if (vk13_) {
+      // What the render pass did: the presenter's image from UNDEFINED to an attachment (and, from a render
+      // target, that image fully written before it is read), then rendering straight to its view.
+      VkMemoryBarrier2 memoria{};
+      memoria.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+      memoria.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      memoria.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+      memoria.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      memoria.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+      VkImageMemoryBarrier2 imagen{};
+      imagen.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+      imagen.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+      imagen.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      imagen.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      imagen.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      imagen.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      imagen.srcQueueFamilyIndex = imagen.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      imagen.image = contexto.image();
+      imagen.subresourceRange = kRangoColor;
+      VkDependencyInfo dependencia{};
+      dependencia.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+      dependencia.memoryBarrierCount = desde_destino ? 1 : 0;
+      dependencia.pMemoryBarriers = &memoria;
+      dependencia.imageMemoryBarrierCount = 1;
+      dependencia.pImageMemoryBarriers = &imagen;
+      vk13_fn_.barrera2(comandos_salida_[s], &dependencia);
+      VkRenderingAttachmentInfo adjunto{};
+      adjunto.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+      adjunto.imageView = contexto.image_view();
+      adjunto.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      adjunto.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+      adjunto.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkRenderingInfo renderizado{};
+      renderizado.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+      renderizado.renderArea.extent = {ancho, alto};
+      renderizado.layerCount = 1;
+      renderizado.colorAttachmentCount = 1;
+      renderizado.pColorAttachments = &adjunto;
+      vk13_fn_.begin_rendering(comandos_salida_[s], &renderizado);
+    } else if (desde_destino) {
       // That image was just written as a render target (or copy destination) in the frame's work, which goes in
       // another submission: make the output read it fully written.
       VkMemoryBarrier barrera{};
@@ -6293,7 +6379,9 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &barrera, 0, nullptr, 0, nullptr);
     }
-    dfn_.vkCmdBeginRenderPass(comandos_salida_[s], &pase, VK_SUBPASS_CONTENTS_INLINE);
+    if (!vk13_) {
+      dfn_.vkCmdBeginRenderPass(comandos_salida_[s], &pase, VK_SUBPASS_CONTENTS_INLINE);
+    }
     const VkViewport viewport{0.0f, 0.0f, float(ancho), float(alto), 0.0f, 1.0f};
     dfn_.vkCmdSetViewport(comandos_salida_[s], 0, 1, &viewport);
     const VkRect2D tijera{{0, 0}, {ancho, alto}};
@@ -6333,8 +6421,36 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
     dfn_.vkCmdPushConstants(comandos_salida_[s], layout_pipeline_, VK_SHADER_STAGE_FRAGMENT_BIT, 16,
                             sizeof(bilineal), &bilineal);
     dfn_.vkCmdDraw(comandos_salida_[s], 4, 1, 0, 0);
-    dfn_.vkCmdEndRenderPass(comandos_salida_[s]);
-    if (desde_destino) {
+    if (vk13_) {
+      vk13_fn_.end_rendering(comandos_salida_[s]);
+      // The render pass's final layout, for the presenter that samples it; and, from a render target, nothing
+      // submitted later writes that image before the output has read it.
+      VkImageMemoryBarrier2 imagen{};
+      imagen.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+      imagen.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      imagen.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+      imagen.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      imagen.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+      imagen.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      imagen.newLayout = VulkanPresenter::kGuestOutputInternalLayout;
+      imagen.srcQueueFamilyIndex = imagen.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      imagen.image = contexto.image();
+      imagen.subresourceRange = kRangoColor;
+      VkMemoryBarrier2 memoria{};
+      memoria.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+      memoria.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+      memoria.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      VkDependencyInfo dependencia{};
+      dependencia.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+      dependencia.memoryBarrierCount = desde_destino ? 1 : 0;
+      dependencia.pMemoryBarriers = &memoria;
+      dependencia.imageMemoryBarrierCount = 1;
+      dependencia.pImageMemoryBarriers = &imagen;
+      vk13_fn_.barrera2(comandos_salida_[s], &dependencia);
+    } else {
+      dfn_.vkCmdEndRenderPass(comandos_salida_[s]);
+    }
+    if (desde_destino && !vk13_) {
       // And nothing submitted later (the next frame draws and clears that image again) writes it before the
       // output has read it.
       dfn_.vkCmdPipelineBarrier(comandos_salida_[s], VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -6579,6 +6695,8 @@ class DestinosVulkan final : public DestinosNativos, public ContextoDestinos {
   VkShaderModule fs_ = VK_NULL_HANDLE;
   VkRenderPass render_pass_salida_ = VK_NULL_HANDLE;
   VkPipeline pipeline_ = VK_NULL_HANDLE;
+  bool vk13_ = false;  // output pass with dynamic rendering (Mali mode on 1.3)
+  nfsmw::vk13::Funciones vk13_fn_;
   // Output with the game's gamma ramp (nfsmw_nativo_rampa_gamma).
   struct RampaSalida {
     VkBuffer bufer = VK_NULL_HANDLE;

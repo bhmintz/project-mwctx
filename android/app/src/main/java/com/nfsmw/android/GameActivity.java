@@ -251,12 +251,25 @@ public final class GameActivity extends SDLActivity
         args.add("--cache_root=" + cacheRoot);
         // The launcher's graphics options win over nfsmw.toml.
         args.addAll(GameOptions.arguments(this));
+        if (GameOptions.get(this, VulkanDriver.OPTION).equals("panvk")) {
+            String icd = VulkanDriver.prepare(this, new File(gameRoot, VulkanDriver.FOLDER));
+            if (icd != null) {
+                args.add("--vulkan_icd_android=" + icd);
+            }
+        }
         if (getSharedPreferences("nfsmw_controls", MODE_PRIVATE).getBoolean("stretch", true)) {
             args.add("--present_letterbox=false");
             args.add("--present_safe_area_x=100");
             args.add("--present_safe_area_y=100");
         }
-        args.addAll(extraArguments());
+        // nfsmw_args.txt replaces a launcher argument with the same name: the cvar parser rejects a repeated one
+        // and then drops every argument (user_data_root included).
+        for (String extra : extraArguments()) {
+            int igual = extra.indexOf('=');
+            String nombre = igual > 0 ? extra.substring(0, igual + 1) : extra;
+            args.removeIf(a -> a.startsWith(nombre) || a.equals(extra));
+            args.add(extra);
+        }
         return args.toArray(new String[0]);
     }
 

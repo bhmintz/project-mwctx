@@ -328,6 +328,10 @@ class DibujosVulkan {
   virtual void AntesDeEnviar() = 0;
   // Mali-G52 sub-mode (bounded descriptors, per-draw sets): ContextoDestinos adds its transfer barriers.
   virtual bool ModoMali() const { return false; }
+  // Mali mode on a Vulkan 1.3 driver: passes with dynamic rendering (nfsmw_nativo_mali_vk13).
+  virtual bool ModoMaliVk13() const { return false; }
+  // nfsmw_nativo_mali_sin_burbuja for the current frame: no dependency ends in the vertex stage.
+  virtual bool SinBurbuja() const { return false; }
   // Starts work in that work slot. Its upload buffer starts over: the GPU has finished the last work
   // submitted with it.
   virtual void UsarRanura(uint32_t ranura) = 0;

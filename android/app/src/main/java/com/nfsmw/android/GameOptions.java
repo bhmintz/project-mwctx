@@ -127,6 +127,10 @@ final class GameOptions {
             new Option("volume", "Volumen del juego", "audio_ganancia_pct", "100",
                     new String[] {"100", "125", "150", "200"},
                     new String[] {"Normal", "Alto", "Muy alto", "Máximo · puede saturar"}),
+            // Not a cvar: GameActivity turns "panvk" into --vulkan_icd_android=<copied driver> (VulkanDriver).
+            new Option(VulkanDriver.OPTION, "Driver Vulkan", null, "sistema",
+                    new String[] {"sistema", "panvk"},
+                    new String[] {"Del sistema", "PanVK (Mesa) · experimental, el zip va en drivers/ de la carpeta del juego"}),
             new Option("filter", "Filtro de color", "nfsmw_posproceso", "apagado",
                     new String[] {"apagado", "cine", "vivo", "calido", "frio", "sepia", "noir", "crt"},
                     new String[] {"Sin filtro", "Cine", "Vivo", "Cálido", "Frío", "Sepia", "Blanco y negro",
@@ -148,6 +152,7 @@ final class GameOptions {
             {"REFLEJOS", "car_reflections", "car_reflections_content", "car_reflections_fixed_brightness",
                     "rear_mirror"},
             {"AUDIO", "volume"},
+            {"DRIVER GRÁFICO", VulkanDriver.OPTION},
     };
 
     private static final String PREFS = "nfsmw_game";
@@ -202,7 +207,9 @@ final class GameOptions {
     static List<String> arguments(Context context) {
         List<String> args = new ArrayList<>();
         for (Option o : ALL) {
-            args.add("--" + o.cvar + "=" + get(context, o.key));
+            if (o.cvar != null) {
+                args.add("--" + o.cvar + "=" + get(context, o.key));
+            }
         }
         args.addAll(profileArguments(context));
         return args;

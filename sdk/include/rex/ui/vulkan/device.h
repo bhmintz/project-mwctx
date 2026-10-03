@@ -172,6 +172,10 @@ class VulkanDevice {
 
     bool dynamicRendering = false;
 
+    // VK_KHR_synchronization2 (#315, promoted to 1.3). Only read on Android (NFSMW's Mali mode on 1.3).
+
+    bool synchronization2 = false;
+
     // VK_EXT_non_seamless_cube_map (#423)
 
     bool nonSeamlessCubeMap = false;

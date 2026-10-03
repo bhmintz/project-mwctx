@@ -41,6 +41,7 @@
 #include "nfsmw_nativo_vertices_dedupe.h"
 #include "nfsmw_nativo_texturas_pool.h"
 #include "nfsmw_nativo_sincronizacion.h"
+#include "vk13/nfsmw_vk13_pases.h"
 
 #include "nfsmw_ajustes_graficos.h"
 #if __has_include("nfsmw_nativo_resplandor_energia_spirv.h") && __has_include("nfsmw_nativo_resplandor_suave_spirv.h")
@@ -812,6 +813,9 @@ REXCVAR_DEFINE_BOOL(nfsmw_nativo_desglose_por_fence, false, "NFSMW",
                     "Diagnostico para GPUs sin marcas de tiempo (Mali-G52): al cerrar cada pase se envia lo grabado "
                     "y se espera a la GPU; ese tiempo va a la categoria del pase en el informe C2 (GPU por Swap). "
                     "Serializa CPU y GPU: los fps bajan, solo para medir");
+#if defined(__ANDROID__)
+REXCVAR_DECLARE(std::string, vulkan_icd_android);  // sdk/src/ui/vulkan/vulkan_instance.cpp
+#endif
 REXCVAR_DEFINE_INT32(nfsmw_nativo_mali_sin_burbuja, 1, "NFSMW",
                      "Modo Mali: las dependencias de los render pass no terminan en la etapa de vertices, para que "
                      "la geometria de un pase se solape con el sombreado del anterior. 0 = como antes, 1 = sin "
@@ -863,6 +867,13 @@ REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sin_sombras, true, "NFSMW",
                     "Modo Mali: no se graba el mapa de sombras (como nfsmw_nativo_omitir_sombras, solo en Mali) "
                     "mientras nfsmw_sombras_cada sea 0 (automatico); la opcion de la app manda");
 REXCVAR_DECLARE(int32_t, nfsmw_sombras_cada);
+// Mali mode on a Vulkan 1.3 driver (PanVK): passes with dynamic rendering and synchronization2 barriers instead
+// of the VkRenderPass/VkFramebuffer caches the 1.1 driver needs (vk13/nfsmw_vk13_pases.h). Only when the device
+// has both features; with the vendor's 1.1 driver it changes nothing.
+REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_vk13, true, "NFSMW",
+                    "Modo Mali con un driver Vulkan 1.3 (PanVK): pases con renderizado dinamico y barreras de "
+                    "synchronization2 en vez de VkRenderPass y VkFramebuffer. false = como en el driver 1.1")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(nfsmw_nativo_mali_sets_persistentes, true, "NFSMW",
                     "Modo Mali: los sets de texturas por dibujo se guardan entre fotogramas y solo se descartan "
                     "cuando se retira una vista que usan (si no, cada ranura de trabajo los rehace)")
@@ -2744,8 +2755,14 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     const int32_t cvar = REXCVAR_GET(nfsmw_nativo_mali);
     if (cvar == 0) return false;
     if (cvar == 1) return true;
-    const bool tiene_bindless = propiedades.shaderInt64 && propiedades.bufferDeviceAddress &&
-                                propiedades.runtimeDescriptorArray;
+    bool tiene_bindless = propiedades.shaderInt64 && propiedades.bufferDeviceAddress &&
+                          propiedades.runtimeDescriptorArray;
+#if defined(__ANDROID__)
+    // The native heaps are also written while the GPU reads them: Mesa's PanVK on a Mali-G52 (Vulkan 1.3)
+    // has Int64, BDA and runtime arrays but neither of these, and the PC path drew a black screen there.
+    tiene_bindless = tiene_bindless && propiedades.descriptorBindingPartiallyBound &&
+                     propiedades.descriptorBindingSampledImageUpdateAfterBind;
+#endif
     return !tiene_bindless && propiedades.shaderSampledImageArrayDynamicIndexing;
   }
 
@@ -2841,6 +2858,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         dispositivo_->vulkan_instance()->functions().vkGetDeviceProcAddr(device_, "vkCmdCopyImage"));
     CargarCachePipelines();
     CargarEstadoDinamico();  // dynamic state phases 1 and 2
+    CargarVk13();            // Mali mode on a 1.3 driver
     // En modo Mali las constantes van siempre por UBO (incompatibilidad A): no se usa el puntero de 64
     // bits, asi que no se exige vkGetBufferDeviceAddress.
     if ((!direccion_bufer_ && !modo_mali_) || !CrearSubida() || !CrearDescriptores()) {
@@ -5534,7 +5552,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         consulta_oclusion_ = UINT32_MAX;
       }
       const auto antes_fin = std::chrono::steady_clock::now();
-      dfn_.vkCmdEndRenderPass(pase_comandos_);
+      CerrarPaseVulkan(pase_comandos_);
       if (estadisticas_pase_ != UINT32_MAX) {
         contexto_->TerminarEstadisticas(estadisticas_pase_);
         estadisticas_pase_ = UINT32_MAX;
@@ -5735,6 +5753,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   }
 
   bool ModoMali() const override { return modo_mali_; }
+  bool ModoMaliVk13() const override { return vk13_; }
+  bool SinBurbuja() const override { return sin_burbuja_fotograma_; }
 
   void AntesDeEnviar() override {
     EsperarSubidas();  // deferred vertex copies, before flushing the mapping and submitting
@@ -6367,27 +6387,17 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     TerminarPase();  // a pass cannot be opened inside another
     uint32_t formatos[5] = {0, 0, 0, 0, uint32_t(imagen.formato)};
-    const VkRenderPass pase = PaseDe(formatos, kCargaBorrar);
-    if (pase == VK_NULL_HANDLE) {
-      return false;
-    }
     std::array<VkImageView, 5> vistas{};
     vistas[4] = imagen.vista;
-    const VkFramebuffer framebuffer = FramebufferDe(pase, vistas, imagen.ancho, imagen.alto);
-    if (framebuffer == VK_NULL_HANDLE) {
+    VkClearValue valores[5] = {};
+    valores[4].depthStencil = {profundidad, stencil};
+    VkRect2D area{};
+    area.extent = {imagen.ancho, imagen.alto};
+    if (AbrirPaseVulkan(comandos, formatos, vistas, imagen.ancho, imagen.alto, area, kCargaBorrar, 0, valores,
+                        nullptr)) {
       return false;
     }
-    VkClearValue borrado{};
-    borrado.depthStencil = {profundidad, stencil};
-    VkRenderPassBeginInfo inicio{};
-    inicio.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    inicio.renderPass = pase;
-    inicio.framebuffer = framebuffer;
-    inicio.renderArea.extent = {imagen.ancho, imagen.alto};
-    inicio.clearValueCount = 1;
-    inicio.pClearValues = &borrado;
-    dfn_.vkCmdBeginRenderPass(comandos, &inicio, VK_SUBPASS_CONTENTS_INLINE);
-    dfn_.vkCmdEndRenderPass(comandos);
+    CerrarPaseVulkan(comandos);
     ++borrados_profundidad_en_pase_;
     return true;
   }
@@ -6403,25 +6413,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     const uint32_t i = profundidad ? 4 : 0;
     uint32_t formatos[5] = {};
     formatos[i] = uint32_t(imagen.formato);
-    const VkRenderPass pase = PaseDe(formatos, kCargaBorrar);
-    if (pase == VK_NULL_HANDLE) {
-      return false;
-    }
     std::array<VkImageView, 5> vistas{};
     vistas[i] = imagen.vista;
-    const VkFramebuffer framebuffer = FramebufferDe(pase, vistas, imagen.ancho, imagen.alto);
-    if (framebuffer == VK_NULL_HANDLE) {
+    VkClearValue valores[5] = {};
+    valores[i] = valor;
+    if (AbrirPaseVulkan(comandos, formatos, vistas, imagen.ancho, imagen.alto, area, kCargaBorrar, 0, valores,
+                        nullptr)) {
       return false;
     }
-    VkRenderPassBeginInfo inicio{};
-    inicio.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    inicio.renderPass = pase;
-    inicio.framebuffer = framebuffer;
-    inicio.renderArea = area;
-    inicio.clearValueCount = 1;
-    inicio.pClearValues = &valor;
-    dfn_.vkCmdBeginRenderPass(comandos, &inicio, VK_SUBPASS_CONTENTS_INLINE);
-    dfn_.vkCmdEndRenderPass(comandos);
+    CerrarPaseVulkan(comandos);
     return true;
   }
 
@@ -6437,27 +6437,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     }
     TerminarPase();  // a pass cannot be opened inside another
     uint32_t formatos[5] = {uint32_t(imagen.formato), 0, 0, 0, 0};
-    const VkRenderPass pase = PaseDe(formatos, kCargaBorrar);
-    if (pase == VK_NULL_HANDLE) {
-      return false;
-    }
     std::array<VkImageView, 5> vistas{};
     vistas[0] = imagen.vista;
-    const VkFramebuffer framebuffer = FramebufferDe(pase, vistas, imagen.ancho, imagen.alto);
-    if (framebuffer == VK_NULL_HANDLE) {
+    VkClearValue valores[5] = {};
+    valores[0].color = color;
+    if (AbrirPaseVulkan(comandos, formatos, vistas, imagen.ancho, imagen.alto, area, kCargaBorrar, 0, valores,
+                        nullptr)) {
       return false;
     }
-    VkClearValue borrado{};
-    borrado.color = color;
-    VkRenderPassBeginInfo inicio{};
-    inicio.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    inicio.renderPass = pase;
-    inicio.framebuffer = framebuffer;
-    inicio.renderArea = area;
-    inicio.clearValueCount = 1;
-    inicio.pClearValues = &borrado;
-    dfn_.vkCmdBeginRenderPass(comandos, &inicio, VK_SUBPASS_CONTENTS_INLINE);
-    dfn_.vkCmdEndRenderPass(comandos);
+    CerrarPaseVulkan(comandos);
     return true;
   }
 
@@ -8606,6 +8594,18 @@ class DibujosVulkanImpl final : public DibujosVulkan {
 
   // The pipelines file (cache/nfsmw_nativo_pipelines.bin): the Vulkan cache and the prewarm list.
   static std::filesystem::path RutaFicheroPipelines() {
+#if defined(__ANDROID__)
+    // With another Vulkan driver (vulkan_icd_android, e.g. PanVK) a file of its own: a driver ignores the other
+    // one's cache, and on saving it would overwrite it, so every driver switch recompiled everything.
+    const std::string& driver = REXCVAR_GET(vulkan_icd_android);
+    std::error_code error;
+    if (!driver.empty() && std::filesystem::is_regular_file(driver, error)) {  // otherwise it is the system one
+      std::string nombre = driver.substr(driver.rfind('/') + 1);
+      nombre = nombre.substr(0, nombre.rfind('.'));
+      return rex::filesystem::GetExecutableFolder() / kCarpetaCache /
+             ("nfsmw_nativo_pipelines_" + nombre + ".bin");
+    }
+#endif
     return rex::filesystem::GetExecutableFolder() / kCarpetaCache / kFicheroPipelines;
   }
 
@@ -8626,6 +8626,13 @@ class DibujosVulkanImpl final : public DibujosVulkan {
   void LeerFicheroPipelines(std::vector<uint8_t>& cache, std::vector<uint8_t>& lista) {
     std::vector<uint8_t> todo;
     LeerFicheroEntero(RutaFicheroPipelines(), todo);
+    bool solo_lista = false;
+    if (todo.empty() && RutaFicheroPipelines().filename() != kFicheroPipelines) {
+      // First run with another driver: its own file does not exist yet. The prewarm list (the game's
+      // pipelines, the same with any driver) is taken from the system driver's file; its cache is not.
+      LeerFicheroEntero(rex::filesystem::GetExecutableFolder() / kCarpetaCache / kFicheroPipelines, todo);
+      solo_lista = !todo.empty();
+    }
     if (!todo.empty()) {
       uint32_t magia = 0;
       uint32_t version = 0;
@@ -8645,6 +8652,10 @@ class DibujosVulkanImpl final : public DibujosVulkan {
       }
       const auto inicio = todo.begin() + kCabeceraFicheroPipelines;
       lista.assign(inicio, inicio + std::ptrdiff_t(bytes_lista));
+      if (solo_lista) {
+        REXLOG_INFO("[nativo] C6: primer arranque con este driver: lista de precalentado del driver del sistema");
+        return;
+      }
       cache.assign(inicio + std::ptrdiff_t(bytes_lista), todo.end());
       return;
     }
@@ -11816,14 +11827,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     uint32_t alto_abrir = alto_pase;
     const uint32_t mascara_borrar =
         modo_mali_ ? contexto_->TomarBorradosDePase(imagenes.data(), ancho, alto_pase, alto_abrir, valores_borrar) : 0;
-    const VkRenderPass pase =
-        PaseDe(formatos, sombras_sin_load ? kCargaIgnorar : kCargaLeer, mascara_borrar);
-    if (pase == VK_NULL_HANDLE) {
-      return Rechazar(42, "no se pudo crear el render pass");
-    }
-    const VkFramebuffer framebuffer = FramebufferDe(pase, vistas, ancho, alto);
-    if (framebuffer == VK_NULL_HANDLE) {
-      return Rechazar(43, "no se pudo crear el framebuffer");
+    const uint32_t modo_carga = sombras_sin_load ? kCargaIgnorar : kCargaLeer;
+    if (!vk13_) {  // the render pass and framebuffer now, so a failure rejects the draw before anything is recorded
+      const VkRenderPass pase = PaseDe(formatos, modo_carga, mascara_borrar);
+      if (pase == VK_NULL_HANDLE) {
+        return Rechazar(42, "no se pudo crear el render pass");
+      }
+      if (FramebufferDe(pase, vistas, ancho, alto) == VK_NULL_HANDLE) {
+        return Rechazar(43, "no se pudo crear el framebuffer");
+      }
     }
     if (cronometrar_) {
       etapas_ns_[10] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -11850,23 +11862,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     if (!cmd) {
       return false;
     }
-    VkRenderPassBeginInfo inicio{};
-    inicio.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    inicio.renderPass = pase;
-    inicio.framebuffer = framebuffer;
-    inicio.renderArea.extent = {ancho, alto_abrir};
-    // The clear values, in attachment order (CrearPase skips the empty slots).
-    std::array<VkClearValue, 5> valores_compactos{};
-    if (mascara_borrar) {
-      uint32_t n = 0;
-      for (uint32_t i = 0; i < 5; ++i) {
-        if (formatos[i]) {
-          valores_compactos[n++] = valores_borrar[i];
-        }
-      }
-      inicio.clearValueCount = n;
-      inicio.pClearValues = valores_compactos.data();
-    }
+    VkRect2D area{};
+    area.extent = {ancho, alto_abrir};
     // nfsmw_nativo_diag_borrados. What this pass loads and stores of each render target, to compare with
     // what is cleared of it (C2 clears per target). Before opening the pass.
     for (const ImagenNativa* imagen : imagenes) {
@@ -11877,7 +11874,15 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     // The statistics cover the whole pass, from here to after EndRenderPass.
     estadisticas_pase_ = contexto_->EmpezarEstadisticas(categoria_pase_);
     const auto antes_inicio = std::chrono::steady_clock::now();
-    dfn_.vkCmdBeginRenderPass(cmd, &inicio, VK_SUBPASS_CONTENTS_INLINE);
+    VkRenderPass pase = VK_NULL_HANDLE;
+    if (const uint32_t error = AbrirPaseVulkan(cmd, formatos, vistas, ancho, alto, area, modo_carga, mascara_borrar,
+                                               valores_borrar, &pase)) {
+      if (estadisticas_pase_ != UINT32_MAX) {
+        contexto_->TerminarEstadisticas(estadisticas_pase_);
+        estadisticas_pase_ = UINT32_MAX;
+      }
+      return Rechazar(error, error == 42 ? "no se pudo crear el render pass" : "no se pudo crear el framebuffer");
+    }
     ns_render_pass_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - antes_inicio).count());
     if (cronometrar_) {
@@ -13210,6 +13215,80 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     return true;
   }
 
+  // nfsmw_nativo_mali_vk13: decided once, after the Mali mode.
+  void CargarVk13() {
+    const auto& p = dispositivo_->properties();
+    const bool pedido = modo_mali_ && REXCVAR_GET(nfsmw_nativo_mali_vk13);
+    vk13_ = pedido && p.dynamicRendering && p.synchronization2 &&
+            vk13_fn_.Cargar(dispositivo_->vulkan_instance()->functions().vkGetDeviceProcAddr, device_);
+    if (modo_mali_) {
+      REXLOG_INFO("[nativo] C6 modo Mali 1.3 (nfsmw_nativo_mali_vk13): {}",
+                  vk13_    ? "SI: renderizado dinamico y barreras de synchronization2, sin VkRenderPass ni VkFramebuffer"
+                  : pedido ? "no: el dispositivo no tiene dynamicRendering y synchronization2 (driver 1.1)"
+                           : "apagado");
+    }
+  }
+
+  // Opens a pass of the ring or of a clear: with dynamic rendering (vk13_) or with PaseDe/FramebufferDe.
+  // `valores` by slot (0-3 color, 4 depth). 0 = done, otherwise the Rechazar code (42 pass, 43 framebuffer).
+  uint32_t AbrirPaseVulkan(VkCommandBuffer cmd, const uint32_t formatos[5], const std::array<VkImageView, 5>& vistas,
+                           uint32_t fb_ancho, uint32_t fb_alto, const VkRect2D& area, uint32_t modo_carga,
+                           uint32_t mascara_borrar, const VkClearValue* valores, VkRenderPass* pase_salida) {
+    if (vk13_) {
+      if (REXCVAR_GET(nfsmw_nativo_sincronizacion_gpu)) {
+        nfsmw::vk13::BarreraEntrada(vk13_fn_, cmd, sin_burbuja_fotograma_);
+      }
+      uint32_t borrar = mascara_borrar;
+      if (modo_carga == kCargaBorrar) {
+        for (uint32_t i = 0; i < 5; ++i) {
+          if (formatos[i]) borrar |= 1u << i;
+        }
+      }
+      nfsmw::vk13::AbrirPase(vk13_fn_, cmd, formatos, vistas, area, borrar, modo_carga == kCargaIgnorar, valores);
+      if (pase_salida) *pase_salida = VK_NULL_HANDLE;
+      return 0;
+    }
+    const VkRenderPass pase = PaseDe(formatos, modo_carga, mascara_borrar);
+    if (pase == VK_NULL_HANDLE) {
+      return 42;
+    }
+    const VkFramebuffer framebuffer = FramebufferDe(pase, vistas, fb_ancho, fb_alto);
+    if (framebuffer == VK_NULL_HANDLE) {
+      return 43;
+    }
+    VkRenderPassBeginInfo inicio{};
+    inicio.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    inicio.renderPass = pase;
+    inicio.framebuffer = framebuffer;
+    inicio.renderArea = area;
+    // The clear values, in attachment order (CrearPase skips the empty slots).
+    std::array<VkClearValue, 5> valores_compactos{};
+    if (valores && (mascara_borrar || modo_carga == kCargaBorrar)) {
+      uint32_t n = 0;
+      for (uint32_t i = 0; i < 5; ++i) {
+        if (formatos[i]) {
+          valores_compactos[n++] = valores[i];
+        }
+      }
+      inicio.clearValueCount = n;
+      inicio.pClearValues = valores_compactos.data();
+    }
+    dfn_.vkCmdBeginRenderPass(cmd, &inicio, VK_SUBPASS_CONTENTS_INLINE);
+    if (pase_salida) *pase_salida = pase;
+    return 0;
+  }
+
+  void CerrarPaseVulkan(VkCommandBuffer cmd) {
+    if (vk13_) {
+      vk13_fn_.end_rendering(cmd);
+      if (REXCVAR_GET(nfsmw_nativo_sincronizacion_gpu)) {
+        nfsmw::vk13::BarreraSalida(vk13_fn_, cmd, sin_burbuja_fotograma_);
+      }
+      return;
+    }
+    dfn_.vkCmdEndRenderPass(cmd);
+  }
+
   /*
    * Dynamic state phases 1 and 2. The EDS1/EDS2 vkCmdSet* functions are core in Vulkan 1.3 and the SDK's
    * table does not load them: they are requested from the driver, like vkCmdCopyImage. With an API below
@@ -13514,6 +13593,11 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     info.pDynamicState = &dinamico;
     info.layout = layout_pipeline_;
     info.renderPass = pase;  // the pass's (ring) or a compatible one (prewarm)
+    nfsmw::vk13::FormatosPipeline formatos_vk13;
+    if (vk13_) {
+      info.renderPass = VK_NULL_HANDLE;  // dynamic rendering: only the formats
+      info.pNext = formatos_vk13.De(clave.formatos);
+    }
     info.basePipelineIndex = -1;
     n_colores_salida = n_colores;
     pipeline = VK_NULL_HANDLE;
@@ -13821,7 +13905,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
         const uint64_t clave_pase = XXH3_64bits(r.clave.formatos, sizeof(r.clave.formatos));
         auto it_pase = pases.find(clave_pase);
         if (it_pase == pases.end()) {
-          it_pase = pases.emplace(clave_pase, CrearPase(r.clave.formatos, kCargaLeer)).first;
+          // Mali mode on 1.3: no render pass, the pipeline only takes the formats (CrearPipelineVulkan).
+          it_pase = pases.emplace(clave_pase, vk13_ ? VK_NULL_HANDLE : CrearPase(r.clave.formatos, kCargaLeer)).first;
         }
         EntradaVertices entrada;
         for (uint32_t k = 0; k < r.n_atributos; ++k) {
@@ -13832,7 +13917,7 @@ class DibujosVulkanImpl final : public DibujosVulkan {
           entrada.enlaces.push_back({0, r.zancadas[k]});
         }
         if (modulo_vs != VK_NULL_HANDLE && (!r.clave.ps || modulo_ps != VK_NULL_HANDLE) &&
-            it_pase->second != VK_NULL_HANDLE) {
+            (it_pase->second != VK_NULL_HANDLE || vk13_)) {
           VkPipeline pipeline = VK_NULL_HANDLE;
           uint32_t n_colores = 0;
           const auto t0 = std::chrono::steady_clock::now();
@@ -14231,6 +14316,8 @@ class DibujosVulkanImpl final : public DibujosVulkan {
     kEdsTodo,          // times everything is set (not a call)
     kEdsN
   };
+  bool vk13_ = false;  // nfsmw_nativo_mali_vk13 (CargarVk13)
+  nfsmw::vk13::Funciones vk13_fn_;
   PFN_vkCmdSetCullMode set_cara_ = nullptr;  // nucleo de Vulkan 1.3 (CargarEstadoDinamico)
   PFN_vkCmdSetFrontFace set_frente_ = nullptr;
   PFN_vkCmdSetPrimitiveTopology set_topologia_ = nullptr;

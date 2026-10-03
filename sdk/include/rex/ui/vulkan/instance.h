@@ -22,6 +22,14 @@ namespace rex {
 namespace ui {
 namespace vulkan {
 
+#if REX_PLATFORM_ANDROID
+// Opens a Vulkan loader library that uses the driver at `driver_path` (a .so in app storage) instead of the
+// system one, and returns its dlopen handle, or nullptr. The app sets it (with libadrenotools) before the first
+// VulkanInstance::Create; it is used when the vulkan_icd_android cvar names a driver. The handle is never closed.
+using AndroidVulkanLoaderOpener = void* (*)(const char* driver_path);
+void SetAndroidVulkanLoaderOpener(AndroidVulkanLoaderOpener opener);
+#endif
+
 class VulkanInstance {
  public:
   static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation);

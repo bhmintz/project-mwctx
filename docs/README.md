@@ -45,6 +45,7 @@ This is the path the game follows, from the Xbox 360 disc to the Switch screen:
 | [backend-mali.md](backend-mali.md) | The native renderer's Mali mode for low-end Android GPUs (Mali-G52): architecture, frame and texture flow, every hack (in Spanish) |
 | [mali-g52-vulkan.md](mali-g52-vulkan.md) | What the Mali-G52 MC2 exposes in Vulkan: features, extensions, limits, memory and formats (in Spanish) |
 | [plan-optimizacion-mali.md](plan-optimizacion-mali.md) | The optimization to-do list for the Mali mode (in Spanish) |
+| [herramientas-mali.md](herramientas-mali.md) | The tools to capture the Mali driver, read ARM's compiled shaders and build our PanVK, with how to build them and what they need (in Spanish) |
 | [shaders.md](shaders.md) | How the game's shaders are translated, and what had to be fixed |
 | [toolchain.md](toolchain.md) | How the game's code is translated and compiled, and the build options that make it faster |
 | [mesa.md](mesa.md) | The graphics driver and this port's changes to it |

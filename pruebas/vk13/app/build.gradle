@@ -1,0 +1,64 @@
+plugins {
+    id 'com.android.application'
+}
+
+def localProps = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+def cfg = { String key, String fallback -> localProps.getProperty(key) ?: fallback }
+
+android {
+    namespace 'com.nfsmw.pruebavk13'
+    compileSdk cfg('nfsmw.compileSdk', '35').toInteger()
+
+    // PanVK (libvulkan_panfrost.so, from the mali-panvk zip unpacked in out/panvk) goes in as an asset; the app
+    // copies it to its private storage, where it can be dlopen'd.
+    sourceSets {
+        main.assets.srcDirs = ["$rootDir/../../out/panvk"]
+    }
+    androidResources {
+        ignoreAssetsPattern '!*.zip:!*.txt:!*.json:!lh.so:!ls.so'
+    }
+
+    defaultConfig {
+        applicationId 'com.nfsmw.pruebavk13'
+        minSdk 29
+        targetSdk cfg('nfsmw.targetSdk', '35').toInteger()
+        versionCode 1
+        versionName '1.0'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++20'
+                arguments '-DANDROID_STL=c++_shared'
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('src/main/cpp/CMakeLists.txt')
+            version cfg('nfsmw.cmakeVersion', '3.30.5')
+        }
+    }
+
+    // libadrenotools loads its hook libraries from nativeLibraryDir, so they must be extracted from the APK.
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    ndkVersion cfg('nfsmw.ndkVersion', '28.2.13676358')
+}

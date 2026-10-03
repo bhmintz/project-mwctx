@@ -27,6 +27,16 @@
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
 
+#if REX_PLATFORM_ANDROID
+#include <dlfcn.h>
+
+// A Vulkan driver used instead of the system's, e.g. Mesa's PanVK for Mali Bifrost on the stock kbase kernel
+// driver. Absolute path to the .so in app-private storage (external storage is noexec); the launcher copies it
+// there. Empty = the system driver. Needs the app's AndroidVulkanLoaderOpener.
+REXCVAR_DEFINE_STRING(vulkan_icd_android, "", "UI/Vulkan",
+                      "Android: absolute path of a Vulkan driver to use instead of the system one");
+#endif
+
 #if REX_PLATFORM_SWITCH
 // NVK for Horizon is linked statically (Mesa's libvulkan.a) and exports the
 // entry points directly. api.h defines VK_NO_PROTOTYPES, so they have to be
@@ -42,6 +52,16 @@ namespace rex {
 namespace ui {
 namespace vulkan {
 
+#if REX_PLATFORM_ANDROID
+namespace {
+AndroidVulkanLoaderOpener android_vulkan_loader_opener = nullptr;
+}  // namespace
+
+void SetAndroidVulkanLoaderOpener(AndroidVulkanLoaderOpener opener) {
+  android_vulkan_loader_opener = opener;
+}
+#endif
+
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                                        const bool try_enable_validation) {
   std::unique_ptr<VulkanInstance> vulkan_instance(new VulkanInstance());
@@ -56,6 +76,8 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
 
   bool functions_loaded = true;
   bool loader_loaded = false;
+  // Android: vkGetInstanceProcAddr and vkDestroyInstance come from a libvulkan for another driver.
+  [[maybe_unused]] bool custom_loader = false;
 #if REX_PLATFORM_MAC
   const MacOSVulkanRuntimePaths macos_runtime_paths = DetectMacOSVulkanRuntimePaths();
   ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
@@ -93,19 +115,42 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   ifn.vkDestroyInstance = &::vkDestroyInstance;
   loader_loaded = true;
 #else
-  loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
-  if (!loader_loaded) {
-    REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
-    return nullptr;
+#if REX_PLATFORM_ANDROID
+  if (!REXCVAR_GET(vulkan_icd_android).empty()) {
+    const std::string& driver_path = REXCVAR_GET(vulkan_icd_android);
+    void* custom_libvulkan =
+        android_vulkan_loader_opener ? android_vulkan_loader_opener(driver_path.c_str()) : nullptr;
+    if (custom_libvulkan) {
+      ifn.vkGetInstanceProcAddr =
+          PFN_vkGetInstanceProcAddr(dlsym(custom_libvulkan, "vkGetInstanceProcAddr"));
+      ifn.vkDestroyInstance = PFN_vkDestroyInstance(dlsym(custom_libvulkan, "vkDestroyInstance"));
+      custom_loader = ifn.vkGetInstanceProcAddr && ifn.vkDestroyInstance;
+    }
+    if (custom_loader) {
+      loader_loaded = true;
+      REXLOG_INFO("Vulkan: using the driver {}", driver_path);
+    } else {
+      REXLOG_ERROR("Vulkan: could not open the driver {}; using the system one", driver_path);
+    }
+  }
+#endif  // REX_PLATFORM_ANDROID
+  if (!custom_loader) {
+    loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+    if (!loader_loaded) {
+      REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
+      return nullptr;
+    }
   }
 #endif
 
 #if !REX_PLATFORM_SWITCH
+  if (!custom_loader) {
 #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
 #undef XE_VULKAN_LOAD_LOADER_FUNCTION
+  }
 #endif  // !REX_PLATFORM_SWITCH
   if (!functions_loaded) {
     REXLOG_ERROR("Failed to get Vulkan loader function pointers");

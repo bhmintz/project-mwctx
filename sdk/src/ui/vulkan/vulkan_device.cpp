@@ -734,6 +734,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_3, shaderDemoteToHelperInvocation);
       XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
     }
+#if REX_PLATFORM_ANDROID
+    if (REXCVAR_GET(vulkan_native_shader_features)) {
+      // NFSMW's Mali mode on a 1.3 driver (Mesa's PanVK): passes without VkRenderPass and synchronization2
+      // barriers (nfsmw_nativo_mali_vk13). The vendor's 1.1 driver never gets here.
+      XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
+      XE_UI_VULKAN_FEATURE_2(features_1_3, synchronization2);
+    }
+#endif
   } else {
     if (ext_1_3_KHR_dynamic_rendering) {
       if (with_gpu_emulation) {
