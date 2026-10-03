@@ -256,7 +256,14 @@ public final class GameActivity extends SDLActivity
             args.add("--present_safe_area_x=100");
             args.add("--present_safe_area_y=100");
         }
-        args.addAll(extraArguments());
+        // nfsmw_args.txt replaces a launcher argument with the same name: the cvar parser rejects a repeated one
+        // and then drops every argument (user_data_root included).
+        for (String extra : extraArguments()) {
+            int igual = extra.indexOf('=');
+            String nombre = igual > 0 ? extra.substring(0, igual + 1) : extra;
+            args.removeIf(a -> a.startsWith(nombre) || a.equals(extra));
+            args.add(extra);
+        }
         return args.toArray(new String[0]);
     }
 
