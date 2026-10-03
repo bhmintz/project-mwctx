@@ -180,6 +180,17 @@ Implementación en nuestro JimVulkan (`out/jim/mesa`, se compila con `tools/mali
    offset dinámico) y el resultado va como uniformes empujados del FS. Los índices de textura del piloto se
    corrigen a la tabla de PanVK.
 
+### Resultado del adaptador (2026-10-03)
+
+- Con los 54 paquetes (56 variantes de fragmento de la lista de pipelines), 43 fragmentos corren con el binario de
+  ARM en el menú y en carrera, sin errores de GPU y sin diferencias visibles con Mesa.
+- **Rendimiento:** en carrera, 16 FPS con la GPU al 92%, contra 35–48 FPS del driver de Samsung. Que los
+  fragmentos usen el código de ARM no cierra la diferencia, así que el compilador de fragmentos de Mesa no la
+  explica sola. Falta medir la misma carrera con y sin ARM para saber cuánto aporta, y comparar un fotograma de
+  la captura de Samsung con uno de PanVK (render passes, AFBC, vértices) para encontrar el resto.
+- Lo que hubo que corregir hasta que anduvo, el uso y la compilación: [herramientas-mali.md](herramientas-mali.md),
+  secciones 5 y 7.
+
 ## Orden y criterios de corte
 
 1. Etapas 1 y 2 juntas: la primera captura decodificada ya responde varias incógnitas.
